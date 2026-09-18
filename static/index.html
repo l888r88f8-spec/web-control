@@ -114,6 +114,22 @@
         </section>
 
         <section>
+          <h2>Map</h2>
+          <div class="map-picker">
+            <select id="mapSelect" aria-label="Selected map" disabled></select>
+            <button id="refreshMaps" type="button">Refresh</button>
+          </div>
+          <div class="map-capabilities">
+            <span id="mapTiledLabel" class="map-tag">Tiled loading: --</span>
+            <span id="mapRelocalizationLabel" class="map-tag">Automatic relocalization: --</span>
+          </div>
+          <p id="mapManualInitialPose" class="map-note" hidden>Manual initial pose required: this map has no sc_db.bin.</p>
+          <p id="mapWarning" class="map-warning" role="status" hidden></p>
+          <p id="mapStatus" class="result" role="status" aria-live="polite">Loading maps...</p>
+          <p id="mapLockNote" class="map-note" hidden></p>
+        </section>
+
+        <section>
           <h2>Terminal Logs</h2>
           <div class="terminal-list">
             <article class="terminal">
@@ -143,9 +159,9 @@
 
         <section>
           <h2>Layers</h2>
-          <label><input type="checkbox" data-layer="global_map" checked> localization global_map</label>
-          <label><input type="checkbox" data-layer="mapcloud"> navigation mapcloud</label>
-          <label><input type="checkbox" data-layer="mapground" checked> ground mapground</label>
+          <label><input type="checkbox" data-layer="local_map" checked> local map</label>
+          <label><input type="checkbox" data-layer="mapcloud" checked> global map</label>
+          <label><input type="checkbox" data-layer="mapground" checked> ground map</label>
           <label><input type="checkbox" id="pathLayer" checked> planning paths</label>
           <label><input type="checkbox" id="vehicleLayer" checked> vehicle</label>
         </section>

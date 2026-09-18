@@ -1,12 +1,15 @@
 import ast
 import json
 import math
+import os
 import pytest
+import shutil
 import signal
 import subprocess
 import threading
 import urllib.error
 import urllib.request
+import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import MethodType
@@ -134,13 +137,186 @@ def test_navigation_readiness_waits_for_relocalization_then_navigation():
 def test_normalize_layer_name_rejects_unknown_layer():
     from web_control.web_control_node import normalize_layer_name
 
-    assert normalize_layer_name("global_map") == "global_map"
+    assert normalize_layer_name("local_map") == "local_map"
+    try:
+        normalize_layer_name("global_map")
+    except ValueError as exc:
+        assert "unknown layer" in str(exc)
+    else:
+        raise AssertionError("navigation global_map layer was accepted")
     try:
         normalize_layer_name("../bad")
     except ValueError as exc:
         assert "unknown layer" in str(exc)
     else:
         raise AssertionError("unknown layer was accepted")
+
+
+def _layer_payload_node():
+    """ROS-free WebControlNode stand-in for the navigation layer endpoint."""
+
+    class _LayerPayloadNode:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.layers = {
+                name: SourceCache(name, stale_timeout_sec=2.0, static_source=True)
+                for name in ("local_map", "mapcloud", "mapground")
+            }
+
+        def now_sec(self):
+            return 10.0
+
+    node = _LayerPayloadNode()
+    node.layer_payload = MethodType(
+        web_control_node.WebControlNode.layer_payload, node
+    )
+    return node
+
+
+def test_navigation_layer_payload_serves_local_map_cloud():
+    node = _layer_payload_node()
+    node.layers["local_map"].update(
+        {"points3d": [[1.0, 2.0, 3.0]], "points2d": [[1.0, 2.0]]},
+        stamp=10.0,
+        frame_id="map",
+        count=1,
+    )
+
+    assert node.layer_payload("local_map", "3d") == {
+        "layer": "local_map",
+        "status": "loaded",
+        "frame_id": "map",
+        "count": 1,
+        "points": [[1.0, 2.0, 3.0]],
+    }
+    with pytest.raises(ValueError, match="unknown layer"):
+        node.layer_payload("global_map", "3d")
+
+
+def test_navigation_page_replaces_localization_global_map_with_local_map():
+    package_root = Path(__file__).resolve().parents[1]
+    static_dir = package_root / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+    config_yaml = (package_root / "config" / "web_control.yaml").read_text(
+        encoding="utf-8"
+    )
+    node_source = (
+        package_root / "web_control" / "web_control_node.py"
+    ).read_text(encoding="utf-8")
+
+    # The navigation layer set is localization local_map + navigation clouds.
+    assert web_control_node.LAYER_NAMES == {"local_map", "mapcloud", "mapground"}
+
+    # Navigation sidebar checkbox and JavaScript layer declaration.
+    assert 'data-layer="local_map"' in index_html
+    assert 'data-layer="local_map" checked> local map' in index_html
+    assert 'data-layer="mapcloud" checked> global map' in index_html
+    assert 'data-layer="mapground" checked> ground map' in index_html
+    assert 'data-layer="global_map"' not in index_html
+    navigation_layers = app_js[
+        app_js.index("const LAYERS = {") : app_js.index("const MAPPING_LAYERS = {")
+    ]
+    assert "local_map: { color: 0x8ea4b8" in navigation_layers
+    assert "mapcloud: { color: 0x49b59f, points3d: [], enabled: true" in navigation_layers
+    assert "global_map" not in navigation_layers
+
+    # ROS parameter, cache, subscription, and API default layer.
+    assert (
+        'self.declare_parameter("local_map_topic", "/lio_sam/localization/local_map")'
+        in node_source
+    )
+    assert '"local_map": SourceCache("local_map"' in node_source
+    assert '"local_map": str(self.get_parameter("local_map_topic").value)' in node_source
+    assert 'layer = query.get("layer", ["local_map"])[0]' in node_source
+    assert 'local_map_topic: "/lio_sam/localization/local_map"' in config_yaml
+
+
+def test_navigation_page_no_longer_declares_localization_global_map():
+    package_root = Path(__file__).resolve().parents[1]
+    node_source = (
+        package_root / "web_control" / "web_control_node.py"
+    ).read_text(encoding="utf-8")
+    config_yaml = (package_root / "config" / "web_control.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'self.declare_parameter("global_map_topic", "/lio_sam/localization/global_map")'
+        not in node_source
+    )
+    assert (
+        '"global_map": SourceCache("global_map"' not in node_source
+    )
+    assert "    global_map_topic:" not in config_yaml
+
+
+def test_mapping_page_keeps_its_global_map_layer_and_topics():
+    package_root = Path(__file__).resolve().parents[1]
+    static_dir = package_root / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+    config_yaml = (package_root / "config" / "web_control.yaml").read_text(
+        encoding="utf-8"
+    )
+    node_source = (
+        package_root / "web_control" / "web_control_node.py"
+    ).read_text(encoding="utf-8")
+
+    assert web_control_node.MAPPING_LAYER_NAMES == {"global_map", "ground"}
+    assert 'data-mapping-layer="global_map"' in index_html
+    assert 'data-mapping-layer="ground"' in index_html
+    mapping_layers = app_js[
+        app_js.index("const MAPPING_LAYERS = {") : app_js.index(
+            "const TARGET_MARKER_COLOR"
+        )
+    ]
+    assert "global_map: { color: 0x8ea4b8" in mapping_layers
+    assert (
+        'self.declare_parameter("mapping_global_map_topic", "/lio_sam/mapping/map_global")'
+        in node_source
+    )
+    assert '"global_map": SourceCache("mapping_global_map"' in node_source
+    assert 'mapping_global_map_topic: "/lio_sam/mapping/map_global"' in config_yaml
+    # The mapping map3d endpoint keeps its own global_map default.
+    assert 'layer = query.get("layer", ["global_map"])[0]' in node_source
+
+
+class _RecordingLayerWebNode:
+    """ROS-free node recording which layer the GET router requests."""
+
+    def __init__(self):
+        self.calls = []
+        self.static_dir = Path(__file__).resolve().parents[1] / "static"
+
+    def layer_payload(self, layer, mode):
+        self.calls.append((layer, mode))
+        return {"layer": layer, "mode": mode, "points": []}
+
+    def now_sec(self):
+        return 1.0
+
+    def get_logger(self):
+        return _LoggerStub()
+
+
+def test_navigation_map_layer_api_defaults_to_local_map():
+    node = _RecordingLayerWebNode()
+    server, thread = _serve_fake_web_node(node)
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        status_3d, payload_3d = _json_request(f"{base}/api/map3d")
+        status_2d, payload_2d = _json_request(f"{base}/api/map2d")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status_3d == 200
+    assert payload_3d["layer"] == "local_map"
+    assert status_2d == 200
+    assert payload_2d["layer"] == "local_map"
+    assert node.calls == [("local_map", "3d"), ("local_map", "2d")]
 
 
 def test_success_response_has_expected_shape():
@@ -1966,3 +2142,956 @@ def test_save_map_handler_post_returns_400_for_invalid_payload(monkeypatch):
     assert body["ok"] is False
     assert "destination" in body["message"]
 
+
+def _make_map_dir(root: Path, name: str) -> Path:
+    map_dir = root / name
+    map_dir.mkdir(parents=True)
+    (map_dir / "GlobalMap.pcd").write_bytes(b"global")
+    (map_dir / "GroundMap.pcd").write_bytes(b"ground")
+    return map_dir
+
+
+def _tiled_manifest_document(**overrides):
+    document = {
+        "schema_version": 1,
+        "frame_id": "map",
+        "point_type": "XYZI",
+        "tile_size_m": 20,
+        "origin_xy": [0, 0],
+        "source": {
+            "global_map_name": "GlobalMap.pcd",
+            "ground_map_name": "GroundMap.pcd",
+        },
+        "tiles": {
+            "global": [
+                {
+                    "index": [0, 0],
+                    "path": "global/0_0.pcd",
+                    "point_count": 2,
+                    "bytes": 4,
+                }
+            ],
+            "ground": [
+                {
+                    "index": [0, 0],
+                    "path": "ground/0_0.pcd",
+                    "point_count": 2,
+                    "bytes": 4,
+                }
+            ],
+        },
+    }
+    document.update(overrides)
+    return document
+
+
+def _write_tiled_manifest(map_dir: Path, document) -> Path:
+    tiled_dir = map_dir / "tiled"
+    tiled_dir.mkdir(parents=True, exist_ok=True)
+    (tiled_dir / "manifest.yaml").write_text(
+        yaml.safe_dump(document), encoding="utf-8"
+    )
+    return tiled_dir
+
+
+def _write_tile_files(tiled_dir: Path) -> None:
+    (tiled_dir / "global").mkdir(parents=True, exist_ok=True)
+    (tiled_dir / "ground").mkdir(parents=True, exist_ok=True)
+    (tiled_dir / "global" / "0_0.pcd").write_bytes(b"tile")
+    (tiled_dir / "ground" / "0_0.pcd").write_bytes(b"tile")
+
+
+def test_map_catalog_lists_direct_child_maps_sorted_with_capabilities(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    alpha = _make_map_dir(root, "alpha")
+    zeta = _make_map_dir(root, "zeta")
+    (root / "incomplete").mkdir()
+    (root / "GroundMap.pcd").write_bytes(b"stray file")
+    (alpha / "sc_db.bin").write_bytes(b"scan context")
+
+    catalog = MapCatalog(root)
+
+    assert [entry["name"] for entry in catalog.list_maps()] == ["alpha", "zeta"]
+    assert catalog.get("alpha") == {
+        "name": "alpha",
+        "global_map_path": str((alpha / "GlobalMap.pcd").resolve()),
+        "ground_map_path": str((alpha / "GroundMap.pcd").resolve()),
+        "tiled_path": None,
+        "has_scan_context": True,
+        "warning": None,
+    }
+    assert catalog.get("zeta")["has_scan_context"] is False
+
+
+def test_map_catalog_requires_both_pcd_files_as_regular_files(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    _make_map_dir(root, "good")
+    missing_ground = _make_map_dir(root, "missing_ground")
+    (missing_ground / "GroundMap.pcd").unlink()
+    directory_global = _make_map_dir(root, "directory_global")
+    (directory_global / "GlobalMap.pcd").unlink()
+    (directory_global / "GlobalMap.pcd").mkdir()
+
+    catalog = MapCatalog(root)
+
+    assert [entry["name"] for entry in catalog.list_maps()] == ["good"]
+    for name in ("missing_ground", "directory_global"):
+        with pytest.raises(ValueError):
+            catalog.get(name)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission checks")
+def test_map_catalog_rejects_unreadable_pcd_files(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    locked = _make_map_dir(root, "locked")
+    (locked / "GlobalMap.pcd").chmod(0o000)
+    try:
+        catalog = MapCatalog(root)
+
+        assert catalog.list_maps() == []
+        with pytest.raises(ValueError):
+            catalog.get("locked")
+    finally:
+        (locked / "GlobalMap.pcd").chmod(0o644)
+
+
+def test_map_catalog_rejects_names_and_symlinks_that_escape_the_root(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    _make_map_dir(outside, "leak")
+    (root / "leak").symlink_to(outside / "leak")
+    inside = _make_map_dir(root, "inside")
+    (inside / "GlobalMap.pcd").unlink()
+    (inside / "GlobalMap.pcd").symlink_to(outside / "leak" / "GlobalMap.pcd")
+
+    catalog = MapCatalog(root)
+
+    assert catalog.list_maps() == []
+    for name in (".", "..", "a/b", "../outside/leak", "/etc", "", "   ", None, 7):
+        with pytest.raises(ValueError):
+            catalog.get(name)
+    for name in ("leak", "inside"):
+        with pytest.raises(ValueError):
+            catalog.get(name)
+
+
+def test_map_catalog_reports_tiled_capability_for_valid_v1_manifest(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    tiled_map = _make_map_dir(root, "tiled_map")
+    tiled_dir = _write_tiled_manifest(tiled_map, _tiled_manifest_document())
+    _write_tile_files(tiled_dir)
+
+    entry = MapCatalog(root).get("tiled_map")
+
+    assert entry["tiled_path"] == str(tiled_dir.resolve())
+    assert entry["warning"] is None
+    assert entry["global_map_path"] == str((tiled_map / "GlobalMap.pcd").resolve())
+
+
+def test_map_catalog_falls_back_to_global_map_for_malformed_tiled_manifests(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    root = tmp_path / "map"
+    broken_yaml = _make_map_dir(root, "broken_yaml")
+    (broken_yaml / "tiled").mkdir()
+    (broken_yaml / "tiled" / "manifest.yaml").write_text(
+        "schema_version: [", encoding="utf-8"
+    )
+
+    wrong_schema = _make_map_dir(root, "wrong_schema")
+    _write_tiled_manifest(wrong_schema, _tiled_manifest_document(schema_version=2))
+
+    missing_tile = _make_map_dir(root, "missing_tile")
+    _write_tiled_manifest(missing_tile, _tiled_manifest_document())
+
+    escaping_tile = _make_map_dir(root, "escaping_tile")
+    escaping_document = _tiled_manifest_document()
+    escaping_document["tiles"]["global"][0]["path"] = "../GlobalMap.pcd"
+    escaping_dir = _write_tiled_manifest(escaping_tile, escaping_document)
+    _write_tile_files(escaping_dir)
+
+    symlinked_tile = _make_map_dir(root, "symlinked_tile")
+    symlinked_dir = _write_tiled_manifest(symlinked_tile, _tiled_manifest_document())
+    _write_tile_files(symlinked_dir)
+    (symlinked_dir / "global" / "0_0.pcd").unlink()
+    (symlinked_dir / "global" / "0_0.pcd").symlink_to(
+        symlinked_tile / "GlobalMap.pcd"
+    )
+
+    catalog = MapCatalog(root)
+
+    for name in (
+        "broken_yaml",
+        "wrong_schema",
+        "missing_tile",
+        "escaping_tile",
+        "symlinked_tile",
+    ):
+        entry = catalog.get(name)
+        assert entry["tiled_path"] is None
+        assert isinstance(entry["warning"], str) and entry["warning"]
+        assert entry["global_map_path"] == str(
+            (root / name / "GlobalMap.pcd").resolve()
+        )
+
+
+def test_map_catalog_missing_root_yields_empty_catalog(tmp_path):
+    from web_control.map_catalog import MapCatalog
+
+    catalog = MapCatalog(tmp_path / "absent")
+
+    assert catalog.list_maps() == []
+    with pytest.raises(ValueError):
+        catalog.get("alpha")
+
+
+def test_selection_store_load_treats_missing_empty_and_malformed_files_as_no_selection(
+    tmp_path,
+):
+    from web_control.map_selection import SelectionStore
+
+    path = tmp_path / "web_control" / "selected_map.json"
+    store = SelectionStore(path)
+
+    assert store.load() is None
+
+    path.parent.mkdir(parents=True)
+    for content in (
+        "",
+        "   ",
+        "{not json",
+        json.dumps([1, 2]),
+        json.dumps({"name": 5}),
+        json.dumps({"name": "../etc"}),
+        json.dumps({"name": ""}),
+    ):
+        path.write_text(content, encoding="utf-8")
+        assert store.load() is None
+
+    path.write_text(json.dumps({"name": "site_a"}), encoding="utf-8")
+    assert store.load() == "site_a"
+
+
+def test_selection_store_logs_corrupt_saved_selection(tmp_path, caplog, capsys):
+    from web_control.map_selection import SelectionStore
+
+    path = tmp_path / "selected_map.json"
+    path.write_text("{invalid json", encoding="utf-8")
+
+    assert SelectionStore(path).load() is None
+
+    log_output = caplog.text + capsys.readouterr().err
+    assert "invalid saved map selection" in log_output
+    assert str(path) in log_output
+
+
+def test_selection_store_save_creates_parent_directory_and_persists_name(tmp_path):
+    from web_control.map_selection import SelectionStore
+
+    path = tmp_path / "config" / "web_control" / "selected_map.json"
+    store = SelectionStore(path)
+
+    store.save("site_a")
+
+    assert path.is_file()
+    assert SelectionStore(path).load() == "site_a"
+
+    store.save("site_b")
+
+    assert SelectionStore(path).load() == "site_b"
+
+
+def test_selection_store_replaces_selection_file_atomically(tmp_path, monkeypatch):
+    from web_control.map_selection import SelectionStore
+
+    path = tmp_path / "web_control" / "selected_map.json"
+    store = SelectionStore(path)
+    store.save("site_a")
+
+    replacements = []
+    real_replace = os.replace
+
+    def spying_replace(source, destination):
+        source_path = Path(source)
+        assert json.loads(source_path.read_text(encoding="utf-8")) == {
+            "name": "site_b"
+        }
+        replacements.append((source_path, Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", spying_replace)
+    store.save("site_b")
+
+    assert len(replacements) == 1
+    temporary, destination = replacements[0]
+    assert temporary.parent == path.parent
+    assert destination == path
+    assert store.load() == "site_b"
+    assert [entry.name for entry in path.parent.iterdir()] == ["selected_map.json"]
+
+
+def test_selection_store_rejects_names_that_are_not_single_path_components(tmp_path):
+    from web_control.map_selection import SelectionStore
+
+    path = tmp_path / "selected_map.json"
+    store = SelectionStore(path)
+
+    for name in ("", "   ", ".", "..", "../etc", "a/b", "a\\b", "/etc", None, 7):
+        with pytest.raises(ValueError):
+            store.save(name)
+
+    assert not path.exists()
+
+
+def test_selection_store_keeps_saved_name_after_the_map_directory_is_deleted(tmp_path):
+    from web_control.map_catalog import MapCatalog
+    from web_control.map_selection import SelectionStore
+
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_a")
+    store = SelectionStore(tmp_path / "config" / "selected_map.json")
+    store.save("site_a")
+
+    map_dir.rename(tmp_path / "removed_site_a")
+
+    assert store.load() == "site_a"
+    with pytest.raises(ValueError):
+        MapCatalog(root).get(store.load())
+
+
+def test_selection_default_path_lives_under_the_runtime_home():
+    from web_control.map_selection import default_selection_path
+
+    home = Path("/home/robot")
+
+    assert default_selection_path(home) == Path(
+        "/home/robot/.config/web_control/selected_map.json"
+    )
+
+
+def test_map_selection_no_longer_writes_relocalization_parameter_cache():
+    from web_control import map_selection
+
+    assert not hasattr(map_selection, "write_localization_params")
+    assert not hasattr(map_selection, "default_relocalization_params_path")
+    assert "relocalization-selected" not in Path(map_selection.__file__).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_package_declares_pyyaml_exec_dependency():
+    package_xml = (
+        Path(__file__).resolve().parents[1] / "package.xml"
+    ).read_text(encoding="utf-8")
+
+    assert "<exec_depend>python3-yaml</exec_depend>" in package_xml
+
+
+class _RecordingManagedProcess:
+    """ManagedLaunchProcess stand-in that records starts instead of spawning."""
+
+    def __init__(self, command, running=False):
+        self.command = list(command)
+        self.started = 0
+        self._running = running
+
+    def is_running(self):
+        return self._running
+
+    def start(self):
+        self.started += 1
+
+
+def _selection_node(tmp_path, selection=None, running=(), **overrides):
+    """ROS-free node stub for the map selection API and start commands."""
+    from web_control.map_catalog import MapCatalog
+    from web_control.map_selection import SelectionStore
+
+    parameters = {
+        "localization_launch_package": "lio_sam_hesai",
+        "localization_launch_file": "localization_with_nonground.launch.py",
+        "localization_launch_args": "",
+        "navigation_launch_package": "p2p_move_base",
+        "navigation_launch_file": "p2p_move_base_localization.launch.py",
+        "navigation_launch_args": "",
+        "mapping_launch_package": "lio_sam_hesai",
+        "mapping_launch_file": "mapping.launch.py",
+        "mapping_launch_args": "",
+    }
+    root = Path(overrides.pop("map_root", tmp_path / "map"))
+    parameters.update(overrides)
+
+    node = type("_SelectionNodeStub", (), {})()
+    node.get_parameter = lambda name: _ParameterStub(parameters[name])
+    node.get_logger = lambda: _LoggerStub()
+    node.now_sec = lambda: 10.0
+    node.lock = threading.RLock()
+    node.map_root = root
+    node.map_catalog = MapCatalog(root)
+    node.map_selection = SelectionStore(tmp_path / "config" / "selected_map.json")
+    node.managed_logs = {
+        target: TerminalLogBuffer(target, max_lines=5)
+        for target in ("localization", "navigation", "mapping")
+    }
+    node.managed_processes = {
+        "localization": _RecordingManagedProcess(
+            [
+                "ros2",
+                "launch",
+                "lio_sam_hesai",
+                "localization_with_nonground.launch.py",
+            ],
+            running="localization" in running,
+        ),
+        "navigation": _RecordingManagedProcess(
+            [
+                "ros2",
+                "launch",
+                "p2p_move_base",
+                "p2p_move_base_localization.launch.py",
+            ],
+            running="navigation" in running,
+        ),
+        "mapping": _RecordingManagedProcess(
+            ["ros2", "launch", "lio_sam_hesai", "mapping.launch.py"],
+            running="mapping" in running,
+        ),
+    }
+    if selection is not None:
+        node.map_selection.save(selection)
+    for name in (
+        "maps_payload",
+        "select_map",
+        "require_valid_selection",
+        "managed_start_command",
+        "start_managed_target",
+    ):
+        setattr(
+            node,
+            name,
+            MethodType(getattr(web_control_node.WebControlNode, name), node),
+        )
+    return node
+
+
+def _serve_and_request(node, path, payload=None, method="GET"):
+    server, thread = _serve_fake_web_node(node)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        return _json_request(f"{base}{path}", payload, method)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_maps_handler_get_returns_sanitized_catalog_with_selection(tmp_path):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    tiled_map = _make_map_dir(root, "site_b")
+    (tiled_map / "sc_db.bin").write_bytes(b"scan context")
+    tiled_dir = _write_tiled_manifest(tiled_map, _tiled_manifest_document())
+    _write_tile_files(tiled_dir)
+    node = _selection_node(tmp_path, selection="site_a")
+
+    status, body = _serve_and_request(node, "/api/maps")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert [entry["name"] for entry in body["maps"]] == ["site_a", "site_b"]
+    by_name = {entry["name"]: entry for entry in body["maps"]}
+    assert by_name["site_a"] == {
+        "name": "site_a",
+        "tiled": False,
+        "has_scan_context": False,
+        "warning": None,
+    }
+    assert by_name["site_b"]["tiled"] is True
+    assert by_name["site_b"]["has_scan_context"] is True
+    for entry in body["maps"]:
+        assert set(entry) == {"name", "tiled", "has_scan_context", "warning"}
+        assert "global_map_path" not in entry
+        assert "ground_map_path" not in entry
+        assert "tiled_path" not in entry
+    assert body["selection"]["name"] == "site_a"
+    assert body["selection"]["valid"] is True
+    assert body["selection"]["entry"]["name"] == "site_a"
+
+
+def test_maps_handler_reports_missing_root_and_no_selection(tmp_path):
+    node = _selection_node(tmp_path)
+
+    status, body = _serve_and_request(node, "/api/maps")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["maps"] == []
+    assert body["selection"] == {
+        "name": None,
+        "valid": False,
+        "entry": None,
+        "message": "no map selected",
+    }
+
+
+def test_maps_handler_marks_selection_invalid_after_map_is_deleted(tmp_path):
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_a")
+    node = _selection_node(tmp_path, selection="site_a")
+    map_dir.rename(tmp_path / "removed_site_a")
+
+    status, body = _serve_and_request(node, "/api/maps")
+
+    assert status == 200
+    assert body["selection"]["name"] == "site_a"
+    assert body["selection"]["valid"] is False
+    assert body["selection"]["entry"] is None
+    assert body["selection"]["message"]
+
+
+def test_maps_handler_select_persists_name_and_returns_state(tmp_path):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    _make_map_dir(root, "site_b")
+    node = _selection_node(tmp_path)
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": "site_b"}, "POST"
+    )
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["selection"]["name"] == "site_b"
+    assert body["selection"]["valid"] is True
+    assert body["selection"]["entry"]["name"] == "site_b"
+    assert node.map_selection.load() == "site_b"
+
+    status, body = _serve_and_request(node, "/api/maps")
+    assert status == 200
+    assert body["selection"]["name"] == "site_b"
+    assert body["selection"]["valid"] is True
+
+
+@pytest.mark.parametrize(
+    "name", ["", "   ", ".", "..", "../etc", "a/b", "/etc", None, 7, "missing"]
+)
+def test_maps_handler_select_rejects_invalid_or_unknown_names(tmp_path, name):
+    _make_map_dir(tmp_path / "map", "site_a")
+    node = _selection_node(tmp_path)
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": name}, "POST"
+    )
+
+    assert status == 400
+    assert body["ok"] is False
+    assert node.map_selection.load() is None
+
+
+@pytest.mark.parametrize("target", ["localization", "navigation"])
+def test_maps_handler_select_returns_409_while_managed_process_runs(tmp_path, target):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    _make_map_dir(root, "site_b")
+    node = _selection_node(tmp_path, selection="site_a", running=(target,))
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": "site_b"}, "POST"
+    )
+
+    assert status == 409
+    assert body["ok"] is False
+    assert target in body["message"]
+    assert "stop" in body["message"].lower()
+    assert node.map_selection.load() == "site_a"
+
+
+def test_maps_handler_select_returns_409_and_names_both_running_processes(tmp_path):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    _make_map_dir(root, "site_b")
+    node = _selection_node(
+        tmp_path, selection="site_a", running=("localization", "navigation")
+    )
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": "site_b"}, "POST"
+    )
+
+    assert status == 409
+    assert "localization" in body["message"]
+    assert "navigation" in body["message"]
+    assert node.map_selection.load() == "site_a"
+
+
+def test_maps_handler_select_allowed_while_only_mapping_runs(tmp_path):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    _make_map_dir(root, "site_b")
+    node = _selection_node(tmp_path, selection="site_a", running=("mapping",))
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": "site_b"}, "POST"
+    )
+
+    assert status == 200
+    assert body["selection"]["name"] == "site_b"
+    assert node.map_selection.load() == "site_b"
+
+
+def test_managed_start_command_uses_tiled_map_without_writing_cache(tmp_path):
+    root = tmp_path / "map"
+    tiled_map = _make_map_dir(root, "site_tiled")
+    (tiled_map / "sc_db.bin").write_bytes(b"scan context")
+    tiled_dir = _write_tiled_manifest(tiled_map, _tiled_manifest_document())
+    _write_tile_files(tiled_dir)
+    node = _selection_node(
+        tmp_path,
+        selection="site_tiled",
+        localization_launch_args="use_rviz:=false debug_relocalization:=false",
+        navigation_launch_args="use_rviz:=false",
+    )
+
+    localization = node.managed_start_command("localization")
+
+    assert localization[:4] == [
+        "ros2",
+        "launch",
+        "lio_sam_hesai",
+        "localization_with_nonground.launch.py",
+    ]
+    assert "use_rviz:=false" in localization
+    assert "debug_relocalization:=false" in localization
+    assert [a for a in localization if a.startswith("map_path:=")] == [
+        f"map_path:={tiled_dir.resolve()}"
+    ]
+    assert not any(a.startswith("params_file:=") for a in localization)
+    assert not any(a.startswith("auto_relocalization:=") for a in localization)
+    # The selected map is passed straight to the launch; the old generated
+    # relocalization parameter cache is neither created nor referenced.
+    assert not (tmp_path / ".cache").exists()
+    assert not (tmp_path / "cache").exists()
+
+    navigation = node.managed_start_command("navigation")
+
+    assert navigation[:4] == [
+        "ros2",
+        "launch",
+        "p2p_move_base",
+        "p2p_move_base_localization.launch.py",
+    ]
+    assert "use_rviz:=false" in navigation
+    expected_map_root = str((tiled_map / "GlobalMap.pcd").resolve().parent)
+    assert [a for a in navigation if a.startswith("map_path:=")] == [
+        f"map_path:={expected_map_root}"
+    ]
+    assert not any(
+        a.startswith(("map_dir:=", "ground_dir:=")) for a in navigation
+    )
+
+
+def test_managed_start_command_uses_global_map_and_disables_auto_relocalization(
+    tmp_path,
+):
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_global")
+    node = _selection_node(tmp_path, selection="site_global")
+
+    localization = node.managed_start_command("localization")
+
+    assert [a for a in localization if a.startswith("map_path:=")] == [
+        f"map_path:={(map_dir / 'GlobalMap.pcd').resolve()}"
+    ]
+    assert [a for a in localization if a.startswith("auto_relocalization:=")] == [
+        "auto_relocalization:=false"
+    ]
+    assert not any(a.startswith("params_file:=") for a in localization)
+    assert not (tmp_path / ".cache").exists()
+    assert not (tmp_path / "cache").exists()
+
+    navigation = node.managed_start_command("navigation")
+
+    expected_map_root = str((map_dir / "GlobalMap.pcd").resolve().parent)
+    assert [a for a in navigation if a.startswith("map_path:=")] == [
+        f"map_path:={expected_map_root}"
+    ]
+    assert not any(
+        a.startswith(("map_dir:=", "ground_dir:=")) for a in navigation
+    )
+
+
+def test_managed_start_command_replaces_conflicting_configured_map_args(tmp_path):
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_a")
+    node = _selection_node(
+        tmp_path,
+        selection="site_a",
+        localization_launch_args=(
+            "map_path:=/stale/map auto_relocalization:=true use_rviz:=false"
+        ),
+        navigation_launch_args=(
+            "map_path:=/stale/map_root use_rviz:=false"
+        ),
+    )
+
+    localization = node.managed_start_command("localization")
+    assert [a for a in localization if a.startswith("map_path:=")] == [
+        f"map_path:={(map_dir / 'GlobalMap.pcd').resolve()}"
+    ]
+    assert [a for a in localization if a.startswith("auto_relocalization:=")] == [
+        "auto_relocalization:=false"
+    ]
+    assert "use_rviz:=false" in localization
+    assert "auto_relocalization:=true" not in localization
+
+    navigation = node.managed_start_command("navigation")
+    expected_map_root = str((map_dir / "GlobalMap.pcd").resolve().parent)
+    assert [a for a in navigation if a.startswith("map_path:=")] == [
+        f"map_path:={expected_map_root}"
+    ]
+    assert "use_rviz:=false" in navigation
+
+
+def test_managed_start_commands_require_and_revalidate_selection(tmp_path):
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_a")
+    mapping_command = ["ros2", "launch", "lio_sam_hesai", "mapping.launch.py"]
+
+    no_selection = _selection_node(tmp_path)
+    with pytest.raises(ValueError):
+        no_selection.managed_start_command("localization")
+    with pytest.raises(ValueError):
+        no_selection.managed_start_command("navigation")
+    assert no_selection.managed_start_command("mapping") == mapping_command
+
+    stale = _selection_node(tmp_path, selection="site_a")
+    map_dir.rename(tmp_path / "removed_site_a")
+    with pytest.raises(ValueError):
+        stale.managed_start_command("localization")
+    with pytest.raises(ValueError):
+        stale.managed_start_command("navigation")
+    assert stale.managed_start_command("mapping") == mapping_command
+
+
+def test_managed_start_target_rejects_invalid_selection_but_starts_mapping(tmp_path):
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    node = _selection_node(tmp_path)
+
+    with pytest.raises(ValueError):
+        node.start_managed_target("localization")
+    with pytest.raises(ValueError):
+        node.start_managed_target("navigation")
+    assert node.managed_processes["localization"].started == 0
+    assert node.managed_processes["navigation"].started == 0
+
+    result = node.start_managed_target("mapping")
+
+    assert result["ok"] is True
+    assert node.managed_processes["mapping"].started == 1
+
+
+def test_localization_and_navigation_starts_use_the_same_selected_candidate(tmp_path):
+    root = tmp_path / "map"
+    map_dir = _make_map_dir(root, "site_a")
+    node = _selection_node(tmp_path, selection="site_a")
+
+    node.start_managed_target("localization")
+    node.start_managed_target("navigation")
+
+    localization = node.managed_processes["localization"].command
+    navigation = node.managed_processes["navigation"].command
+    expected_global = str((map_dir / "GlobalMap.pcd").resolve())
+    expected_map_root = str(Path(expected_global).parent)
+
+    assert f"map_path:={expected_global}" in localization
+    assert not any(a.startswith("params_file:=") for a in localization)
+    assert f"map_path:={expected_map_root}" in navigation
+    assert node.managed_processes["localization"].started == 1
+    assert node.managed_processes["navigation"].started == 1
+
+
+def _frontend_sources():
+    """Return ``(index_html, app_js, styles_css)`` for browser-facing tests."""
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    return (
+        (static_dir / "index.html").read_text(encoding="utf-8"),
+        (static_dir / "app.js").read_text(encoding="utf-8"),
+        (static_dir / "styles.css").read_text(encoding="utf-8"),
+    )
+
+
+def _js_function_body(app_js, signature):
+    """Return the source of one top-level function, matched by braces."""
+    start = app_js.index(signature)
+    brace = app_js.index("{", start)
+    depth = 0
+    for index in range(brace, len(app_js)):
+        if app_js[index] == "{":
+            depth += 1
+        elif app_js[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return app_js[start : index + 1]
+    raise AssertionError(f"unterminated function starting with {signature!r}")
+
+
+_MAP_PANEL_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("// --- Map selector");
+const end = source.indexOf("// Per-target cursor");
+if (start < 0 || end < 0) throw new Error("map selector block not found");
+const block = source.slice(start, end);
+
+function makeElement() {
+  return {
+    textContent: "",
+    className: "",
+    innerHTML: "",
+    value: "",
+    disabled: false,
+    hidden: false,
+    children: [],
+    appendChild(child) { this.children.push(child); },
+  };
+}
+const elements = {};
+for (const id of [
+  "mapSelect", "mapTiledLabel", "mapRelocalizationLabel", "mapManualInitialPose",
+  "mapWarning", "mapStatus", "mapLockNote",
+]) {
+  elements[id] = makeElement();
+}
+global.document = {
+  getElementById(id) { return elements[id] || null; },
+  createElement() { return makeElement(); },
+};
+
+let state = {
+  localizationRunning: false,
+  navigationRunning: false,
+  mapSelectPending: false,
+  mapCatalog: null,
+  mapError: null,
+  mapSelectionError: null,
+  mapSelectionNotice: null,
+};
+let captured = null;
+global.getJson = async () => ({
+  ok: true,
+  map_root: "~/map",
+  maps: [],
+  selection: { name: null, valid: false, entry: null, message: "no map selected" },
+});
+global.postJson = async (url, payload) => {
+  captured = { url, payload };
+  throw new Error("stop navigation before selecting a different map");
+};
+
+eval(block);
+
+function expect(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+// A valid tiled map with sc_db.bin renders both capability labels.
+state.mapCatalog = {
+  map_root: "~/map",
+  maps: [{ name: "site_a", tiled: true, has_scan_context: true, warning: null }],
+  selection: {
+    name: "site_a",
+    valid: true,
+    entry: { name: "site_a", tiled: true, has_scan_context: true, warning: null },
+    message: null,
+  },
+};
+updateMapPanel();
+expect(elements.mapSelect.value === "site_a", "selected map is not reflected in the selector");
+expect(!elements.mapSelect.disabled, "selector should be enabled for a valid selection");
+expect(/tiled loading: available/i.test(elements.mapTiledLabel.textContent), "tiled label missing");
+expect(/automatic relocalization: available/i.test(elements.mapRelocalizationLabel.textContent), "relocalization label missing");
+expect(elements.mapManualInitialPose.hidden, "manual initial pose note should be hidden");
+
+// A global map without sc_db.bin asks for a manual initial pose and warns.
+const warning = "tiled manifest is invalid: bad schema";
+state.mapCatalog.maps = [{ name: "site_b", tiled: false, has_scan_context: false, warning }];
+state.mapCatalog.selection = {
+  name: "site_b",
+  valid: true,
+  entry: { name: "site_b", tiled: false, has_scan_context: false, warning },
+  message: null,
+};
+updateMapPanel();
+expect(!elements.mapManualInitialPose.hidden, "manual initial pose note should be shown");
+expect(!elements.mapWarning.hidden, "tile warning should be visible");
+expect(/tile warning/i.test(elements.mapWarning.textContent), "tile warning was not surfaced");
+
+// A saved but deleted selection stays visible as unavailable.
+state.mapCatalog.maps = [];
+state.mapCatalog.selection = {
+  name: "gone",
+  valid: false,
+  entry: null,
+  message: "map 'gone' is not a directory",
+};
+updateMapPanel();
+expect(elements.mapSelect.children.some((option) => option.value === "gone"), "stale selection is not offered");
+expect(/unavailable/i.test(elements.mapStatus.textContent), "stale selection is not reported");
+
+// Running localization locks out selection without a server round trip.
+state.mapCatalog = {
+  map_root: "~/map",
+  maps: [{ name: "site_a", tiled: false, has_scan_context: true, warning: null }],
+  selection: {
+    name: "site_a",
+    valid: true,
+    entry: { name: "site_a", tiled: false, has_scan_context: true, warning: null },
+    message: null,
+  },
+};
+state.localizationRunning = true;
+updateMapSelectionLock();
+expect(elements.mapSelect.disabled, "running localization must disable selection");
+expect(/localization/.test(elements.mapLockNote.textContent), "lock note does not name localization");
+
+// A rejected selection posts {name} and shows the server message.
+(async () => {
+  state.localizationRunning = false;
+  await selectMap("site_b");
+  expect(captured && captured.url === "/api/maps/select", "selection was not posted to the select endpoint");
+  expect(captured.payload.name === "site_b", "selection payload is wrong");
+  expect(/map selection failed/i.test(elements.mapStatus.textContent), "selection error was not surfaced");
+  expect(/stop navigation/i.test(elements.mapStatus.textContent), "server message was not shown");
+  console.log("map panel behavior ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+
+def test_frontend_map_selector_behavior_executes_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _MAP_PANEL_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "map panel behavior ok" in completed.stdout

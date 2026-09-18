@@ -28,7 +28,7 @@ The UI places a map selector with the localization/navigation controls. It shows
 
 ## Launch behavior
 
-At web-managed localization Start, the web node revalidates the selected map, copies the installed `lio_sam_hesai` relocalization parameter YAML into `~/.cache/web_control/relocalization-selected.yaml` using `python3-yaml`, and changes only `localization.map_path` and, when `sc_db.bin` is absent, `localization.auto_relocalization` to `false`. It uses `tiled/` when the manifest passes the catalog checks; otherwise it uses `GlobalMap.pcd`. Empty `sc_db_path` and `ground_map_path` keep their existing derived-path behavior. The web node passes `params_file:=<generated-file>` to the existing localization launch argument and preserves other configured launch arguments. The generated file is replaced atomically and remains available for the lifetime of the launch.
+At web-managed localization Start, the web node revalidates the selected map and passes `map_path:=<selected tiled directory or GlobalMap.pcd>` to the existing `localization_with_nonground.launch.py`, which applies it as `localization.map_path`. It uses `tiled/` when the manifest passes the catalog checks; otherwise it uses `GlobalMap.pcd`. When `sc_db.bin` is absent it also passes `auto_relocalization:=false`, which the launch wires to `localization.auto_relocalization`. The web node preserves other configured launch arguments and never writes a generated parameter file into `~/.cache`.
 
 At web-managed navigation Start, the node passes `map_dir:=<selected>/GlobalMap.pcd` and `ground_dir:=<selected>/GroundMap.pcd` to the existing navigation launch arguments. Both commands are built from the current saved selection immediately before start, so a selection change affects the next start without rebuilding the web node. The implementation must preserve unrelated configured launch arguments and avoid shell interpolation.
 
@@ -36,6 +36,6 @@ The web node does not rewrite `lio_sam_hesai` or navigation source config files.
 
 ## Failure handling and verification
 
-- Missing required PCDs, vanished selection, or unreadable parameters produce a visible error and prevent the affected launch from starting with a different map. A malformed tiled manifest uses the valid global PCD path and is shown as a warning.
+- Missing required PCDs, vanished selection, or unreadable map files produce a visible error and prevent the affected launch from starting with a different map. A malformed tiled manifest uses the valid global PCD path and is shown as a warning.
 - Map names and capabilities are obtained from the server; the browser does not construct absolute robot paths.
-- Tests cover catalog filtering and traversal/symlink rejection, persistence and reload, running-process conflict, command generation for tiled/global maps, missing `sc_db.bin`, stale selections, and HTTP responses. Verify the generated ROS parameter file's map path and both navigation arguments. Run the web package's Python tests and JavaScript syntax check. The user will run `colcon build` themselves.
+- Tests cover catalog filtering and traversal/symlink rejection, persistence and reload, running-process conflict, command generation for tiled/global maps, missing `sc_db.bin`, stale selections, and HTTP responses. Verify the localization launch arguments (`map_path` and `auto_relocalization`) and the navigation argument. Run the web package's Python tests and JavaScript syntax check. The user will run `colcon build` themselves.

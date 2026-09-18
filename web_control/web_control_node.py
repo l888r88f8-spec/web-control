@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -72,8 +73,10 @@ from web_control.core import (
     validate_save_map_payload,
     yaw_from_quaternion,
 )
+from web_control.map_catalog import MapCatalog
+from web_control.map_selection import SelectionStore, default_selection_path
 
-LAYER_NAMES = {"global_map", "mapcloud", "mapground"}
+LAYER_NAMES = {"local_map", "mapcloud", "mapground"}
 MAPPING_LAYER_NAMES = {"global_map", "ground"}
 ACTION_STATUS_NAMES = {
     0: "unknown",
@@ -88,6 +91,54 @@ STOP_SIGINT_TIMEOUT_SEC = 1.5
 STOP_SIGTERM_TIMEOUT_SEC = 0.75
 STOP_SIGKILL_TIMEOUT_SEC = 0.25
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError)
+MAP_ROOT_DISPLAY = "~/map"
+
+
+class MapSelectionError(ValueError):
+    """Raised when no usable map is selected for a managed launch."""
+
+
+class MapSelectionConflictError(RuntimeError):
+    """Raised when a running managed process blocks a selection change."""
+
+
+def _launch_argument_name(token: str) -> str:
+    """Return the ``key`` of a ``key:=value`` launch argument, else ``""``."""
+    name, separator, _value = token.partition(":=")
+    return name if separator else ""
+
+
+def build_selected_launch_command(
+    package: str,
+    launch_file: str,
+    launch_args: str,
+    overrides: dict[str, str],
+) -> list[str]:
+    """Build a ros2 launch argv, injecting selection values over stale config.
+
+    The configured argument string is split without a shell; any configured
+    argument whose key is being injected by the web node is dropped so it
+    cannot override the freshly revalidated selection. ``argv`` elements are
+    passed verbatim, so map paths are never shell-interpreted.
+    """
+    managed = set(overrides)
+    retained = [
+        token
+        for token in shlex.split(launch_args)
+        if _launch_argument_name(token) not in managed
+    ]
+    retained.extend(f"{key}:={value}" for key, value in overrides.items())
+    return ["ros2", "launch", package, launch_file, *retained]
+
+
+def sanitize_map_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return the browser-safe subset of a catalog entry (no absolute paths)."""
+    return {
+        "name": entry["name"],
+        "tiled": entry.get("tiled_path") is not None,
+        "has_scan_context": bool(entry.get("has_scan_context")),
+        "warning": entry.get("warning"),
+    }
 
 
 class ManagedLaunchProcess:
@@ -374,7 +425,7 @@ class WebControlNode(Node):
         self.declare_parameter("host", "0.0.0.0")
         self.declare_parameter("port", 8080)
         self.declare_parameter("map_frame", "map")
-        self.declare_parameter("global_map_topic", "/lio_sam/localization/global_map")
+        self.declare_parameter("local_map_topic", "/lio_sam/localization/local_map")
         self.declare_parameter("mapcloud_topic", "mapcloud")
         self.declare_parameter("mapground_topic", "mapground")
         self.declare_parameter("odom_topic", "/lio_sam/localization/odometry")
@@ -416,9 +467,13 @@ class WebControlNode(Node):
         self.viewer_timeout = float(self.get_parameter("viewer_timeout_sec").value)
         self.static_dir = package_static_dir()
 
+        self.map_root = Path.home() / "map"
+        self.map_catalog = MapCatalog(self.map_root)
+        self.map_selection = SelectionStore(default_selection_path())
+
         self.lock = threading.RLock()
         self.layers = {
-            "global_map": SourceCache("global_map", self.stale_timeout, static_source=True),
+            "local_map": SourceCache("local_map", self.stale_timeout, static_source=True),
             "mapcloud": SourceCache("mapcloud", self.stale_timeout, static_source=True),
             "mapground": SourceCache("mapground", self.stale_timeout, static_source=True),
         }
@@ -471,7 +526,7 @@ class WebControlNode(Node):
         )
 
         layer_topics = {
-            "global_map": str(self.get_parameter("global_map_topic").value),
+            "local_map": str(self.get_parameter("local_map_topic").value),
             "mapcloud": str(self.get_parameter("mapcloud_topic").value),
             "mapground": str(self.get_parameter("mapground_topic").value),
         }
@@ -614,7 +669,7 @@ class WebControlNode(Node):
                 cache.clear()
             # mapcloud/mapground are published by the navigation process; drop
             # their last cached clouds so the viewer stops showing them after
-            # navigation stops. global_map is localization-owned, leave it.
+            # navigation stops. local_map is localization-owned, leave it.
             for name in ("mapcloud", "mapground"):
                 if name in self.layers:
                     self.layers[name].clear()
@@ -657,6 +712,124 @@ class WebControlNode(Node):
         for thread in threads:
             thread.join(timeout=3.0)
 
+    def maps_payload(self) -> dict[str, Any]:
+        """Return the browser-safe catalog plus the current selection state."""
+        maps = [sanitize_map_entry(entry) for entry in self.map_catalog.list_maps()]
+        name = self.map_selection.load()
+        if name is None:
+            selection: dict[str, Any] = {
+                "name": None,
+                "valid": False,
+                "entry": None,
+                "message": "no map selected",
+            }
+        else:
+            try:
+                entry = self.map_catalog.get(name)
+            except ValueError as exc:
+                selection = {
+                    "name": name,
+                    "valid": False,
+                    "entry": None,
+                    "message": str(exc),
+                }
+            else:
+                selection = {
+                    "name": name,
+                    "valid": True,
+                    "entry": sanitize_map_entry(entry),
+                    "message": None,
+                }
+        return {
+            "ok": True,
+            "map_root": MAP_ROOT_DISPLAY,
+            "maps": maps,
+            "selection": selection,
+            "stamp": self.now_sec(),
+        }
+
+    def select_map(self, payload: Any) -> dict[str, Any]:
+        """Validate and persist ``payload["name"]`` as the next launch map."""
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        name = payload.get("name")
+        # Catalog validation rejects arbitrary paths and missing artifacts
+        # before the running-process check touches any state.
+        entry = self.map_catalog.get(name)
+        with self.lock:
+            running = [
+                target
+                for target in ("localization", "navigation")
+                if self.managed_processes.get(target) is not None
+                and self.managed_processes[target].is_running()
+            ]
+            if running:
+                raise MapSelectionConflictError(
+                    "stop "
+                    + " and ".join(running)
+                    + " before selecting a different map"
+                )
+            self.map_selection.save(name)
+            selection = {
+                "name": name,
+                "valid": True,
+                "entry": sanitize_map_entry(entry),
+                "message": None,
+            }
+        response = success_response(f"selected map {name}", self.now_sec())
+        response["selection"] = selection
+        return response
+
+    def require_valid_selection(self) -> dict[str, Any]:
+        """Revalidate the saved selection and return its catalog entry."""
+        name = self.map_selection.load()
+        if name is None:
+            raise MapSelectionError(
+                "no map selected; choose a map before starting localization or "
+                "navigation"
+            )
+        try:
+            return self.map_catalog.get(name)
+        except ValueError as exc:
+            raise MapSelectionError(
+                f"selected map {name!r} is no longer available: {exc}"
+            ) from exc
+
+    def managed_start_command(self, target: str) -> list[str]:
+        """Build the launch argv for ``target`` from the current selection.
+
+        Localization and navigation revalidate the saved map on every call so a
+        stale selection can never silently fall back to a launch default.
+        Mapping keeps the configured command untouched.
+        """
+        if target == "localization":
+            entry = self.require_valid_selection()
+            overrides = {
+                "map_path": str(
+                    entry.get("tiled_path") or entry.get("global_map_path")
+                )
+            }
+            # A map without a Scan Context database cannot relocalize
+            # automatically, so ask the launch to require a manual initial pose.
+            if not entry.get("has_scan_context"):
+                overrides["auto_relocalization"] = "false"
+            return build_selected_launch_command(
+                str(self.get_parameter("localization_launch_package").value),
+                str(self.get_parameter("localization_launch_file").value),
+                str(self.get_parameter("localization_launch_args").value),
+                overrides,
+            )
+        if target == "navigation":
+            entry = self.require_valid_selection()
+            map_root = Path(entry["global_map_path"]).parent
+            return build_selected_launch_command(
+                str(self.get_parameter("navigation_launch_package").value),
+                str(self.get_parameter("navigation_launch_file").value),
+                str(self.get_parameter("navigation_launch_args").value),
+                {"map_path": str(map_root)},
+            )
+        return self.managed_processes[target].command
+
     def start_managed_target(self, target: str) -> dict[str, Any]:
         if target == "all":
             for item in self.managed_processes:
@@ -664,13 +837,15 @@ class WebControlNode(Node):
             return success_response("managed processes starting", self.now_sec())
         if target not in self.managed_logs:
             raise ValueError(f"unknown managed target: {target}")
-        process = self.managed_processes[target]
-        self.managed_logs[target].set_process_state(
-            enabled=True,
-            running=process.is_running(),
-            returncode=None,
-        )
-        process.start()
+        with self.lock:
+            process = self.managed_processes[target]
+            process.command = self.managed_start_command(target)
+            self.managed_logs[target].set_process_state(
+                enabled=True,
+                running=process.is_running(),
+                returncode=None,
+            )
+            process.start()
         return success_response(f"{target} starting", self.now_sec())
 
     def stop_managed_target(self, target: str) -> dict[str, Any]:
@@ -1122,13 +1297,15 @@ class WebControlNode(Node):
                 try:
                     if parsed.path == "/api/state":
                         self.send_json(node.state_payload())
+                    elif parsed.path == "/api/maps":
+                        self.send_json(node.maps_payload())
                     elif parsed.path == "/api/pose":
                         self.send_json(node.pose_payload())
                     elif parsed.path == "/api/map2d":
-                        layer = query.get("layer", ["global_map"])[0]
+                        layer = query.get("layer", ["local_map"])[0]
                         self.send_json(node.layer_payload(layer, "2d"))
                     elif parsed.path == "/api/map3d":
-                        layer = query.get("layer", ["global_map"])[0]
+                        layer = query.get("layer", ["local_map"])[0]
                         self.send_json(node.layer_payload(layer, "3d"))
                     elif parsed.path == "/api/path":
                         topic = query.get("topic", [""])[0]
@@ -1170,6 +1347,8 @@ class WebControlNode(Node):
                     payload = json.loads(raw or "{}")
                     if self.path == "/api/initialpose":
                         self.send_json(node.publish_initialpose(payload))
+                    elif self.path == "/api/maps/select":
+                        self.send_json(node.select_map(payload))
                     elif self.path == "/api/goal":
                         self.send_json(node.publish_goal(payload))
                     elif self.path == "/api/managed/start":
@@ -1192,6 +1371,8 @@ class WebControlNode(Node):
                     self.send_json(error_response(str(exc), node.now_sec()), status=409)
                 except SaveMapUnavailableError as exc:
                     self.send_json(error_response(str(exc), node.now_sec()), status=503)
+                except MapSelectionConflictError as exc:
+                    self.send_json(error_response(str(exc), node.now_sec()), status=409)
                 except (json.JSONDecodeError, ValueError) as exc:
                     self.send_json(error_response(str(exc), node.now_sec()), status=400)
                 except Exception as exc:  # pragma: no cover - defensive HTTP guard

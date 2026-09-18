@@ -1,8 +1,8 @@
 import * as THREE from "./vendor/three.module.js";
 
 const LAYERS = {
-  global_map: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
-  mapcloud: { color: 0x49b59f, points3d: [], enabled: false, object: null, lastFetch3d: 0 },
+  local_map: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
+  mapcloud: { color: 0x49b59f, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
   mapground: { color: 0xd9a441, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
 };
 
@@ -25,6 +25,14 @@ const state = {
   mappingOdom: null,
   mappingPath: [],
   mapSceneCleared: false,
+  mapCatalog: null,
+  mapError: null,
+  mapSelectionError: null,
+  mapSelectionNotice: null,
+  mapSelectPending: false,
+  localizationRunning: false,
+  navigationRunning: false,
+  saveMapState: null,
   hideCompletedPaths: false,
   showPaths: true,
   showVehicle: true,
@@ -589,6 +597,13 @@ function updateSaveMapStatus(status) {
       ? "Ready to save map."
       : "Start mapping to enable saving.";
   }
+  if (status && status.state) {
+    // Pick up a newly saved map directory the moment the export succeeds.
+    if (status.state === "succeeded" && state.saveMapState !== "succeeded") {
+      refreshMaps(true);
+    }
+    state.saveMapState = status.state;
+  }
 }
 
 async function submitSaveMap(event) {
@@ -650,6 +665,157 @@ function updateNavigationReadiness(readiness) {
   element.className = `readiness ${ready ? "ready" : "waiting"}`;
 }
 
+// --- Map selector ---------------------------------------------------------
+//
+// The catalog is fetched on demand (page load, Refresh, after a successful
+// Save Map, or after a rejected selection) instead of on the fast poll loop.
+// Process-running state used to lock selection comes from the existing
+// terminal-log polling so the panel never issues its own aggressive GET.
+
+const MAP_ROOT_FALLBACK = "~/map";
+
+function mapSelectionLockReason() {
+  const running = [];
+  if (state.localizationRunning) running.push("localization");
+  if (state.navigationRunning) running.push("navigation");
+  if (!running.length) return null;
+  return `Stop ${running.join(" and ")} before changing the selected map.`;
+}
+
+function updateMapSelectionLock() {
+  const select = document.getElementById("mapSelect");
+  if (!select) return;
+  const payload = state.mapCatalog;
+  const maps = payload && Array.isArray(payload.maps) ? payload.maps : [];
+  const reason = mapSelectionLockReason();
+  select.disabled = reason !== null || maps.length === 0 || state.mapSelectPending;
+  const note = document.getElementById("mapLockNote");
+  if (note) {
+    note.hidden = reason === null;
+    note.textContent = reason || "";
+  }
+}
+
+function updateMapPanel() {
+  const select = document.getElementById("mapSelect");
+  const tiledLabel = document.getElementById("mapTiledLabel");
+  const relocLabel = document.getElementById("mapRelocalizationLabel");
+  const manualNote = document.getElementById("mapManualInitialPose");
+  const warning = document.getElementById("mapWarning");
+  const status = document.getElementById("mapStatus");
+  if (!select || !tiledLabel || !relocLabel || !manualNote || !warning || !status) return;
+
+  const payload = state.mapCatalog;
+  const maps = payload && Array.isArray(payload.maps) ? payload.maps : [];
+  const selection = payload && payload.selection ? payload.selection : null;
+  const selectedEntry = selection && selection.valid && selection.entry ? selection.entry : null;
+
+  select.innerHTML = "";
+  if (maps.length) {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select a map...";
+    select.appendChild(placeholder);
+    maps.forEach((entry) => {
+      const option = document.createElement("option");
+      option.value = entry.name;
+      option.textContent = entry.warning ? `${entry.name} (tile warning)` : entry.name;
+      select.appendChild(option);
+    });
+  } else {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "no maps found";
+    select.appendChild(empty);
+  }
+  const names = new Set(maps.map((entry) => entry.name));
+  if (selection && selection.name && !names.has(selection.name)) {
+    const stale = document.createElement("option");
+    stale.value = selection.name;
+    stale.textContent = `${selection.name} (unavailable)`;
+    select.appendChild(stale);
+  }
+  select.value = selection && selection.name ? selection.name : "";
+
+  if (selectedEntry) {
+    tiledLabel.textContent = `Tiled loading: ${selectedEntry.tiled ? "available" : "not available (uses GlobalMap.pcd)"}`;
+    relocLabel.textContent = `Automatic relocalization: ${selectedEntry.has_scan_context ? "available" : "off"}`;
+  } else {
+    tiledLabel.textContent = "Tiled loading: --";
+    relocLabel.textContent = "Automatic relocalization: --";
+  }
+  manualNote.hidden = !(selectedEntry && !selectedEntry.has_scan_context);
+  const warningText = selectedEntry && selectedEntry.warning ? `Tile warning: ${selectedEntry.warning}` : "";
+  warning.hidden = warningText === "";
+  warning.textContent = warningText;
+
+  status.className = "result";
+  if (state.mapSelectionError) {
+    status.textContent = `Map selection failed: ${state.mapSelectionError}`;
+    status.className = "result error";
+  } else if (state.mapError) {
+    status.textContent = `Map list unavailable: ${state.mapError}`;
+    status.className = "result error";
+  } else if (!payload) {
+    status.textContent = "Loading maps...";
+  } else if (state.mapSelectionNotice) {
+    status.textContent = state.mapSelectionNotice;
+  } else if (!selection || !selection.name) {
+    status.textContent = `No map selected under ${payload.map_root || MAP_ROOT_FALLBACK}. Choose a map before starting localization or navigation.`;
+  } else if (!selection.valid) {
+    status.textContent = `Selected map '${selection.name}' is unavailable: ${selection.message || "choose another map"}.`;
+    status.className = "result error";
+  } else {
+    status.textContent = `Using map '${selection.name}'. Changes apply to the next localization or navigation start.`;
+  }
+
+  updateMapSelectionLock();
+}
+
+async function refreshMaps(clearMessages = false) {
+  if (clearMessages) {
+    state.mapSelectionError = null;
+    state.mapSelectionNotice = null;
+  }
+  try {
+    state.mapCatalog = await getJson("/api/maps");
+    state.mapError = null;
+  } catch (error) {
+    state.mapCatalog = null;
+    state.mapError = error.message;
+  }
+  updateMapPanel();
+}
+
+async function selectMap(name) {
+  const status = document.getElementById("mapStatus");
+  if (!name) {
+    updateMapPanel();
+    return;
+  }
+  state.mapSelectionError = null;
+  state.mapSelectionNotice = `Selecting map '${name}'...`;
+  state.mapSelectPending = true;
+  if (status) {
+    status.textContent = state.mapSelectionNotice;
+    status.className = "result";
+  }
+  updateMapSelectionLock();
+  try {
+    const data = await postJson("/api/maps/select", { name });
+    state.mapSelectPending = false;
+    if (state.mapCatalog) state.mapCatalog.selection = data.selection;
+    state.mapSelectionNotice = `Using map '${name}'. Changes apply to the next localization or navigation start.`;
+    updateMapPanel();
+  } catch (error) {
+    state.mapSelectPending = false;
+    state.mapSelectionError = error.message;
+    state.mapSelectionNotice = null;
+    // The server is authoritative; resync in case the UI state was stale.
+    await refreshMaps();
+  }
+}
+
 // Per-target cursor: the max line seq we have already rendered. The server
 // only returns lines with seq > this, so polling is incremental. 0 means
 // "nothing yet" and makes the server return the current full buffer, which we
@@ -663,6 +829,12 @@ function updateTerminalLog(target, summary) {
     stateElement.textContent = "error";
     stateElement.className = "pill error";
     return;
+  }
+  if (target === "localization" || target === "navigation") {
+    const running = Boolean(summary.running);
+    if (target === "localization") state.localizationRunning = running;
+    else state.navigationRunning = running;
+    updateMapSelectionLock();
   }
   const lines = Array.isArray(summary.lines) ? summary.lines : [];
   const seq = typeof summary.seq === "number" ? summary.seq : undefined;
@@ -953,6 +1125,8 @@ async function startManagedTarget(target) {
     pollLogs();
   } catch (error) {
     result.textContent = `Start failed: ${error.message}`;
+    // Revalidate the selection so a stale/unavailable map becomes visible.
+    refreshMaps();
   }
 }
 
@@ -998,6 +1172,8 @@ function attachEvents() {
   document.getElementById("publishPose").addEventListener("click", publishPose);
   document.querySelectorAll("[data-start-target]").forEach((button) => button.addEventListener("click", () => startManagedTarget(button.dataset.startTarget)));
   document.querySelectorAll("[data-stop-target]").forEach((button) => button.addEventListener("click", () => stopManagedTarget(button.dataset.stopTarget)));
+  document.getElementById("mapSelect").addEventListener("change", (event) => selectMap(event.target.value));
+  document.getElementById("refreshMaps").addEventListener("click", () => refreshMaps(true));
   document.getElementById("openSaveMap").addEventListener("click", () => {
     saveMapSubmissionError = null;
     const dialog = document.getElementById("saveMapDialog");
@@ -1101,6 +1277,7 @@ function start() {
   pollMaps3d(true);
   pollMappingState();
   pollPose();
+  refreshMaps();
   setInterval(pollState, 1000);
   setInterval(pollMappingState, 1000);
   setInterval(pollPose, 100);
