@@ -5,6 +5,7 @@ import shlex
 import threading
 from dataclasses import dataclass
 from collections import deque
+from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
 CpuTicks = tuple[int, ...]
@@ -187,21 +188,74 @@ def _optional_finite_number(
     return value
 
 
-def validate_save_map_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def runtime_home_dir() -> str:
+    """Return the home directory of the user running the web node."""
+    return os.path.expanduser("~")
+
+
+def resolve_save_map_destination(destination: str, home: str) -> str:
+    """Resolve a web save-map destination to an absolute path under ``home``.
+
+    The web dialog sends a path starting with ``/`` that is relative to the web
+    node user's home directory (``/map`` or ``/map/site``), so the browser can
+    never pick an arbitrary robot directory. ``..`` components are rejected
+    instead of normalised, keeping the resolved path inside ``home``, and an
+    already home-prefixed destination (``/home/robot/map`` when the home is
+    ``/home/robot``) is rejected so the prefix is not applied twice.
+    """
+    if not isinstance(destination, str):
+        raise ValueError("destination must be a string path")
+    destination = destination.strip()
+    if not destination:
+        raise ValueError("destination is required")
+    if not destination.startswith("/"):
+        raise ValueError(
+            "destination must start with / and name a path under the home directory"
+        )
+
+    parts = PurePosixPath(destination).parts
+    if ".." in parts:
+        raise ValueError("destination must not contain '..' path components")
+    relative_parts = parts[1:]
+    if not relative_parts:
+        raise ValueError("destination must not be the filesystem root /")
+
+    if not isinstance(home, str) or not home.strip():
+        raise ValueError("home directory is required")
+    home = home.strip()
+    if not os.path.isabs(home):
+        raise ValueError("home directory must be an absolute path")
+
+    home_path = PurePosixPath(home)
+    destination_path = PurePosixPath(destination)
+    if home_path != PurePosixPath("/") and (
+        destination_path == home_path or home_path in destination_path.parents
+    ):
+        raise ValueError(
+            "destination must be relative to the home directory; "
+            f"remove the {home} prefix (for example /map instead of {home}/map)"
+        )
+
+    return os.path.join(home, *relative_parts)
+
+
+def validate_save_map_payload(
+    payload: dict[str, Any], *, home: str | None = None
+) -> dict[str, Any]:
     """Validate a web save-map payload against the SaveMapOptions service.
 
-    The service rejects anything but an explicit absolute destination, so the
-    same rule is enforced here before a request is sent. Omitted toggles use
-    the web dialog defaults (both artifacts enabled).
+    The web destination is relative to the web node user's home directory
+    (``/map``, ``/map/site``); it is resolved to an absolute path under ``home``
+    (default: the runtime user's home) before the service sees it. Omitted
+    toggles use the web dialog defaults (both artifacts enabled), and explicit
+    resolution values are forwarded unchanged.
     """
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
-    destination = payload.get("destination")
-    if not isinstance(destination, str) or not destination.strip():
-        raise ValueError("destination is required")
-    destination = destination.strip()
-    if not os.path.isabs(destination):
-        raise ValueError("destination must be an absolute path")
+    destination = resolve_save_map_destination(
+        payload.get("destination"),
+        runtime_home_dir() if home is None else home,
+    )
     return {
         "destination": destination,
         "resolution": _optional_finite_number(payload, "resolution", -1.0),

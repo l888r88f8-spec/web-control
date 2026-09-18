@@ -1,6 +1,7 @@
 import ast
 import json
 import math
+import pytest
 import signal
 import subprocess
 import threading
@@ -1511,11 +1512,68 @@ def _json_request(url, payload=None, method="GET"):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def test_resolve_save_map_destination_maps_web_paths_under_home():
+    assert core.resolve_save_map_destination("/map", "/home/robot") == "/home/robot/map"
+    assert (
+        core.resolve_save_map_destination("/map/site", "/home/robot")
+        == "/home/robot/map/site"
+    )
+    assert (
+        core.resolve_save_map_destination(" /map/site/run_01/ ", "/home/robot")
+        == "/home/robot/map/site/run_01"
+    )
+
+
+def test_resolve_save_map_destination_rejects_empty_root_and_relative_paths():
+    for destination in ("", "   ", "/", "map", "map/site", 7, None):
+        with pytest.raises(ValueError, match="destination"):
+            core.resolve_save_map_destination(destination, "/home/robot")
+
+
+def test_resolve_save_map_destination_rejects_parent_directory_escape():
+    for destination in (
+        "/..",
+        "/../etc",
+        "/map/..",
+        "/map/../etc",
+        "/map/site/../../etc",
+    ):
+        with pytest.raises(ValueError, match=r"\.\."):
+            core.resolve_save_map_destination(destination, "/home/robot")
+
+
+def test_resolve_save_map_destination_rejects_home_prefixed_paths():
+    for destination in (
+        "/home/robot",
+        "/home/robot/",
+        "/home/robot/map",
+        "/home/robot/map/site",
+    ):
+        with pytest.raises(ValueError, match="home"):
+            core.resolve_save_map_destination(destination, "/home/robot")
+
+    # A sibling directory merely sharing the home prefix is not home-prefixed.
+    assert (
+        core.resolve_save_map_destination("/home/robot2/map", "/home/robot")
+        == "/home/robot/home/robot2/map"
+    )
+
+
+def test_validate_save_map_payload_resolves_destination_under_runtime_home(monkeypatch):
+    monkeypatch.setenv("HOME", "/tmp/web-control-home")
+
+    payload = core.validate_save_map_payload({"destination": "/map/site"})
+
+    assert payload["destination"] == "/tmp/web-control-home/map/site"
+
+
 def test_validate_save_map_payload_fills_service_defaults():
-    payload = core.validate_save_map_payload({"destination": " /map/run_01 "})
+    payload = core.validate_save_map_payload(
+        {"destination": " /map/run_01 "}, home="/home/robot"
+    )
 
     assert payload == {
-        "destination": "/map/run_01",
+        "destination": "/home/robot/map/run_01",
         "resolution": -1.0,
         "ground_resolution": -1.0,
         "save_ground_map": True,
@@ -1531,11 +1589,12 @@ def test_validate_save_map_payload_accepts_explicit_options():
             "ground_resolution": "0.2",
             "save_ground_map": False,
             "save_tiled_map": True,
-        }
+        },
+        home="/home/robot",
     )
 
     assert payload == {
-        "destination": "/map/run_02",
+        "destination": "/home/robot/map/run_02",
         "resolution": 0.05,
         "ground_resolution": 0.2,
         "save_ground_map": False,
@@ -1543,21 +1602,25 @@ def test_validate_save_map_payload_accepts_explicit_options():
     }
 
 
-def test_validate_save_map_payload_requires_absolute_destination():
-    for destination in (None, "", "   ", 7, "map/run"):
-        try:
-            core.validate_save_map_payload({"destination": destination})
-        except ValueError as exc:
-            assert "destination" in str(exc)
-        else:
-            raise AssertionError(f"destination {destination!r} was accepted")
+def test_validate_save_map_payload_requires_home_relative_destination():
+    for destination in (None, "", "   ", 7, "map/run", "/"):
+        with pytest.raises(ValueError, match="destination"):
+            core.validate_save_map_payload(
+                {"destination": destination}, home="/home/robot"
+            )
 
-    try:
+    with pytest.raises(ValueError, match=r"\.\."):
+        core.validate_save_map_payload(
+            {"destination": "/map/../etc"}, home="/home/robot"
+        )
+
+    with pytest.raises(ValueError, match="home"):
+        core.validate_save_map_payload(
+            {"destination": "/home/robot/map"}, home="/home/robot"
+        )
+
+    with pytest.raises(ValueError, match="object"):
         core.validate_save_map_payload([])
-    except ValueError as exc:
-        assert "object" in str(exc)
-    else:
-        raise AssertionError("non-object payload was accepted")
 
 
 def test_validate_save_map_payload_rejects_non_boolean_toggles():
@@ -1642,6 +1705,7 @@ def test_save_map_job_ignores_stale_callbacks_after_abandon():
 
 def test_start_save_map_sends_async_request_and_returns_running_state(monkeypatch):
     monkeypatch.setattr(web_control_node, "SaveMapOptions", _FakeSaveMapOptions, raising=False)
+    monkeypatch.setenv("HOME", "/home/robot")
     future = _FakeFuture()
     client = _FakeSaveMapClient(ready=True, future=future)
     node = _FakeWebNode(client)
@@ -1659,10 +1723,10 @@ def test_start_save_map_sends_async_request_and_returns_running_state(monkeypatc
     assert response["ok"] is True
     assert response["state"] == "running"
     assert response["available"] is True
-    assert response["destination"] == "/map/hesai_sim"
+    assert response["destination"] == "/home/robot/map/hesai_sim"
     assert len(client.requests) == 1
     request = client.requests[0]
-    assert request.destination == "/map/hesai_sim"
+    assert request.destination == "/home/robot/map/hesai_sim"
     assert request.resolution == 0.05
     assert request.ground_resolution == 0.1
     assert request.save_ground_map is False
@@ -1670,17 +1734,32 @@ def test_start_save_map_sends_async_request_and_returns_running_state(monkeypatc
     assert future.callbacks
     assert node.save_map_future is future
 
-    future.response = _FakeSaveMapResponse(True, "saved to /map/hesai_sim")
+    future.response = _FakeSaveMapResponse(True, "saved to /home/robot/map/hesai_sim")
     future.resolve()
 
     assert node.save_map_future is None
     snapshot = node.save_map_job.snapshot()
     assert snapshot["state"] == "succeeded"
-    assert snapshot["message"] == "saved to /map/hesai_sim"
+    assert snapshot["destination"] == "/home/robot/map/hesai_sim"
+    assert snapshot["message"] == "saved to /home/robot/map/hesai_sim"
+
+
+def test_start_save_map_rejects_escaping_destination_before_starting_job(monkeypatch):
+    monkeypatch.setattr(web_control_node, "SaveMapOptions", _FakeSaveMapOptions, raising=False)
+    monkeypatch.setenv("HOME", "/home/robot")
+    client = _FakeSaveMapClient(ready=True)
+    node = _FakeWebNode(client)
+
+    with pytest.raises(ValueError, match=r"\.\."):
+        node.start_save_map({"destination": "/map/../etc"})
+
+    assert client.requests == []
+    assert node.save_map_job.snapshot()["state"] == "idle"
 
 
 def test_start_save_map_rejects_duplicate_while_running(monkeypatch):
     monkeypatch.setattr(web_control_node, "SaveMapOptions", _FakeSaveMapOptions, raising=False)
+    monkeypatch.setenv("HOME", "/home/robot")
     client = _FakeSaveMapClient(ready=True)
     node = _FakeWebNode(client)
     node.start_save_map({"destination": "/map/run"})
@@ -1693,7 +1772,7 @@ def test_start_save_map_rejects_duplicate_while_running(monkeypatch):
         raise AssertionError("duplicate save map request was accepted")
 
     assert len(client.requests) == 1
-    assert node.save_map_job.snapshot()["destination"] == "/map/run"
+    assert node.save_map_job.snapshot()["destination"] == "/home/robot/map/run"
 
 
 def test_start_save_map_reports_unavailable_service(monkeypatch):
@@ -1783,6 +1862,7 @@ def test_cleanup_save_map_cancels_pending_request_and_destroys_client(monkeypatc
 
 def test_save_map_handler_post_starts_async_job_and_get_reports_result(monkeypatch):
     monkeypatch.setattr(web_control_node, "SaveMapOptions", _FakeSaveMapOptions, raising=False)
+    monkeypatch.setenv("HOME", "/home/robot")
     future = _FakeFuture()
     node = _FakeWebNode(_FakeSaveMapClient(ready=True, future=future))
     server, thread = _serve_fake_web_node(node)
@@ -1801,21 +1881,22 @@ def test_save_map_handler_post_starts_async_job_and_get_reports_result(monkeypat
         assert status == 200
         assert body["ok"] is True
         assert body["state"] == "running"
+        assert body["destination"] == "/home/robot/map/run"
 
         status, body = _json_request(f"{base}/api/mapping/save_map")
         assert status == 200
         assert body["available"] is True
         assert body["state"] == "running"
-        assert body["destination"] == "/map/run"
+        assert body["destination"] == "/home/robot/map/run"
 
-        future.response = _FakeSaveMapResponse(True, "saved to /map/run")
+        future.response = _FakeSaveMapResponse(True, "saved to /home/robot/map/run")
         future.resolve()
 
         status, body = _json_request(f"{base}/api/mapping/save_map")
         assert status == 200
         assert body["state"] == "succeeded"
         assert body["success"] is True
-        assert body["message"] == "saved to /map/run"
+        assert body["message"] == "saved to /home/robot/map/run"
     finally:
         server.shutdown()
         server.server_close()

@@ -840,6 +840,9 @@ class WebControlNode(Node):
             return False
 
     def start_save_map(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # The web dialog sends a path relative to the web node user's home
+        # directory (/map); validation resolves it to an absolute path under
+        # that home before the job and the SaveMapOptions request use it.
         options = validate_save_map_payload(payload)
         if not self.save_map_available():
             raise SaveMapUnavailableError("save map service unavailable")

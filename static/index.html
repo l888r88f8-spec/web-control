@@ -211,9 +211,9 @@
     <dialog id="saveMapDialog" aria-labelledby="saveMapTitle">
       <form id="saveMapForm">
         <h2 id="saveMapTitle">Save Map</h2>
-        <label for="saveMapDestination">Destination directory on the robot</label>
-        <input id="saveMapDestination" name="destination" type="text" placeholder="/home/robot/maps/site" autocomplete="off" required>
-        <p class="save-map-hint">Enter an absolute path on the robot. Existing map files in that directory will be overwritten; unrelated files are preserved.</p>
+        <label for="saveMapDestination">Destination path under the robot user's home directory</label>
+        <input id="saveMapDestination" name="destination" type="text" value="/map/hesai_outdoor" placeholder="/map/hesai_outdoor" autocomplete="off" required>
+        <p class="save-map-hint">Enter a path such as /map or /map/site. The web node resolves it under its user's home directory on the robot (usually /home/robot). Existing map files in that directory will be overwritten; unrelated files are preserved.</p>
         <label class="save-map-option"><input id="saveMapGround" type="checkbox" checked> Save ground map (GroundMap.pcd)</label>
         <label class="save-map-option"><input id="saveMapTiled" type="checkbox" checked> Save tiled map</label>
         <div class="save-map-dialog-actions">

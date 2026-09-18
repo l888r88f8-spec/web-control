@@ -597,17 +597,22 @@ async function submitSaveMap(event) {
   const destinationInput = document.getElementById("saveMapDestination");
   const destination = destinationInput.value.trim();
   if (!destination.startsWith("/") || destination === "/") {
-    destinationInput.setCustomValidity("Enter an absolute directory path on the robot, other than /.");
+    destinationInput.setCustomValidity("Enter a path under the robot user's home directory, such as /map or /map/site.");
+    destinationInput.reportValidity();
+    return;
+  }
+  if (destination.split("/").includes("..")) {
+    destinationInput.setCustomValidity("Destination cannot contain '..' path segments.");
     destinationInput.reportValidity();
     return;
   }
   destinationInput.setCustomValidity("");
-  if (!window.confirm(`Save the map to ${destination}?\n\nExisting map files in this directory will be overwritten. Unrelated files are preserved.`)) return;
+  if (!window.confirm(`Save the map to ${destination} under the robot user's home directory?\n\nExisting map files in this directory will be overwritten. Unrelated files are preserved.`)) return;
 
   dialog.close();
   saveMapSubmissionError = null;
   document.getElementById("openSaveMap").disabled = true;
-  document.getElementById("saveMapStatus").textContent = `Starting map save to ${destination} ...`;
+  document.getElementById("saveMapStatus").textContent = `Starting map save to ${destination} under the robot user's home directory ...`;
   try {
     await postJson("/api/mapping/save_map", {
       destination,
