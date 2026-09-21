@@ -24,3 +24,16 @@ ros2 launch web_control web_control.launch.py
 - 选择只影响**下一次**由网页启动的 localization/navigation，不会热重载正在运行的地图。localization 或 navigation 运行期间无法更改选择（服务端返回 409），需要先停止相应进程。
 - 点击 **Refresh** 可重新扫描地图目录；保存地图成功后列表也会自动刷新。
 - 通过命令行直接执行 `ros2 launch`（例如 `~/bringup.sh`）时仍使用各自配置中的默认地图，不受网页选择影响。
+
+## 暂停与恢复导航（Pause / Resume / Clear）
+
+**Navigation** 页面的 **Target Pose** 区域提供导航目标控制：
+
+- **Pause Navigation**：在当前目标 accepted/executing 时可用。网页节点先把目标保存为 `pausing`，再通过 `cancel_goal_service`（默认 `/p2p_move_base/_action/cancel_goal`，使用零 UUID）取消当前 Action 目标；收到 Action 的 `canceled` 后进入 **Paused**，不会停止 navigation launch。
+- **Resume Navigation**：在 **Paused** 且当前所选地图与保存地图一致时可用。网页节点用保存的 x/y/z/yaw/frame 重新发布目标，由导航从机器人当前位姿重新规划；新目标被 accepted/executing 后才删除保存记录。
+- **Clear Goal**：取消当前目标或删除已暂停的目标。删除已暂停目标不会调用 Action 服务；取消进行中（**Pausing**）时点击 Clear 会复用同一次取消请求。**Resuming** 期间 Clear 返回 HTTP 409。
+- 状态显示为 `Idle`、`Navigating`、`Pausing`、`Paused`、`Resuming` 或 `Clearing`；过渡状态期间会禁用可能重复发布目标的按钮。
+- 暂停目标持久化在 `~/.config/web_control/paused_navigation.json`，浏览器刷新或网页节点重启后仍可 Resume。重启时若检测到 active 但无保存目标，显示 **Navigating**，允许 Clear，Pause 禁用。
+- 网页节点重启后若 Action 状态数组为空（当前没有任何目标），持久化的 **Pausing**/**Resuming** 会一次性归一为 **Paused**，保存目标保留、可继续 Resume；已处于 **Paused** 的记录保持不变。
+- 选择另一张地图会清除上一张地图的暂停目标；取消服务超时返回 HTTP 504，状态保持 **Pausing**，前端继续轮询直到 Action 状态确定。
+- `GET /api/state` 的 `navigation_control` 字段是按钮文案与可用状态的唯一权威来源。

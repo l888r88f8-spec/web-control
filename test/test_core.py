@@ -3947,3 +3947,14 @@ def test_frontend_navigation_controls_behavior_executes_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "navigation control behavior ok" in completed.stdout
+
+
+def test_readme_documents_navigation_pause_and_cancel_service():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Pause Navigation" in readme
+    assert "Resume Navigation" in readme
+    assert "paused_navigation.json" in readme
+    assert "cancel_goal_service" in readme
