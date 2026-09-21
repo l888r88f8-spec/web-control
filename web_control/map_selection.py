@@ -6,10 +6,9 @@ that name against the map root on every use.
 
 import json
 import logging
-import os
-import tempfile
 from pathlib import Path
 
+from web_control.atomic_io import atomic_write_text
 from web_control.map_catalog import validate_map_name
 
 SELECTION_FILENAME = "selected_map.json"
@@ -27,20 +26,7 @@ def _runtime_home(home: Path | None) -> Path:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` by replacing a fully written sibling file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, text)
 
 
 class SelectionStore:
