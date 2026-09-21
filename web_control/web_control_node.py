@@ -88,6 +88,7 @@ from web_control.navigation_control import (
     NavigationUnavailableError,
     PAUSING,
     PENDING_CLEAR,
+    PENDING_PAUSE,
     RESUMING,
     select_action_status,
 )
@@ -1028,13 +1029,10 @@ class WebControlNode(Node):
             if not self.navigation_control.has_goal():
                 self.published_goal = None
         if action == "retry_cancel":
-            clear_retry = self.navigation_control.pending_kind() == PENDING_CLEAR
-            threading.Thread(
-                target=self._retry_startup_cancel,
-                args=(clear_retry,),
-                name="web_control_retry_cancel",
-                daemon=True,
-            ).start()
+            token = self.navigation_control.retry_token()
+            kind = self.navigation_control.retry_kind()
+            if token is not None and kind is not None:
+                self._spawn_cancel_retry(kind, token)
 
     def _cancel_all_goals(self) -> str:
         """Cancel every server goal with a zero UUID.
@@ -1082,29 +1080,46 @@ class WebControlNode(Node):
         results = list(getattr(response, "goals_canceling", []) or [])
         return "accepted" if results else "empty"
 
-    def _retry_startup_cancel(self, clear: bool | None = None) -> None:
+    def _spawn_cancel_retry(self, kind: str, token: int) -> None:
+        """Start the single bounded background cancel retry for ``token``."""
+        threading.Thread(
+            target=self._retry_startup_cancel,
+            args=(kind == PENDING_CLEAR, token),
+            name="web_control_retry_cancel",
+            daemon=True,
+        ).start()
+
+    def _retry_startup_cancel(
+        self, clear: bool | None = None, token: int | None = None
+    ) -> None:
         """Retry a cancellation that raced goal registration or a restart.
 
-        ``clear`` selects the Clear registration retry so a failure reports a
-        truthful Navigating state with the goal retained; a Pause retry keeps
-        the previous behavior of leaving the transition in place when the
-        service is unavailable.
+        The retry lease generation and the still-pending intent are revalidated
+        under the control lock immediately before the service call, and the lock
+        is released before waiting on the future so the single-threaded ROS
+        executor can complete it.  ``clear`` selects the Clear registration
+        retry so a failure reports a truthful Navigating state with the goal
+        retained; a Pause retry uses the same failure handling.
         """
         if clear is None:
             clear = self.navigation_control.pending_kind() == PENDING_CLEAR
-        if clear and self.navigation_control.pending_kind() != PENDING_CLEAR:
-            return
+        kind = PENDING_CLEAR if clear else PENDING_PAUSE
+        if token is None:
+            token = self.navigation_control.retry_token()
         try:
-            result = self._cancel_all_goals()
-        except (NavigationUnavailableError, NavigationTimeoutError):
-            if clear:
-                self.navigation_control.note_cancel_failed(self.now_sec())
-                with self.lock:
-                    if not self.navigation_control.has_goal():
-                        self.published_goal = None
-            return
-        if result != "accepted":
-            self.navigation_control.note_cancel_failed(self.now_sec())
+            if not self.navigation_control.validate_retry(token, kind):
+                return
+            try:
+                result = self._cancel_all_goals()
+            except (NavigationUnavailableError, NavigationTimeoutError):
+                self.navigation_control.note_cancel_failed(self.now_sec(), token)
+                return
+            if result == "accepted":
+                self.navigation_control.note_cancel_accepted(token)
+            else:
+                self.navigation_control.note_cancel_failed(self.now_sec(), token)
+        finally:
+            self.navigation_control.release_retry(token)
             with self.lock:
                 if not self.navigation_control.has_goal():
                     self.published_goal = None
@@ -1418,6 +1433,12 @@ class WebControlNode(Node):
         try:
             result = self._cancel_all_goals()
         except NavigationTimeoutError:
+            # Keep the pausing record for polling and schedule exactly one
+            # bounded retry so a later Clear is never stuck on an untracked
+            # cancel.
+            token = self.navigation_control.note_cancel_timeout(self.now_sec())
+            if token is not None:
+                self._spawn_cancel_retry(PENDING_PAUSE, token)
             raise
         except NavigationUnavailableError:
             self.navigation_control.note_cancel_failed(self.now_sec())
@@ -1427,6 +1448,7 @@ class WebControlNode(Node):
             # pause never started; restore the previous navigating state.
             self.navigation_control.note_cancel_failed(self.now_sec())
             raise NavigationConflictError("no active navigation goal to cancel")
+        self.navigation_control.note_cancel_accepted()
         response = success_response("pause requested", self.now_sec())
         response["navigation_control"] = self.navigation_control.snapshot(map_name)
         return response
@@ -1459,6 +1481,11 @@ class WebControlNode(Node):
             try:
                 result = self._cancel_all_goals()
             except NavigationTimeoutError:
+                # Keep clearing/record state for polling and schedule a bounded
+                # retry so repeated Clear cannot become permanently 409.
+                token = self.navigation_control.note_cancel_timeout(self.now_sec())
+                if token is not None:
+                    self._spawn_cancel_retry(PENDING_CLEAR, token)
                 raise
             except NavigationUnavailableError:
                 self.navigation_control.note_cancel_failed(self.now_sec())
@@ -1467,10 +1494,14 @@ class WebControlNode(Node):
                         self.published_goal = None
                 raise
             if result == "empty":
-                # An empty result while the goal is still awaiting its first
-                # active status only means registration raced the cancel; the
-                # control keeps clearing and retains the goal for the retry.
-                self.navigation_control.note_cancel_empty(self.now_sec())
+                # An empty result may be a registration race; the control keeps
+                # clearing and may ask for exactly one bounded retry.
+                action = self.navigation_control.note_cancel_empty(self.now_sec())
+                if action == "retry_cancel":
+                    token = self.navigation_control.retry_token()
+                    kind = self.navigation_control.retry_kind()
+                    if token is not None and kind is not None:
+                        self._spawn_cancel_retry(kind, token)
             elif result == "rejected":
                 # The service refused; the goal may still be running, so keep
                 # the previous state instead of pretending the clear finished.
@@ -1479,6 +1510,8 @@ class WebControlNode(Node):
                     if not self.navigation_control.has_goal():
                         self.published_goal = None
                 raise NavigationUnavailableError("cancel goal request rejected")
+            else:
+                self.navigation_control.note_cancel_accepted()
         with self.lock:
             if not self.navigation_control.has_goal():
                 self.published_goal = None
@@ -1494,11 +1527,18 @@ class WebControlNode(Node):
                 "navigation is busy; wait for the current command to finish"
             )
         pose = validate_pose_payload(payload)
-        self._publish_goal_pose(pose)
         now = self.now_sec()
-        self.navigation_control.record_goal_published(
+        # Arm the transition floor and reject retry-lease conflicts before the
+        # ROS publish, but keep the old paused record until it succeeds.
+        token = self.navigation_control.prepare_goal_publish(
             pose, self.map_frame, map_name, now
         )
+        try:
+            self._publish_goal_pose(pose)
+        except Exception:
+            self.navigation_control.rollback_goal_publish(token)
+            raise
+        self.navigation_control.commit_goal_publish(token)
         with self.lock:
             self.published_goal = {
                 "x": pose["x"],

@@ -31,9 +31,9 @@ ros2 launch web_control web_control.launch.py
 
 - **Pause Navigation**：在当前目标 accepted/executing 时可用。网页节点先把目标保存为 `pausing`，再通过 `cancel_goal_service`（默认 `/p2p_move_base/_action/cancel_goal`，使用零 UUID）取消当前 Action 目标；收到 Action 的 `canceled` 后进入 **Paused**，不会停止 navigation launch。
 - **Resume Navigation**：在 **Paused** 且当前所选地图与保存地图一致时可用。网页节点用保存的 x/y/z/yaw/frame 重新发布目标，由导航从机器人当前位姿重新规划；新目标被 accepted/executing 后才删除保存记录。
-- **Clear Goal**：取消当前目标或删除已暂停的目标。删除已暂停目标不会调用 Action 服务；取消进行中（**Pausing**）时点击 Clear 会复用同一次取消请求。**Resuming** 期间 Clear 返回 HTTP 409。
+- **Clear Goal**：取消当前目标或删除已暂停的目标。删除已暂停目标不会调用 Action 服务；本进程内取消进行中（**Pausing**）时点击 Clear 会复用同一次取消请求。网页节点重启后恢复的 **Pausing**、或取消服务已经超时的 **Pausing**，没有可复用的在途取消，Clear 会重新发送一次取消。**Resuming** 期间 Clear 返回 HTTP 409。
 - 状态显示为 `Idle`、`Navigating`、`Pausing`、`Paused`、`Resuming` 或 `Clearing`；过渡状态期间会禁用可能重复发布目标的按钮。
 - 暂停目标持久化在 `~/.config/web_control/paused_navigation.json`，浏览器刷新或网页节点重启后仍可 Resume。重启时若检测到 active 但无保存目标，显示 **Navigating**，允许 Clear，Pause 禁用。
 - 网页节点重启后若 Action 状态数组为空（当前没有任何目标），持久化的 **Pausing**/**Resuming** 会一次性归一为 **Paused**，保存目标保留、可继续 Resume；已处于 **Paused** 的记录保持不变。
-- 选择另一张地图会清除上一张地图的暂停目标；取消服务超时返回 HTTP 504，状态保持 **Pausing**，前端继续轮询直到 Action 状态确定。
+- 选择另一张地图会清除上一张地图的暂停目标；取消服务超时返回 HTTP 504，状态与保存记录保持不变以便轮询，同时调度**一次有界后台重试**。若重试仍然不可用/超时/被拒绝/（目标已确认 active 后）匹配不到目标，则状态如实回到 **Navigating** 并保留当前目标（Clear 意图会丢弃暂停记录），浏览器可再次点击 **Clear Goal** 重试。自动重试运行期间，新的 Resume 或目标发布会被拒绝，直到重试租约释放。
 - `GET /api/state` 的 `navigation_control` 字段是按钮文案与可用状态的唯一权威来源。

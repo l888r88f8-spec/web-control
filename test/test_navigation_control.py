@@ -7,6 +7,8 @@ from web_control.navigation_control import (
     NAVIGATING,
     PAUSED,
     PAUSING,
+    PENDING_CLEAR,
+    PENDING_PAUSE,
     RESUMING,
     NavigationConflictError,
     NavigationControl,
@@ -613,3 +615,304 @@ def test_map_change_invalidates_paused_record(tmp_path):
 
     assert store.load() is None
     assert control.snapshot("site_b")["state"] == IDLE
+
+
+# --- F1: clear published before the goal is confirmed active -----------------
+
+
+def test_clear_accepted_before_empty_triggers_exactly_one_retry(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+
+    # The accepted status is processed while the HTTP thread is still blocked
+    # inside CancelGoal; it confirms registration before the empty result lands.
+    assert control.note_action_status("accepted", 7, 11.0) is None
+    assert control.snapshot("site_a")["state"] == CLEARING
+
+    # The first cancel matched no goal, so the clear must stay pending and arm
+    # exactly one retry.
+    assert control.note_cancel_empty(11.5) == "retry_cancel"
+    assert control.snapshot("site_a")["state"] == CLEARING
+    assert control.snapshot("site_a")["has_goal"] is True
+    token = control.retry_token()
+    assert token is not None
+    assert control.validate_retry(token, PENDING_CLEAR) is True
+
+    # A later executing status must not arm a second retry.
+    assert control.note_action_status("executing", 7, 12.0) is None
+    assert control.retry_token() == token
+
+    control.note_action_status("canceled", 7, 13.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_clear_before_active_accepted_result_never_retries(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+
+    # The initial cancel matched the goal: no registration race, so a confirming
+    # status must never schedule a retry.
+    control.note_cancel_accepted()
+    assert control.note_action_status("accepted", 7, 11.0) is None
+    assert control.retry_token() is None
+    assert control.retry_lease_active() is False
+
+    control.note_action_status("canceled", 7, 12.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_clear_empty_before_confirmation_retries_on_confirmation(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+
+    # Empty result lands before the goal is confirmed.
+    assert control.note_cancel_empty(10.5) is None
+    assert control.retry_token() is None
+
+    # Confirmation now arms exactly one retry.
+    assert control.note_action_status("accepted", 7, 11.0) == "retry_cancel"
+    token = control.retry_token()
+    assert token is not None
+    assert control.validate_retry(token, PENDING_CLEAR) is True
+    assert control.note_action_status("executing", 7, 12.0) is None
+    assert control.retry_token() == token
+
+
+# --- F2: retry lease blocks operator publish/resume --------------------------
+
+
+def test_publish_and_resume_blocked_while_retry_lease_outstanding(tmp_path):
+    control, store = _control(tmp_path, _record(phase="pausing"))
+    assert control.note_action_status("executing", 7, 9.0) == "retry_cancel"
+    token = control.retry_token()
+    assert token is not None
+
+    with pytest.raises(NavigationConflictError):
+        control.begin_resume(10.0, "site_a")
+
+    with pytest.raises(NavigationConflictError):
+        control.prepare_goal_publish(
+            {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+        )
+
+    # The old goal terminates while the retry is delayed; pending intent is gone
+    # so revalidation must fail and release the lease.
+    control.note_action_status("canceled", 7, 11.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+    assert control.validate_retry(token, PENDING_PAUSE) is False
+    control.release_retry(token)
+    assert control.retry_lease_active() is False
+    assert control.begin_resume(12.0, "site_a")["x"] == 1.0
+
+
+# --- F3: late failure/empty callbacks are idempotent no-ops ------------------
+
+
+def test_late_cancel_failure_after_terminal_is_noop(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    control.note_action_status("canceled", 5, 11.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+
+    # A callback that arrives after the transition already settled must not
+    # create an unmanageable Idle state with a persisted paused record.
+    control.note_cancel_failed(12.0)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert store.load()["phase"] == "paused"
+
+
+def test_late_cancel_empty_after_terminal_is_noop(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    control.note_action_status("canceled", 5, 11.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+
+    assert control.note_cancel_empty(12.0) is None
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert store.load()["phase"] == "paused"
+
+
+def test_late_cancel_failure_with_unknown_token_is_noop(tmp_path):
+    control, store = _control(tmp_path, _record())
+    control.note_cancel_failed(9.0, token=99)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert store.load()["phase"] == "paused"
+
+
+# --- F4: timeout recovery through the retry lease ----------------------------
+
+
+def test_cancel_timeout_arms_retry_and_clear_requests_fresh_cancel(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+
+    token = control.note_cancel_timeout(10.5)
+    assert token is not None
+    assert control.validate_retry(token, PENDING_PAUSE) is True
+    # The timeout contract keeps the pausing record for polling.
+    assert control.snapshot("site_a")["state"] == PAUSING
+    assert store.load()["phase"] == "pausing"
+
+    # Clear during the timed-out pause cannot reuse an untracked cancel: it
+    # invalidates the delayed retry and asks for a fresh cancel.
+    assert control.begin_clear(11.0) is True
+    assert control.snapshot("site_a")["state"] == CLEARING
+    assert control.validate_retry(token, PENDING_PAUSE) is False
+
+
+def test_cancel_timeout_retry_failure_settles_navigating_with_goal(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_clear(10.0)
+    token = control.note_cancel_timeout(10.5)
+    assert token is not None
+
+    # The bounded retry was rejected/empty while the goal is still active.
+    control.note_cancel_failed(11.0, token=token)
+    control.release_retry(token)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == NAVIGATING
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+    assert control.retry_lease_active() is False
+
+
+# --- F5: operator commands supersede startup reconciliation ------------------
+
+
+def test_restored_pausing_clear_before_first_status_supersedes_reconcile(tmp_path):
+    control, store = _control(tmp_path, _record(phase="pausing"))
+
+    # Restored pausing has no in-process cancel, so Clear must send a fresh one.
+    assert control.begin_clear(10.0) is True
+    assert control.snapshot("site_a")["state"] == CLEARING
+
+    # Startup reconciliation must not overwrite the explicit command.
+    control.note_no_active_goals(10.5)
+    assert control.snapshot("site_a")["state"] == CLEARING
+    assert control.note_action_status("accepted", 7, 11.0) is None
+    assert control.snapshot("site_a")["state"] == CLEARING
+
+    control.note_action_status("canceled", 7, 12.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_restored_paused_resume_before_empty_status_is_not_reverted(tmp_path):
+    control, store = _control(tmp_path, _record())
+
+    control.begin_resume(10.0, "site_a")
+    assert control.snapshot("site_a")["state"] == RESUMING
+
+    # The first status-less update must not roll the resume back to paused and
+    # invite a duplicate publish.
+    control.note_no_active_goals(10.5)
+    assert control.snapshot("site_a")["state"] == RESUMING
+    assert store.load()["phase"] == "resuming"
+
+
+# --- F6: resume publish failure resets every transition field ----------------
+
+
+def test_resume_publish_failure_resets_transition_fields(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    control.note_action_status("canceled", 5, 11.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+
+    control.begin_resume(12.0, "site_a")
+    assert control.snapshot("site_a")["state"] == RESUMING
+
+    control.note_resume_publish_failed(12.5)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert store.load()["phase"] == "paused"
+
+    # A stale terminal arriving after the failed publish must not delete the
+    # now-paused record.
+    control.note_action_status("aborted", 9, 13.0)
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert store.load()["phase"] == "paused"
+
+
+# --- F7: two-phase goal publish reservation ----------------------------------
+
+
+def test_goal_publish_reservation_arms_floor_and_commits(tmp_path):
+    control, store = _control(tmp_path, _record())
+    token = control.prepare_goal_publish(
+        {"x": 5.0, "y": 6.0, "z": 0.0, "yaw": 1.0}, "map", "site_a", 10.0
+    )
+    # The old paused record survives until the publish is committed.
+    assert store.load()["phase"] == "paused"
+
+    # A status that arrives inside the ROS publish must be treated as the new
+    # goal's confirmation, not filtered by a post-publish floor.
+    assert control.note_action_status("accepted", 9, 10.1) is None
+
+    control.commit_goal_publish(token)
+    assert store.load() is None
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == NAVIGATING
+    assert snapshot["can_pause"] is True
+
+    control.note_action_status("succeeded", 9, 11.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+
+
+def test_goal_publish_reservation_rolls_back_to_paused(tmp_path):
+    control, store = _control(tmp_path, _record())
+    token = control.prepare_goal_publish(
+        {"x": 5.0, "y": 6.0, "z": 0.0, "yaw": 1.0}, "map", "site_a", 10.0
+    )
+    control.rollback_goal_publish(token)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
+    assert snapshot["paused_goal"]["x"] == 1.0
+    assert store.load()["phase"] == "paused"
+    assert control.retry_lease_active() is False
+
+    # A stale terminal for the aborted publish must not disturb the record.
+    control.note_action_status("aborted", 9, 11.0)
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert store.load()["phase"] == "paused"

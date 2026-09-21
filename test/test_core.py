@@ -30,6 +30,7 @@ from web_control.core import (
     validate_pose_payload,
     yaw_from_quaternion,
 )
+from web_control.navigation_control import PENDING_CLEAR
 
 
 def test_yaw_quaternion_round_trip():
@@ -3253,7 +3254,10 @@ def _navigation_node(
     }
     node.paths = {}
     node.viewers = ViewerRegistry(timeout_sec=10.0)
-    for name in methods:
+    # ``_spawn_cancel_retry`` is always available so timeout paths can be driven
+    # deterministically; tests may override it with a recorder.
+    bound = set(methods) | {"_spawn_cancel_retry"}
+    for name in bound:
         setattr(
             node,
             name,
@@ -3500,6 +3504,8 @@ def test_pause_navigation_timeout_keeps_pausing_record(tmp_path, monkeypatch):
     )
     _arm_active_goal(node)
     monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+    # Keep the bounded background retry from racing the assertion below.
+    node._spawn_cancel_retry = lambda kind, token: None
 
     with pytest.raises(web_control_node.NavigationTimeoutError):
         node.pause_navigation()
@@ -3708,7 +3714,10 @@ def test_clear_before_active_registration_retries_then_reaches_idle(
 
     # A newer accepted status confirms registration and queues exactly one retry.
     node.action_status_callback(_GoalStatusArray([_GoalStatus(1, 7)]))
-    assert spawned == [(node._retry_startup_cancel, (True,))]
+    assert len(spawned) == 1
+    retry_target, retry_args = spawned[0]
+    assert retry_target == node._retry_startup_cancel
+    assert retry_args[0] is True
     node.action_status_callback(_GoalStatusArray([_GoalStatus(2, 7)]))
     assert len(spawned) == 1
     assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
@@ -3974,6 +3983,7 @@ def test_pause_endpoint_returns_504_on_timeout(tmp_path, monkeypatch):
     )
     _arm_active_goal(node)
     monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+    node._spawn_cancel_retry = lambda kind, token: None
 
     status, body = _serve_and_request(node, "/api/navigation/pause", {}, "POST")
 
@@ -4053,6 +4063,287 @@ def test_clear_endpoint_returns_409_while_resuming(tmp_path):
     assert body["ok"] is False
     assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
     assert node.navigation_store.load()["phase"] == "resuming"
+
+
+# --- Regressions for the F1-F7 navigation transition hardening -------------
+
+
+def test_clear_accept_before_empty_retries_once_to_idle(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "publish_goal",
+            "clear_navigation",
+            "action_status_callback",
+            "_retry_startup_cancel",
+        ),
+    )
+    node.publish_goal({"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0})
+    assert node.navigation_control.snapshot("site_a")["state"] == "navigating"
+
+    calls = []
+
+    def scripted_cancel():
+        calls.append(1)
+        if len(calls) == 1:
+            # The accepted status lands while the HTTP thread is blocked inside
+            # CancelGoal, before the empty result is returned.
+            node.action_status_callback(_GoalStatusArray([_GoalStatus(1, 9)]))
+            return "empty"
+        return "accepted"
+
+    node._cancel_all_goals = scripted_cancel
+    spawned = []
+    node._spawn_cancel_retry = lambda kind, token: spawned.append((kind, token))
+
+    response = node.clear_navigation()
+
+    assert response["navigation_control"]["state"] == "clearing"
+    assert len(spawned) == 1
+    assert spawned[0][0] == PENDING_CLEAR
+    assert len(calls) == 1
+
+    # Exactly one retry is sent, and its accepted result keeps clearing.
+    node._retry_startup_cancel(True, spawned[0][1])
+    assert len(calls) == 2
+    assert len(spawned) == 1
+
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(5, 9)]))
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "idle"
+    assert snapshot["has_goal"] is False
+    assert node.published_goal is None
+
+
+def test_stale_pause_retry_blocks_publish_and_resume_then_skips(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(phase="pausing"),
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "resume_navigation",
+            "action_status_callback",
+            "_retry_startup_cancel",
+        ),
+    )
+    spawned = []
+    node._spawn_cancel_retry = lambda kind, token: spawned.append((kind, token))
+
+    # Startup sees an active goal and schedules the interrupted Pause retry.
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(2, 7)]))
+    assert len(spawned) == 1
+    token = spawned[0][1]
+    assert node.navigation_control.retry_lease_active() is True
+
+    # The old goal terminates before the delayed retry thread runs.
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(5, 7)]))
+    assert node.navigation_control.snapshot("site_a")["state"] == "paused"
+
+    # Operator resume/new publish are blocked until the lease is released.
+    with pytest.raises(web_control_node.NavigationConflictError):
+        node.resume_navigation()
+    with pytest.raises(web_control_node.NavigationConflictError):
+        node.publish_goal({"x": 5.0, "y": 6.0, "z": 0.0, "yaw": 0.0})
+    assert node.goal_publications == []
+
+    # The delayed retry revalidates, skips, and must not cancel the new goal.
+    before = len(node.cancel_goal_client.requests)
+    node._retry_startup_cancel(False, token)
+    assert len(node.cancel_goal_client.requests) == before
+    assert node.navigation_control.retry_lease_active() is False
+
+    # Resume works once the stale lease is gone.
+    node.resume_navigation()
+    assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
+
+
+def test_pause_timeout_then_clear_issues_fresh_cancel(tmp_path, monkeypatch):
+    node = _navigation_node(
+        tmp_path,
+        client=_FakeCancelClient(ready=True, future=_FakeFuture()),
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "pause_navigation",
+            "clear_navigation",
+        ),
+    )
+    _arm_active_goal(node)
+    monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+    spawned = []
+    node._spawn_cancel_retry = lambda kind, token: spawned.append((kind, token))
+
+    with pytest.raises(web_control_node.NavigationTimeoutError):
+        node.pause_navigation()
+
+    assert node.navigation_control.snapshot("site_a")["state"] == "pausing"
+    assert node.navigation_store.load()["phase"] == "pausing"
+    assert len(spawned) == 1
+
+    # Clear during the timed-out Pause sends a fresh cancel rather than reusing
+    # a cancellation that no longer has a tracked completion.
+    response = node.clear_navigation()
+
+    assert response["navigation_control"]["state"] == "clearing"
+    assert len(node.cancel_goal_client.requests) == 2
+
+    node.navigation_control.note_action_status("canceled", 5, 12.0)
+    assert node.navigation_control.snapshot("site_a")["state"] == "idle"
+
+
+def test_clear_timeout_background_retry_recovers_to_navigating(tmp_path, monkeypatch):
+    client = _FakeCancelClient(ready=True, future=_FakeFuture())
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "clear_navigation",
+            "_retry_startup_cancel",
+        ),
+    )
+    _arm_active_goal(node)
+    monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+    spawned = []
+    node._spawn_cancel_retry = lambda kind, token: spawned.append((kind, token))
+
+    with pytest.raises(web_control_node.NavigationTimeoutError):
+        node.clear_navigation()
+
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+    assert spawned and spawned[0][0] == PENDING_CLEAR
+
+    # Let the bounded retry report that nothing is canceling; the state must
+    # become truthfully Navigating so the browser can Clear again.
+    client.future.done_flag = True
+    client.results = ()
+    node._retry_startup_cancel(True, spawned[0][1])
+
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "navigating"
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+
+
+def test_restored_pausing_clear_before_first_status_issues_cancel(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(phase="pausing"),
+        methods=(
+            "state_payload",
+            "_cancel_all_goals",
+            "clear_navigation",
+            "action_status_callback",
+        ),
+    )
+
+    response = node.clear_navigation()
+
+    assert response["navigation_control"]["state"] == "clearing"
+    assert len(node.cancel_goal_client.requests) == 1
+
+    # The startup reconciliation must not overwrite the explicit Clear.
+    node.action_status_callback(_EmptyGoalStatusArray())
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+
+
+def test_restored_paused_resume_before_status_does_not_double_publish(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "resume_navigation",
+            "action_status_callback",
+        ),
+    )
+
+    node.resume_navigation()
+    assert len(node.goal_publications) == 1
+    assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
+
+    # A first status-less update must not revert the resume and invite a second
+    # publish.
+    node.action_status_callback(_EmptyGoalStatusArray())
+    assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
+    assert len(node.goal_publications) == 1
+
+
+def test_resume_publish_failure_restores_paused_and_ignores_stale_terminal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "resume_navigation",
+            "action_status_callback",
+        ),
+    )
+
+    def failing_publish(pose, frame=None):
+        raise RuntimeError("publish failed")
+
+    node._publish_goal_pose = failing_publish
+
+    with pytest.raises(web_control_node.NavigationUnavailableError):
+        node.resume_navigation()
+
+    assert node.navigation_store.load()["phase"] == "paused"
+
+    # A stale terminal must not delete the paused record after the reset.
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(6, 9)]))
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "paused"
+    assert snapshot["can_resume"] is True
+    assert node.navigation_store.load()["phase"] == "paused"
+
+
+def test_goal_publish_status_during_publish_is_not_floor_filtered(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "publish_goal",
+            "action_status_callback",
+        ),
+    )
+    # An older active goal at stamp 5 makes the new goal's accepted genuinely
+    # newer; the bug armed the floor with that same newer stamp after publish.
+    node.navigation_control.record_goal_published(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    node.navigation_control.note_action_status("executing", 5, 10.0)
+    node.published_goal = {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}
+
+    def publishing(pose, frame=None):
+        # Accepted for the new goal is processed inside the ROS publish, before
+        # the state records the goal.
+        node.action_status_callback(_GoalStatusArray([_GoalStatus(1, 9)]))
+
+    node._publish_goal_pose = publishing
+
+    node.publish_goal({"x": 5.0, "y": 6.0, "z": 0.0, "yaw": 1.0})
+
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(2, 9)]))
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "navigating"
+    assert snapshot["can_pause"] is True
+
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(4, 9)]))
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "idle"
 
 
 _NAVIGATION_PANEL_NODE_HARNESS = r"""
