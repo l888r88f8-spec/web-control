@@ -709,13 +709,26 @@ class NavigationControl:
 
     def note_cancel_timeout(self, now: float) -> int | None:
         """A cancel timed out; keep the state and arm one bounded retry."""
+        lease = self.note_cancel_timeout_lease(now)
+        return lease[0] if lease is not None else None
+
+    def note_cancel_timeout_lease(self, now: float) -> tuple[int, str] | None:
+        """Arm the bounded timeout retry and return its ``(generation, kind)``.
+
+        The kind is read from the newly armed lease under the same lock, so a
+        caller that started a Pause while a concurrent Clear changed the pending
+        intent retries Clear instead of its stale assumption.
+        """
         with self._lock:
             if self._pending not in (PENDING_PAUSE, PENDING_CLEAR):
                 return None
             # The request gave up on the future, so there is no tracked
             # completion to reuse: a later Clear must send a new cancel.
             self._pause_cancel_tracked = False
-            return self._arm_retry_locked(self._pending)
+            token = self._arm_retry_locked(self._pending)
+            if token is None:
+                return None
+            return token, self._retry_kind
 
     def note_cancel_failed(self, now: float, token: int | None = None) -> None:
         """An explicit rejection or unavailable service ends the transition.

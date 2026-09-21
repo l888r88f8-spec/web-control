@@ -4234,6 +4234,72 @@ def test_clear_timeout_background_retry_recovers_to_navigating(tmp_path, monkeyp
     assert snapshot["can_clear"] is True
 
 
+@pytest.mark.parametrize("retry_result", ["accepted", "empty"])
+def test_pause_timeout_after_concurrent_clear_retries_pending_clear(
+    tmp_path, retry_result
+):
+    """A timeout after Clear overtook Pause must retry the stored Clear intent.
+
+    Ordering: active -> Pause's CancelGoal is in flight -> Clear flips the
+    pending intent to CLEAR and reuses that request -> the Pause call times out.
+    The timeout must arm and retry the kind actually stored in the lease, not
+    the Pause the caller assumed; a hardcoded Pause makes ``validate_retry``
+    reject the background thread and leaves the state stuck clearing forever.
+    """
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "state_payload",
+            "pause_navigation",
+            "clear_navigation",
+            "action_status_callback",
+            "_retry_startup_cancel",
+        ),
+    )
+    _arm_active_goal(node)
+    spawned = []
+    calls = []
+
+    def scripted_cancel():
+        calls.append(1)
+        if len(calls) == 1:
+            # Clear overtakes the in-flight Pause cancel and reuses it.
+            response = node.clear_navigation()
+            assert response["navigation_control"]["state"] == "clearing"
+            raise web_control_node.NavigationTimeoutError(
+                "cancel goal request timed out"
+            )
+        return retry_result
+
+    node._cancel_all_goals = scripted_cancel
+    node._spawn_cancel_retry = lambda kind, token: spawned.append((kind, token))
+
+    with pytest.raises(web_control_node.NavigationTimeoutError):
+        node.pause_navigation()
+
+    # The armed lease stores the Clear intent, so the background retry must be
+    # the Clear retry (kind -> clear=True) and must really send a cancel.
+    assert len(spawned) == 1
+    kind, token = spawned[0]
+    assert kind == PENDING_CLEAR
+    node._retry_startup_cancel(kind == PENDING_CLEAR, token)
+    assert len(calls) == 2
+
+    snapshot = node.state_payload()["navigation_control"]
+    if retry_result == "accepted":
+        # An accepted cancel stays clearing until the terminal status settles it.
+        assert snapshot["state"] == "clearing"
+        node.action_status_callback(_GoalStatusArray([_GoalStatus(5, 9)]))
+        snapshot = node.state_payload()["navigation_control"]
+        assert snapshot["state"] == "idle"
+        assert snapshot["has_goal"] is False
+    else:
+        # A retry that matched no goal recovers to a manageable Navigating.
+        assert snapshot["state"] == "navigating"
+        assert snapshot["has_goal"] is True
+        assert snapshot["can_clear"] is True
+
+
 def test_restored_pausing_clear_before_first_status_issues_cancel(tmp_path):
     node = _navigation_node(
         tmp_path,

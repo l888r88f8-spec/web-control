@@ -1435,10 +1435,14 @@ class WebControlNode(Node):
         except NavigationTimeoutError:
             # Keep the pausing record for polling and schedule exactly one
             # bounded retry so a later Clear is never stuck on an untracked
-            # cancel.
-            token = self.navigation_control.note_cancel_timeout(self.now_sec())
-            if token is not None:
-                self._spawn_cancel_retry(PENDING_PAUSE, token)
+            # cancel.  A concurrent Clear may have replaced the pending intent,
+            # so retry the kind actually stored in the armed lease.
+            lease = self.navigation_control.note_cancel_timeout_lease(
+                self.now_sec()
+            )
+            if lease is not None:
+                token, kind = lease
+                self._spawn_cancel_retry(kind, token)
             raise
         except NavigationUnavailableError:
             self.navigation_control.note_cancel_failed(self.now_sec())
@@ -1482,10 +1486,15 @@ class WebControlNode(Node):
                 result = self._cancel_all_goals()
             except NavigationTimeoutError:
                 # Keep clearing/record state for polling and schedule a bounded
-                # retry so repeated Clear cannot become permanently 409.
-                token = self.navigation_control.note_cancel_timeout(self.now_sec())
-                if token is not None:
-                    self._spawn_cancel_retry(PENDING_CLEAR, token)
+                # retry so repeated Clear cannot become permanently 409.  Retry
+                # the kind actually stored in the armed lease rather than this
+                # caller's intent, which a concurrent command may have changed.
+                lease = self.navigation_control.note_cancel_timeout_lease(
+                    self.now_sec()
+                )
+                if lease is not None:
+                    token, kind = lease
+                    self._spawn_cancel_retry(kind, token)
                 raise
             except NavigationUnavailableError:
                 self.navigation_control.note_cancel_failed(self.now_sec())
