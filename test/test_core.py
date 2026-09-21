@@ -2570,6 +2570,13 @@ def _selection_node(tmp_path, selection=None, running=(), **overrides):
     }
     if selection is not None:
         node.map_selection.save(selection)
+    from web_control.navigation_control import NavigationControl
+    from web_control.navigation_store import NavigationStore
+
+    node.navigation_store = NavigationStore(
+        tmp_path / "config" / "paused_navigation.json"
+    )
+    node.navigation_control = NavigationControl(node.navigation_store)
     for name in (
         "maps_payload",
         "select_map",
@@ -3606,3 +3613,81 @@ def test_clear_navigation_runtime_state_settles_control_and_goal(tmp_path):
     assert snapshot["state"] == "paused"
     assert snapshot["can_resume"] is True
     assert node.navigation_store.load()["phase"] == "paused"
+
+
+def test_publish_goal_rejected_while_pausing(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "pause_navigation",
+            "publish_goal",
+        ),
+    )
+    _arm_active_goal(node)
+    node.pause_navigation()
+
+    with pytest.raises(web_control_node.NavigationConflictError):
+        node.publish_goal({"x": 3.0, "y": 4.0, "yaw": 0.0})
+
+    assert node.goal_publications == []
+    assert node.navigation_control.snapshot("site_a")["state"] == "pausing"
+
+
+def test_new_goal_discards_paused_record_after_publish(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("_publish_goal_pose", "publish_goal"),
+    )
+
+    response = node.publish_goal({"x": 5.0, "y": 6.0, "yaw": 1.0})
+
+    assert response["navigation_control"]["state"] == "navigating"
+    assert node.navigation_store.load() is None
+    assert len(node.goal_publications) == 1
+    assert node.goal_publications[0].pose.position.x == 5.0
+
+
+def test_new_goal_publish_failure_keeps_paused_record(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("_publish_goal_pose", "publish_goal"),
+    )
+
+    def _fail_publish(pose, frame=None):
+        raise RuntimeError("goal publish failed")
+
+    node._publish_goal_pose = _fail_publish
+
+    with pytest.raises(RuntimeError, match="goal publish failed"):
+        node.publish_goal({"x": 5.0, "y": 6.0, "yaw": 1.0})
+
+    assert node.goal_publications == []
+    assert node.navigation_store.load() == _paused_record()
+    snapshot = node.navigation_control.snapshot("site_a")
+    assert snapshot["state"] == "paused"
+    assert snapshot["paused_goal"]["x"] == 1.5
+
+
+def test_select_map_clears_paused_goal_from_previous_map(tmp_path):
+    from web_control.navigation_control import NavigationControl
+
+    root = tmp_path / "map"
+    _make_map_dir(root, "site_a")
+    _make_map_dir(root, "site_b")
+    node = _selection_node(tmp_path, selection="site_a")
+    node.navigation_store.save(_paused_record(map_name="site_a"))
+    # Mirror a restart: the control loads the persisted record at construction.
+    node.navigation_control = NavigationControl(node.navigation_store)
+
+    status, body = _serve_and_request(
+        node, "/api/maps/select", {"name": "site_b"}, "POST"
+    )
+
+    assert status == 200
+    assert body["selection"]["name"] == "site_b"
+    assert node.navigation_store.load() is None
+    assert node.navigation_control.snapshot("site_b")["state"] == "idle"

@@ -809,6 +809,7 @@ class WebControlNode(Node):
                     + " before selecting a different map"
                 )
             self.map_selection.save(name)
+            self.navigation_control.note_map_selected(name, self.now_sec())
             selection = {
                 "name": name,
                 "valid": True,
@@ -1444,20 +1445,28 @@ class WebControlNode(Node):
         return response
 
     def publish_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        map_name = self.map_selection.load()
+        snapshot = self.navigation_control.snapshot(map_name)
+        if snapshot["state"] in (PAUSING, RESUMING, CLEARING):
+            raise NavigationConflictError(
+                "navigation is busy; wait for the current command to finish"
+            )
         pose = validate_pose_payload(payload)
-        msg = PoseStamped()
-        msg.header.stamp = self.ros_stamp()
-        msg.header.frame_id = self.map_frame
-        msg.pose.position.x = pose["x"]
-        msg.pose.position.y = pose["y"]
-        msg.pose.position.z = pose["z"]
-        q = quaternion_from_yaw(pose["yaw"])
-        msg.pose.orientation.x = q["x"]
-        msg.pose.orientation.y = q["y"]
-        msg.pose.orientation.z = q["z"]
-        msg.pose.orientation.w = q["w"]
-        self.goal_pub.publish(msg)
-        return success_response("goal published", self.now_sec())
+        self._publish_goal_pose(pose)
+        now = self.now_sec()
+        self.navigation_control.record_goal_published(
+            pose, self.map_frame, map_name, now
+        )
+        with self.lock:
+            self.published_goal = {
+                "x": pose["x"],
+                "y": pose["y"],
+                "z": pose["z"],
+                "yaw": pose["yaw"],
+            }
+        response = success_response("goal published", now)
+        response["navigation_control"] = self.navigation_control.snapshot(map_name)
+        return response
 
     def start_http_server(self) -> None:
         handler = self.make_handler()
