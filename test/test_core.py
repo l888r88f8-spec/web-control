@@ -3425,3 +3425,184 @@ def test_cancel_all_goals_times_out(tmp_path, monkeypatch):
         node._cancel_all_goals()
 
     assert future.cancelled is True
+
+
+def test_cancel_all_goals_maps_call_async_error_to_unavailable(tmp_path):
+    class _RaisingCancelClient(_FakeCancelClient):
+        def call_async(self, request):
+            self.requests.append(request)
+            raise RuntimeError("service handle gone")
+
+    client = _RaisingCancelClient()
+    node = _navigation_node(tmp_path, client=client, methods=("_cancel_all_goals",))
+
+    with pytest.raises(web_control_node.NavigationUnavailableError):
+        node._cancel_all_goals()
+
+
+def test_pause_navigation_persists_pausing_then_canceled_reaches_paused(tmp_path):
+    # The zero-UUID/zero-stamp request shape is asserted by Task 4's
+    # ``test_cancel_all_goals_sends_zero_uuid_and_zero_stamp``; this test owns the
+    # pause behavior around the accepted cancel.
+    node = _navigation_node(
+        tmp_path,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+
+    response = node.pause_navigation()
+
+    assert response["navigation_control"]["state"] == "pausing"
+    assert response["navigation_control"]["paused_goal"]["phase"] == "pausing"
+    assert len(node.cancel_goal_client.requests) == 1
+
+    node.navigation_control.note_action_status("canceled", 5, 11.0)
+    assert node.navigation_control.snapshot("site_a")["state"] == "paused"
+    assert node.navigation_store.load()["phase"] == "paused"
+
+
+def test_pause_navigation_timeout_keeps_pausing_record(tmp_path, monkeypatch):
+    future = _FakeFuture()
+    client = _FakeCancelClient(ready=True, future=future)
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+    monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+
+    with pytest.raises(web_control_node.NavigationTimeoutError):
+        node.pause_navigation()
+
+    assert node.navigation_control.snapshot("site_a")["state"] == "pausing"
+    assert node.navigation_store.load()["phase"] == "pausing"
+
+
+def test_pause_navigation_unavailable_removes_record(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        ready=False,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+
+    with pytest.raises(web_control_node.NavigationUnavailableError):
+        node.pause_navigation()
+
+    assert node.navigation_store.load() is None
+    assert node.navigation_control.snapshot("site_a")["state"] == "navigating"
+
+
+def test_pause_navigation_empty_cancel_removes_record(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        results=(),
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+
+    with pytest.raises(web_control_node.NavigationConflictError):
+        node.pause_navigation()
+
+    assert node.navigation_store.load() is None
+    assert node.navigation_control.snapshot("site_a")["state"] == "navigating"
+
+
+def test_pause_navigation_rejected_cancel_restores_navigating(tmp_path):
+    client = _FakeCancelClient(return_code=1, results=(1,))
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    client.future.done_flag = True
+    _arm_active_goal(node)
+
+    with pytest.raises(web_control_node.NavigationConflictError):
+        node.pause_navigation()
+
+    assert node.navigation_store.load() is None
+    assert node.navigation_control.snapshot("site_a")["state"] == "navigating"
+
+
+def test_clear_paused_goal_skips_cancel_service(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("state_payload", "_cancel_all_goals", "clear_navigation"),
+    )
+
+    response = node.clear_navigation()
+
+    assert response["navigation_control"]["state"] == "idle"
+    assert node.cancel_goal_client.requests == []
+    assert node.navigation_store.load() is None
+
+
+def test_resume_republishes_saved_pose_and_enters_resuming(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("state_payload", "_publish_goal_pose", "resume_navigation"),
+    )
+
+    response = node.resume_navigation()
+
+    assert response["navigation_control"]["state"] == "resuming"
+    message = node.goal_publications[-1]
+    assert message.header.frame_id == "map"
+    assert message.pose.position.x == 1.5
+    assert message.pose.position.y == -2.5
+    assert message.pose.position.z == 0.25
+    assert node.navigation_store.load()["phase"] == "resuming"
+
+    node.navigation_control.note_action_status("accepted", 9, 30.0)
+    assert node.navigation_control.snapshot("site_a")["state"] == "navigating"
+    assert node.navigation_store.load() is None
+
+
+def test_clear_while_pausing_reuses_cancel(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "pause_navigation",
+            "clear_navigation",
+        ),
+    )
+    _arm_active_goal(node)
+    node.pause_navigation()
+
+    response = node.clear_navigation()
+
+    assert response["navigation_control"]["state"] == "clearing"
+    assert len(node.cancel_goal_client.requests) == 1
+
+    node.navigation_control.note_action_status("canceled", 5, 12.0)
+    assert node.navigation_control.snapshot("site_a")["state"] == "idle"
+
+
+def test_clear_navigation_runtime_state_settles_control_and_goal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "pause_navigation",
+            "clear_navigation_runtime_state",
+        ),
+    )
+    _arm_active_goal(node)
+    node.pause_navigation()
+    assert node.navigation_control.snapshot("site_a")["state"] == "pausing"
+
+    node.clear_navigation_runtime_state()
+
+    # Stopping navigation must not leave a phantom active goal in the browser.
+    assert node.published_goal is None
+    snapshot = node.navigation_control.snapshot("site_a")
+    assert snapshot["state"] == "paused"
+    assert snapshot["can_resume"] is True
+    assert node.navigation_store.load()["phase"] == "paused"

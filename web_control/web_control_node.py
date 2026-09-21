@@ -707,6 +707,11 @@ class WebControlNode(Node):
             for name in ("mapcloud", "mapground"):
                 if name in self.layers:
                     self.layers[name].clear()
+            # Stop is not an operator command: settle the pause/resume state so
+            # the browser stops advertising an active goal, while an
+            # interrupted Pause or Resume keeps its saved destination paused.
+            self.published_goal = None
+            self.navigation_control.on_navigation_stopped(self.now_sec())
 
     def clear_map_runtime_state(self) -> None:
         with self.lock:
@@ -1040,7 +1045,12 @@ class WebControlNode(Node):
         request.goal_info.goal_id.uuid = [0] * 16
         request.goal_info.stamp.sec = 0
         request.goal_info.stamp.nanosec = 0
-        future = client.call_async(request)
+        try:
+            future = client.call_async(request)
+        except Exception as exc:
+            raise NavigationUnavailableError(
+                f"cancel goal service call failed: {exc}"
+            ) from exc
         deadline = time.monotonic() + CANCEL_GOAL_TIMEOUT_SEC
         while not future.done():
             if time.monotonic() >= deadline:
@@ -1346,6 +1356,92 @@ class WebControlNode(Node):
         msg.pose.covariance[35] = 0.0685
         self.initialpose_pub.publish(msg)
         return success_response("initial pose published", self.now_sec())
+
+    def _publish_goal_pose(
+        self, pose: dict[str, Any], frame: str | None = None
+    ) -> None:
+        msg = PoseStamped()
+        msg.header.stamp = self.ros_stamp()
+        msg.header.frame_id = frame or self.map_frame
+        msg.pose.position.x = float(pose["x"])
+        msg.pose.position.y = float(pose["y"])
+        msg.pose.position.z = float(pose.get("z", 0.0))
+        q = quaternion_from_yaw(float(pose["yaw"]))
+        msg.pose.orientation.x = q["x"]
+        msg.pose.orientation.y = q["y"]
+        msg.pose.orientation.z = q["z"]
+        msg.pose.orientation.w = q["w"]
+        self.goal_pub.publish(msg)
+
+    def pause_navigation(self) -> dict[str, Any]:
+        map_name = self.map_selection.load()
+        if map_name is None:
+            raise NavigationConflictError("no map selected; cannot pause navigation")
+        with self.lock:
+            goal = dict(self.published_goal) if self.published_goal else None
+        if goal is None:
+            raise NavigationConflictError("no active navigation goal to pause")
+        self.navigation_control.begin_pause(
+            goal, self.map_frame, map_name, self.now_sec()
+        )
+        try:
+            result = self._cancel_all_goals()
+        except NavigationTimeoutError:
+            raise
+        except NavigationUnavailableError:
+            self.navigation_control.note_cancel_failed(self.now_sec())
+            raise
+        if result != "accepted":
+            # ``empty`` and ``rejected`` both mean nothing is canceling, so the
+            # pause never started; restore the previous navigating state.
+            self.navigation_control.note_cancel_failed(self.now_sec())
+            raise NavigationConflictError("no active navigation goal to cancel")
+        response = success_response("pause requested", self.now_sec())
+        response["navigation_control"] = self.navigation_control.snapshot(map_name)
+        return response
+
+    def resume_navigation(self) -> dict[str, Any]:
+        map_name = self.map_selection.load()
+        record = self.navigation_control.begin_resume(self.now_sec(), map_name)
+        try:
+            self._publish_goal_pose(record, record["frame"])
+        except Exception as exc:
+            self.navigation_control.note_resume_publish_failed(self.now_sec())
+            raise NavigationUnavailableError(f"resume publish failed: {exc}") from exc
+        with self.lock:
+            self.published_goal = {
+                "x": record["x"],
+                "y": record["y"],
+                "z": record["z"],
+                "yaw": record["yaw"],
+            }
+        response = success_response("resume published", self.now_sec())
+        response["navigation_control"] = self.navigation_control.snapshot(map_name)
+        return response
+
+    def clear_navigation(self) -> dict[str, Any]:
+        map_name = self.map_selection.load()
+        needs_cancel = self.navigation_control.begin_clear(self.now_sec())
+        if needs_cancel:
+            try:
+                result = self._cancel_all_goals()
+            except NavigationTimeoutError:
+                raise
+            except NavigationUnavailableError:
+                self.navigation_control.note_cancel_failed(self.now_sec())
+                raise
+            if result == "empty":
+                self.navigation_control.note_cancel_empty(self.now_sec())
+            elif result == "rejected":
+                # The service refused; the goal may still be running, so keep
+                # the previous state instead of pretending the clear finished.
+                self.navigation_control.note_cancel_failed(self.now_sec())
+                raise NavigationUnavailableError("cancel goal request rejected")
+        with self.lock:
+            self.published_goal = None
+        response = success_response("clear requested", self.now_sec())
+        response["navigation_control"] = self.navigation_control.snapshot(map_name)
+        return response
 
     def publish_goal(self, payload: dict[str, Any]) -> dict[str, Any]:
         pose = validate_pose_payload(payload)
