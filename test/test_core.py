@@ -3691,3 +3691,131 @@ def test_select_map_clears_paused_goal_from_previous_map(tmp_path):
     assert body["selection"]["name"] == "site_b"
     assert node.navigation_store.load() is None
     assert node.navigation_control.snapshot("site_b")["state"] == "idle"
+
+
+def test_state_endpoint_reports_paused_navigation_controls(tmp_path):
+    node = _navigation_node(tmp_path, record=_paused_record())
+
+    status, body = _serve_and_request(node, "/api/state")
+
+    assert status == 200
+    assert body["navigation_control"]["state"] == "paused"
+    assert body["navigation_control"]["can_resume"] is True
+    assert body["navigation_control"]["can_clear"] is True
+    assert body["navigation_control"]["can_pause"] is False
+
+
+def test_pause_endpoint_returns_409_when_no_active_goal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+
+    status, body = _serve_and_request(node, "/api/navigation/pause", {}, "POST")
+
+    assert status == 409
+    assert body["ok"] is False
+    assert node.cancel_goal_client.requests == []
+
+
+def test_clear_endpoint_returns_200_for_paused_goal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("_cancel_all_goals", "clear_navigation"),
+    )
+
+    status, body = _serve_and_request(node, "/api/navigation/clear", {}, "POST")
+
+    assert status == 200
+    assert body["navigation_control"]["state"] == "idle"
+    assert body["navigation_control"]["paused_goal"] is None
+
+
+def test_pause_endpoint_returns_504_on_timeout(tmp_path, monkeypatch):
+    node = _navigation_node(
+        tmp_path,
+        client=_FakeCancelClient(ready=True, future=_FakeFuture()),
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+    monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+
+    status, body = _serve_and_request(node, "/api/navigation/pause", {}, "POST")
+
+    assert status == 504
+    assert body["ok"] is False
+    assert node.navigation_control.snapshot("site_a")["state"] == "pausing"
+    assert node.navigation_store.load()["phase"] == "pausing"
+
+
+def test_pause_endpoint_returns_503_when_service_missing(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        ready=False,
+        methods=("_cancel_all_goals", "pause_navigation"),
+    )
+    _arm_active_goal(node)
+
+    status, body = _serve_and_request(node, "/api/navigation/pause", {}, "POST")
+
+    assert status == 503
+    assert body["ok"] is False
+
+
+def test_goal_endpoint_rejected_while_pausing(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "pause_navigation",
+            "publish_goal",
+        ),
+    )
+    _arm_active_goal(node)
+    node.pause_navigation()
+
+    status, body = _serve_and_request(
+        node, "/api/goal", {"x": 3.0, "y": 4.0, "yaw": 0.0}, "POST"
+    )
+
+    assert status == 409
+    assert body["ok"] is False
+
+
+def test_resume_endpoint_republishes_paused_goal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("state_payload", "_publish_goal_pose", "resume_navigation"),
+    )
+
+    status, body = _serve_and_request(node, "/api/navigation/resume", {}, "POST")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["navigation_control"]["state"] == "resuming"
+    assert node.goal_publications[-1].pose.position.x == 1.5
+    assert node.navigation_store.load()["phase"] == "resuming"
+
+
+def test_clear_endpoint_returns_409_while_resuming(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=(
+            "state_payload",
+            "_publish_goal_pose",
+            "resume_navigation",
+            "clear_navigation",
+        ),
+    )
+    node.resume_navigation()
+
+    status, body = _serve_and_request(node, "/api/navigation/clear", {}, "POST")
+
+    assert status == 409
+    assert body["ok"] is False
+    assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
+    assert node.navigation_store.load()["phase"] == "resuming"

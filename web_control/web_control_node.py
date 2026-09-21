@@ -1558,6 +1558,12 @@ class WebControlNode(Node):
                         self.send_json(node.select_map(payload))
                     elif self.path == "/api/goal":
                         self.send_json(node.publish_goal(payload))
+                    elif self.path == "/api/navigation/pause":
+                        self.send_json(node.pause_navigation())
+                    elif self.path == "/api/navigation/resume":
+                        self.send_json(node.resume_navigation())
+                    elif self.path == "/api/navigation/clear":
+                        self.send_json(node.clear_navigation())
                     elif self.path == "/api/managed/start":
                         self.send_json(
                             node.start_managed_target(str(payload.get("target", "")))
@@ -1574,6 +1580,12 @@ class WebControlNode(Node):
                         self.send_json(error_response("unknown endpoint", node.now_sec()), status=404)
                 except CLIENT_DISCONNECT_ERRORS:
                     return
+                except NavigationTimeoutError as exc:
+                    self.send_json(error_response(str(exc), node.now_sec()), status=504)
+                except NavigationUnavailableError as exc:
+                    self.send_json(error_response(str(exc), node.now_sec()), status=503)
+                except NavigationConflictError as exc:
+                    self.send_json(error_response(str(exc), node.now_sec()), status=409)
                 except SaveMapBusyError as exc:
                     self.send_json(error_response(str(exc), node.now_sec()), status=409)
                 except SaveMapUnavailableError as exc:
