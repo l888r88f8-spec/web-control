@@ -3819,3 +3819,131 @@ def test_clear_endpoint_returns_409_while_resuming(tmp_path):
     assert body["ok"] is False
     assert node.navigation_control.snapshot("site_a")["state"] == "resuming"
     assert node.navigation_store.load()["phase"] == "resuming"
+
+
+_NAVIGATION_PANEL_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("// --- Navigation pause/resume controls");
+const end = source.indexOf("// --- End navigation pause/resume controls");
+if (start < 0 || end < 0) throw new Error("navigation control block not found");
+const block = source.slice(start, end);
+const publishStart = source.indexOf("function updatePublishPoseButton()");
+if (publishStart < 0) throw new Error("updatePublishPoseButton not found");
+const publishEnd = source.indexOf("\n}", publishStart);
+if (publishEnd < 0) throw new Error("updatePublishPoseButton end not found");
+const publishBlock = source.slice(publishStart, publishEnd + 2);
+
+function makeElement() {
+  return { textContent: "", disabled: false };
+}
+const elements = {
+  navigationPrimary: makeElement(),
+  navigationClear: makeElement(),
+  navigationControlState: makeElement(),
+  publishResult: makeElement(),
+  publishPose: makeElement(),
+};
+global.document = {
+  getElementById(id) { return elements[id] || null; },
+};
+
+let state = { mode: "goal", navigationControl: null, lastGoal: null };
+let clearedScenes = 0;
+let poseUpdates = 0;
+let markerUpdates = 0;
+let polled = 0;
+let captured = null;
+
+function clearNavigationSceneState() { clearedScenes += 1; state.lastGoal = null; }
+function updateTargetPoseDisplay() { poseUpdates += 1; }
+function updateTargetMarkers() { markerUpdates += 1; }
+function pollState() { polled += 1; }
+global.postJson = async (url, payload) => {
+  captured = { url, payload };
+  return {
+    ok: true,
+    message: "pause requested",
+    stamp: 100.0,
+    navigation_control: {
+      state: "pausing", has_goal: true, can_pause: false,
+      can_resume: false, can_clear: true, paused_goal: null,
+    },
+  };
+};
+
+eval(publishBlock + "\n" + block);
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+updateNavigationControls({ state: "navigating", has_goal: true, can_pause: true, can_resume: false, can_clear: true, paused_goal: null });
+expect(elements.navigationPrimary.textContent === "Pause Navigation", "navigating primary label");
+expect(elements.navigationPrimary.disabled === false, "navigating primary enabled");
+expect(elements.navigationClear.disabled === false, "navigating clear enabled");
+expect(elements.navigationControlState.textContent === "Navigating", "navigating state label");
+expect(elements.publishPose.disabled === false, "navigating publish enabled");
+
+updateNavigationControls({ state: "pausing", has_goal: true, can_pause: false, can_resume: false, can_clear: true, paused_goal: null });
+expect(elements.navigationPrimary.textContent === "Pausing...", "pausing label");
+expect(elements.navigationPrimary.disabled === true, "pausing disabled");
+expect(elements.publishPose.disabled === true, "pausing publish disabled");
+
+updateNavigationControls({ state: "paused", has_goal: true, can_pause: false, can_resume: true, can_clear: true, paused_goal: { x: 1, y: 2, z: 0, yaw: 0.5 } });
+expect(elements.navigationPrimary.textContent === "Resume Navigation", "paused label");
+expect(elements.navigationPrimary.disabled === false, "paused primary enabled");
+expect(elements.publishPose.disabled === false, "paused publish enabled");
+expect(state.lastGoal && state.lastGoal.x === 1, "paused destination not shown");
+expect(poseUpdates > 0 && markerUpdates > 0, "paused destination not rendered");
+
+updateNavigationControls({ state: "resuming", has_goal: true, can_pause: false, can_resume: false, can_clear: false, paused_goal: null });
+expect(elements.navigationPrimary.textContent === "Resuming...", "resuming label");
+expect(elements.navigationPrimary.disabled === true, "resuming disabled");
+expect(elements.publishPose.disabled === true, "resuming publish disabled");
+
+const before = clearedScenes;
+updateNavigationControls({ state: "clearing", has_goal: true, can_pause: false, can_resume: false, can_clear: false, paused_goal: null });
+expect(elements.navigationClear.textContent === "Clearing...", "clearing label");
+expect(elements.navigationClear.disabled === true, "clearing disabled");
+expect(elements.publishPose.disabled === true, "clearing publish disabled");
+
+updateNavigationControls({ state: "idle", has_goal: false, can_pause: false, can_resume: false, can_clear: false, paused_goal: null });
+expect(clearedScenes > before, "terminal cleanup not run");
+expect(elements.navigationPrimary.textContent === "Pause Navigation", "idle primary label");
+expect(elements.navigationPrimary.disabled === true, "idle primary disabled");
+expect(elements.navigationClear.disabled === true, "idle clear disabled");
+expect(elements.publishPose.disabled === false, "idle publish enabled");
+
+(async () => {
+  await postNavigationCommand("/api/navigation/pause", "Pause failed");
+  expect(captured && captured.url === "/api/navigation/pause", "command url wrong");
+  expect(elements.navigationControlState.textContent === "Pausing", "command response not applied");
+  expect(elements.publishPose.disabled === true, "command response did not disable publish");
+  expect(polled > 0, "poll after command missing");
+  console.log("navigation control behavior ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_navigation_page_has_pause_resume_controls():
+    index_html = (
+        Path(__file__).resolve().parents[1] / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="navigationPrimary"' in index_html
+    assert 'id="navigationClear"' in index_html
+    assert 'id="navigationControlState"' in index_html
+
+
+def test_frontend_navigation_controls_behavior_executes_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _NAVIGATION_PANEL_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "navigation control behavior ok" in completed.stdout

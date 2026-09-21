@@ -21,6 +21,7 @@ const state = {
   lastGoal: null,
   odom: null,
   navigationAction: null,
+  navigationControl: null,
   paths: {},
   mappingOdom: null,
   mappingPath: [],
@@ -554,6 +555,7 @@ function updateStatus(data) {
   updateNavigationReadiness(data.navigation_ready);
   updateTargetPoseDisplay();
   maybeClearGoalFromActionStatus();
+  updateNavigationControls(data.navigation_control);
 
   const sources = document.getElementById("sources");
   sources.innerHTML = "";
@@ -983,6 +985,74 @@ function updateTargetPoseDisplay() {
   document.getElementById("goalYaw").textContent = goal ? fmt(goal.yaw, 3) : "--";
 }
 
+// --- Navigation pause/resume controls
+function updateNavigationControls(control) {
+  const previous = state.navigationControl;
+  state.navigationControl = control || null;
+  const primary = document.getElementById("navigationPrimary");
+  const clear = document.getElementById("navigationClear");
+  const status = document.getElementById("navigationControlState");
+  const value = control || {
+    state: "idle",
+    has_goal: false,
+    can_pause: false,
+    can_resume: false,
+    can_clear: false,
+    paused_goal: null,
+  };
+  const labels = {
+    idle: "Idle",
+    navigating: "Navigating",
+    pausing: "Pausing",
+    paused: "Paused",
+    resuming: "Resuming",
+    clearing: "Clearing",
+  };
+  status.textContent = labels[value.state] || "Idle";
+  if (value.state === "pausing") {
+    primary.textContent = "Pausing...";
+    primary.disabled = true;
+  } else if (value.state === "resuming") {
+    primary.textContent = "Resuming...";
+    primary.disabled = true;
+  } else if (value.state === "paused") {
+    primary.textContent = "Resume Navigation";
+    primary.disabled = !value.can_resume;
+  } else {
+    primary.textContent = "Pause Navigation";
+    primary.disabled = !value.can_pause;
+  }
+  clear.textContent = value.state === "clearing" ? "Clearing..." : "Clear Goal";
+  clear.disabled = !value.can_clear;
+  if (value.paused_goal) {
+    state.lastGoal = { ...value.paused_goal };
+    updateTargetPoseDisplay();
+    updateTargetMarkers();
+  }
+  if (!value.has_goal && previous && previous.has_goal && !value.paused_goal) {
+    clearNavigationSceneState();
+  }
+  updatePublishPoseButton();
+}
+
+async function postNavigationCommand(path, failureLabel) {
+  const result = document.getElementById("publishResult");
+  try {
+    const response = await postJson(path, {});
+    if (response.navigation_control) {
+      updateNavigationControls(response.navigation_control);
+    }
+    result.textContent = `${response.message} @ ${new Date(response.stamp * 1000).toLocaleTimeString()}`;
+    pollState();
+  } catch (error) {
+    // The server state stays authoritative; the periodic poll keeps rendering
+    // the transition even after a timeout or conflict.
+    result.textContent = `${failureLabel}: ${error.message}`;
+    pollState();
+  }
+}
+// --- End navigation pause/resume controls
+
 function maybeClearGoalFromActionStatus() {
   if (!state.activeGoal || !state.navigationAction || !state.navigationAction.data) return;
   const status = state.navigationAction.data.status;
@@ -1059,7 +1129,12 @@ function selectedPosePayload(includeZ) {
 
 function updatePublishPoseButton() {
   const button = document.getElementById("publishPose");
+  const control = state.navigationControl;
+  const transitioning = Boolean(control) && ["pausing", "resuming", "clearing"].includes(control.state);
   button.disabled = state.mode === "view";
+  if (state.mode === "goal" && transitioning) {
+    button.disabled = true;
+  }
   button.textContent = "Publish Pose";
 }
 
@@ -1168,6 +1243,15 @@ function attachEvents() {
     state.showMappingVehicle = event.target.checked;
     updateMappingVehicleMarker();
   });
+  document.getElementById("navigationPrimary").addEventListener("click", () => {
+    const control = state.navigationControl;
+    if (control && control.state === "paused") {
+      postNavigationCommand("/api/navigation/resume", "Resume failed");
+    } else {
+      postNavigationCommand("/api/navigation/pause", "Pause failed");
+    }
+  });
+  document.getElementById("navigationClear").addEventListener("click", () => postNavigationCommand("/api/navigation/clear", "Clear failed"));
   updatePublishPoseButton();
   document.getElementById("publishPose").addEventListener("click", publishPose);
   document.querySelectorAll("[data-start-target]").forEach((button) => button.addEventListener("click", () => startManagedTarget(button.dataset.startTarget)));
