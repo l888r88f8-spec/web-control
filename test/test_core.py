@@ -3095,3 +3095,333 @@ def test_frontend_map_selector_behavior_executes_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "map panel behavior ok" in completed.stdout
+
+
+class _FakeCancelResponse:
+    def __init__(self, goals_canceling, return_code=0):
+        self.goals_canceling = goals_canceling
+        self.return_code = return_code
+
+
+class _FakeCancelGoalRequest:
+    class _GoalId:
+        def __init__(self):
+            self.uuid = []
+
+    class _Stamp:
+        def __init__(self):
+            self.sec = 0
+            self.nanosec = 0
+
+    class _GoalInfo:
+        def __init__(self):
+            self.goal_id = _FakeCancelGoalRequest._GoalId()
+            self.stamp = _FakeCancelGoalRequest._Stamp()
+
+    def __init__(self):
+        self.goal_info = _FakeCancelGoalRequest._GoalInfo()
+
+
+class _FakeCancelGoal:
+    Request = _FakeCancelGoalRequest
+
+
+class _FakeCancelClient:
+    def __init__(self, ready=True, future=None, results=(1,), return_code=0):
+        self.ready = ready
+        self.future = future if future is not None else _FakeFuture()
+        self.results = list(results)
+        self.return_code = return_code
+        self.requests = []
+
+    def service_is_ready(self):
+        return self.ready
+
+    def call_async(self, request):
+        self.requests.append(request)
+        self.future.response = _FakeCancelResponse(
+            [object() for _ in self.results], return_code=self.return_code
+        )
+        return self.future
+
+
+class _FakeHeader:
+    def __init__(self):
+        self.stamp = None
+        self.frame_id = ""
+
+
+class _FakePosition:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+
+class _FakeOrientation:
+    def __init__(self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.w = 1.0
+
+
+class _FakePose:
+    def __init__(self):
+        self.position = _FakePosition()
+        self.orientation = _FakeOrientation()
+
+
+class _FakePoseStamped:
+    def __init__(self):
+        self.header = _FakeHeader()
+        self.pose = _FakePose()
+
+
+class _FakePublisher:
+    def __init__(self, published):
+        self.published = published
+
+    def publish(self, msg):
+        self.published.append(msg)
+
+
+def _paused_record(phase="paused", map_name="site_a"):
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "x": 1.5,
+        "y": -2.5,
+        "z": 0.25,
+        "yaw": 0.75,
+        "frame": "map",
+        "map_name": map_name,
+        "saved_at": 5.0,
+    }
+
+
+def _navigation_node(
+    tmp_path,
+    record=None,
+    selection="site_a",
+    client=None,
+    ready=True,
+    results=(1,),
+    methods=("state_payload",),
+):
+    from web_control.map_selection import SelectionStore
+    from web_control.navigation_control import NavigationControl
+    from web_control.navigation_store import NavigationStore
+
+    web_control_node.CancelGoal = _FakeCancelGoal
+    web_control_node.PoseStamped = _FakePoseStamped
+    node = type("_NavigationNodeStub", (), {})()
+    node.lock = threading.RLock()
+    node.map_frame = "map"
+    node.now_sec = lambda: 10.0
+    node.ros_stamp = lambda: None
+    node.get_logger = lambda: _LoggerStub()
+    node.map_selection = SelectionStore(tmp_path / "config" / "selected_map.json")
+    if selection is not None:
+        node.map_selection.save(selection)
+    node.navigation_store = NavigationStore(
+        tmp_path / "config" / "paused_navigation.json"
+    )
+    if record is not None:
+        node.navigation_store.save(record)
+    node.navigation_control = NavigationControl(node.navigation_store)
+    node.published_goal = None
+    node.cancel_goal_client = (
+        client if client is not None else _FakeCancelClient(ready=ready, results=results)
+    )
+    if client is None:
+        node.cancel_goal_client.future.done_flag = True
+    node.goal_publications = []
+    node.goal_pub = _FakePublisher(node.goal_publications)
+    node.action_status = SourceCache("action_status", 2.0)
+    node.odom = SourceCache("odom", 2.0)
+    node.layers = {
+        name: SourceCache(name, 2.0, static_source=True)
+        for name in ("local_map", "mapcloud", "mapground")
+    }
+    node.paths = {}
+    node.viewers = ViewerRegistry(timeout_sec=10.0)
+    for name in methods:
+        setattr(
+            node,
+            name,
+            MethodType(getattr(web_control_node.WebControlNode, name), node),
+        )
+    return node
+
+
+def _arm_active_goal(node, pose=None):
+    pose = pose or {"x": 1.5, "y": -2.5, "z": 0.25, "yaw": 0.75}
+    # Publish first, then feed the status, mirroring the real node ordering so
+    # the transition floor is taken from the previous goal stamp.
+    node.navigation_control.record_goal_published(pose, "map", "site_a", 10.0)
+    node.navigation_control.note_action_status("executing", 5, 10.0)
+    node.published_goal = dict(pose)
+
+
+def test_node_declares_cancel_goal_service_and_client():
+    package_root = Path(__file__).resolve().parents[1]
+    source = (package_root / "web_control" / "web_control_node.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "from action_msgs.srv import CancelGoal" in source
+    assert "CancelGoal = None" in source
+    assert '"cancel_goal_service", "/p2p_move_base/_action/cancel_goal"' in source
+    assert 'CancelGoal, str(self.get_parameter("cancel_goal_service").value)' in source
+
+    config = (package_root / "config" / "web_control.yaml").read_text(encoding="utf-8")
+    assert 'cancel_goal_service: "/p2p_move_base/_action/cancel_goal"' in config
+
+
+def test_cancel_goal_import_is_isolated_from_main_ros_import():
+    package_root = Path(__file__).resolve().parents[1]
+    source = (package_root / "web_control" / "web_control_node.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+
+    main_ros_try = None
+    cancel_goal_try = None
+    for statement in tree.body:
+        if not isinstance(statement, ast.Try):
+            continue
+        statements = ast.unparse(statement)
+        if "import rclpy" in statements:
+            main_ros_try = statement
+        if "from action_msgs.srv import CancelGoal" in statements:
+            cancel_goal_try = statement
+
+    assert main_ros_try is not None, "main ROS import try block not found"
+    assert cancel_goal_try is not None, "isolated CancelGoal import try not found"
+    assert cancel_goal_try is not main_ros_try, (
+        "CancelGoal must not share the rclpy import try, or a missing service "
+        "type would set rclpy to None and disable the whole node"
+    )
+    assert "from action_msgs.srv import CancelGoal" not in ast.unparse(main_ros_try)
+    assert len(cancel_goal_try.handlers) == 1
+    assert "CancelGoal = None" in ast.unparse(cancel_goal_try.handlers[0])
+
+
+def test_action_status_callback_uses_selected_status():
+    source = (
+        Path(__file__).resolve().parents[1] / "web_control" / "web_control_node.py"
+    ).read_text(encoding="utf-8")
+
+    assert "select_action_status(msg.status_list)" in source
+    assert "self.navigation_control.note_action_status(" in source
+    assert "self.navigation_control.note_no_active_goals(" in source
+
+
+def test_state_payload_exposes_navigation_control_snapshot(tmp_path):
+    node = _navigation_node(tmp_path, record=_paused_record())
+
+    body = node.state_payload()
+
+    assert body["navigation_control"]["state"] == "paused"
+    assert body["navigation_control"]["can_resume"] is True
+    assert body["navigation_control"]["paused_goal"]["x"] == 1.5
+    assert body["navigation_control"]["paused_goal"]["map_name"] == "site_a"
+
+
+class _EmptyGoalStatusArray:
+    def __init__(self):
+        self.status_list = []
+
+
+def test_action_status_callback_empty_list_reconciles_pausing(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(phase="pausing"),
+        methods=("action_status_callback", "state_payload"),
+    )
+
+    node.action_status_callback(_EmptyGoalStatusArray())
+
+    assert node.action_status.data == {"status": "idle", "status_values": []}
+    assert node.action_status.count == 0
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "paused"
+    assert snapshot["can_resume"] is True
+    assert node.navigation_store.load()["phase"] == "paused"
+
+
+def test_action_status_callback_empty_list_and_no_record_is_idle(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=("action_status_callback", "state_payload"),
+    )
+
+    node.action_status_callback(_EmptyGoalStatusArray())
+
+    assert node.action_status.data == {"status": "idle", "status_values": []}
+    assert node.action_status.count == 0
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "idle"
+    assert snapshot["paused_goal"] is None
+
+
+def test_cancel_all_goals_sends_zero_uuid_and_zero_stamp(tmp_path):
+    client = _FakeCancelClient(return_code=0, results=(1,))
+    node = _navigation_node(tmp_path, client=client, methods=("_cancel_all_goals",))
+    client.future.done_flag = True
+
+    assert node._cancel_all_goals() == "accepted"
+    request = client.requests[0]
+    assert request.goal_info.goal_id.uuid == [0] * 16
+    assert request.goal_info.stamp.sec == 0
+    assert request.goal_info.stamp.nanosec == 0
+
+
+def test_cancel_all_goals_reports_rejected_return_code(tmp_path):
+    client = _FakeCancelClient(return_code=2, results=(1,))
+    node = _navigation_node(tmp_path, client=client, methods=("_cancel_all_goals",))
+    client.future.done_flag = True
+
+    assert node._cancel_all_goals() == "rejected"
+
+
+def test_cancel_all_goals_distinguishes_accepted_and_empty(tmp_path):
+    accepted_client = _FakeCancelClient(return_code=0, results=(1,))
+    accepted_node = _navigation_node(
+        tmp_path, client=accepted_client, methods=("_cancel_all_goals",)
+    )
+    accepted_client.future.done_flag = True
+
+    empty_client = _FakeCancelClient(return_code=0, results=())
+    empty_node = _navigation_node(
+        tmp_path, client=empty_client, methods=("_cancel_all_goals",)
+    )
+    empty_client.future.done_flag = True
+
+    assert accepted_node._cancel_all_goals() == "accepted"
+    assert empty_node._cancel_all_goals() == "empty"
+
+
+def test_cancel_all_goals_maps_future_error_to_unavailable(tmp_path):
+    future = _FakeFuture(error=RuntimeError("service crashed"))
+    future.done_flag = True
+    client = _FakeCancelClient(future=future)
+    node = _navigation_node(tmp_path, client=client, methods=("_cancel_all_goals",))
+
+    with pytest.raises(web_control_node.NavigationUnavailableError):
+        node._cancel_all_goals()
+
+
+def test_cancel_all_goals_times_out(tmp_path, monkeypatch):
+    # The wait is bounded, so a service that never answers must fail the request
+    # thread instead of blocking the HTTP worker forever.
+    future = _FakeFuture()
+    client = _FakeCancelClient(future=future)
+    node = _navigation_node(tmp_path, client=client, methods=("_cancel_all_goals",))
+    monkeypatch.setattr(web_control_node, "CANCEL_GOAL_TIMEOUT_SEC", 0.0)
+
+    with pytest.raises(web_control_node.NavigationTimeoutError):
+        node._cancel_all_goals()
+
+    assert future.cancelled is True

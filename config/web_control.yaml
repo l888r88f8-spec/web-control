@@ -17,6 +17,7 @@ web_control:
     initialpose_topic: "/initialpose"           # Initial pose output
     goal_topic: "goal_pose_3d"                  # Goal pose output
     action_status_topic: "/p2p_move_base/_action/status"  # Navigation action status
+    cancel_goal_service: "/p2p_move_base/_action/cancel_goal"  # Cancel goal service
     path_topics: "/global_path"                 # Comma-separated path topics
 
     max_2d_points_per_layer: 60000        # Max 2D points sent per layer

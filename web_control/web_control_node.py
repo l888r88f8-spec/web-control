@@ -52,6 +52,11 @@ except ModuleNotFoundError:
     Node = object
 
 try:
+    from action_msgs.srv import CancelGoal
+except ModuleNotFoundError:
+    CancelGoal = None
+
+try:
     from lio_sam_hesai.srv import SaveMapOptions
 except ModuleNotFoundError:
     SaveMapOptions = None
@@ -75,6 +80,17 @@ from web_control.core import (
 )
 from web_control.map_catalog import MapCatalog
 from web_control.map_selection import SelectionStore, default_selection_path
+from web_control.navigation_control import (
+    CLEARING,
+    NavigationConflictError,
+    NavigationControl,
+    NavigationTimeoutError,
+    NavigationUnavailableError,
+    PAUSING,
+    RESUMING,
+    select_action_status,
+)
+from web_control.navigation_store import NavigationStore, default_navigation_path
 
 LAYER_NAMES = {"local_map", "mapcloud", "mapground"}
 MAPPING_LAYER_NAMES = {"global_map", "ground"}
@@ -90,6 +106,7 @@ ACTION_STATUS_NAMES = {
 STOP_SIGINT_TIMEOUT_SEC = 1.5
 STOP_SIGTERM_TIMEOUT_SEC = 0.75
 STOP_SIGKILL_TIMEOUT_SEC = 0.25
+CANCEL_GOAL_TIMEOUT_SEC = 2.0
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError)
 MAP_ROOT_DISPLAY = "~/map"
 
@@ -436,6 +453,9 @@ class WebControlNode(Node):
         self.declare_parameter("initialpose_topic", "/initialpose")
         self.declare_parameter("goal_topic", "goal_pose_3d")
         self.declare_parameter("action_status_topic", "/p2p_move_base/_action/status")
+        self.declare_parameter(
+            "cancel_goal_service", "/p2p_move_base/_action/cancel_goal"
+        )
         self.declare_parameter("save_map_service", "/lio_sam/save_map_options")
         self.declare_parameter("path_topics", "")
         self.declare_parameter("max_2d_points_per_layer", 60000)
@@ -470,6 +490,9 @@ class WebControlNode(Node):
         self.map_root = Path.home() / "map"
         self.map_catalog = MapCatalog(self.map_root)
         self.map_selection = SelectionStore(default_selection_path())
+        self.navigation_store = NavigationStore(default_navigation_path())
+        self.navigation_control = NavigationControl(self.navigation_store)
+        self.published_goal: dict[str, Any] | None = None
 
         self.lock = threading.RLock()
         self.layers = {
@@ -512,6 +535,17 @@ class WebControlNode(Node):
             self.get_logger().warning(
                 "lio_sam_hesai SaveMapOptions type is unavailable; "
                 "save map requests will be rejected"
+            )
+
+        self.cancel_goal_client: Any | None = None
+        if CancelGoal is not None:
+            self.cancel_goal_client = self.create_client(
+                CancelGoal, str(self.get_parameter("cancel_goal_service").value)
+            )
+        else:
+            self.get_logger().warning(
+                "action_msgs CancelGoal srv is unavailable; pause and clear "
+                "requests will be rejected"
             )
 
         self.initialpose_pub = self.create_publisher(
@@ -956,18 +990,83 @@ class WebControlNode(Node):
             )
 
     def action_status_callback(self, msg: GoalStatusArray) -> None:
-        status_values = [int(status.status) for status in msg.status_list]
-        payload = {
-            "status": action_status_name(status_values),
-            "status_values": status_values,
-        }
+        selected = select_action_status(msg.status_list)
+        now = self.now_sec()
+        if selected is None:
+            with self.lock:
+                self.action_status.update(
+                    {"status": "idle", "status_values": []},
+                    stamp=now,
+                    frame_id="",
+                    count=0,
+                )
+            self.navigation_control.note_no_active_goals(now)
+            return
         with self.lock:
             self.action_status.update(
-                payload,
-                stamp=self.now_sec(),
+                {"status": selected["name"], "status_values": selected["values"]},
+                stamp=now,
                 frame_id="",
-                count=len(status_values),
+                count=len(selected["values"]),
             )
+        action = self.navigation_control.note_action_status(
+            selected["name"], selected["goal_stamp"], now
+        )
+        if action == "retry_cancel":
+            threading.Thread(
+                target=self._retry_startup_cancel,
+                name="web_control_retry_cancel",
+                daemon=True,
+            ).start()
+
+    def _cancel_all_goals(self) -> str:
+        """Cancel every server goal with a zero UUID.
+
+        Returns ``"accepted"`` when the service accepts the request and reports
+        goals canceling, ``"empty"`` when it accepts but matches no goal, and
+        ``"rejected"`` for any non-zero ``return_code``.  A raised service
+        future is mapped to :class:`NavigationUnavailableError`.
+        """
+        client = self.cancel_goal_client
+        if client is None:
+            raise NavigationUnavailableError("cancel goal service unavailable")
+        try:
+            ready = bool(client.service_is_ready())
+        except Exception:
+            ready = False
+        if not ready:
+            raise NavigationUnavailableError("cancel goal service unavailable")
+        request = CancelGoal.Request()
+        request.goal_info.goal_id.uuid = [0] * 16
+        request.goal_info.stamp.sec = 0
+        request.goal_info.stamp.nanosec = 0
+        future = client.call_async(request)
+        deadline = time.monotonic() + CANCEL_GOAL_TIMEOUT_SEC
+        while not future.done():
+            if time.monotonic() >= deadline:
+                future.cancel()
+                raise NavigationTimeoutError("cancel goal request timed out")
+            time.sleep(0.01)
+        try:
+            response = future.result()
+        except Exception as exc:
+            raise NavigationUnavailableError(
+                f"cancel goal service call failed: {exc}"
+            ) from exc
+        if response is None:
+            raise NavigationUnavailableError("cancel goal service returned no response")
+        if int(getattr(response, "return_code", 0)) != 0:
+            return "rejected"
+        results = list(getattr(response, "goals_canceling", []) or [])
+        return "accepted" if results else "empty"
+
+    def _retry_startup_cancel(self) -> None:
+        try:
+            result = self._cancel_all_goals()
+        except (NavigationUnavailableError, NavigationTimeoutError):
+            return
+        if result != "accepted":
+            self.navigation_control.note_cancel_failed(self.now_sec())
 
     def state_payload(self) -> dict[str, Any]:
         now = self.now_sec()
@@ -995,6 +1094,9 @@ class WebControlNode(Node):
                 ),
                 "viewers": self.viewers.count(now),
                 "map_frame": self.map_frame,
+                "navigation_control": self.navigation_control.snapshot(
+                    self.map_selection.load()
+                ),
                 "server_time": now,
             }
 
