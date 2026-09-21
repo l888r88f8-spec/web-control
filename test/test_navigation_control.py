@@ -239,6 +239,52 @@ def test_clear_before_active_empty_cancel_retries_after_registration(tmp_path):
     assert store.load() is None
 
 
+@pytest.mark.parametrize("active_status", ["accepted", "executing"])
+def test_clear_before_active_accepted_cancel_does_not_retry(tmp_path, active_status):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+
+    # The initial CancelGoal was accepted (not empty), so the confirming
+    # accepted/executing status must keep clearing without a duplicate cancel.
+    assert control.note_action_status(active_status, 7, 11.0) is None
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == CLEARING
+    assert snapshot["has_goal"] is True
+
+    # The original cancel's terminal still settles the clear normally.
+    control.note_action_status("canceling", 7, 12.0)
+    assert control.snapshot("site_a")["state"] == CLEARING
+    control.note_action_status("canceled", 7, 13.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_clear_retry_flag_does_not_leak_into_later_goal(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+    control.note_cancel_empty(10.0)
+    assert control.note_action_status("accepted", 7, 11.0) == "retry_cancel"
+
+    # The retried cancel did not confirm; the failed clear settles Navigating.
+    control.note_cancel_failed(12.0)
+    assert control.snapshot("site_a")["state"] == NAVIGATING
+
+    # A later goal whose initial cancel is accepted must not reuse the stale
+    # retry intent from the failed clear.
+    control.record_goal_published(
+        {"x": 5.0, "y": 6.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 13.0
+    )
+    assert control.begin_clear(13.0) is True
+    assert control.note_action_status("accepted", 9, 14.0) is None
+    assert control.snapshot("site_a")["state"] == CLEARING
+
+
 def test_clear_retry_failure_restores_navigating_with_goal(tmp_path):
     control, store = _control(tmp_path)
     control.record_goal_published(

@@ -3728,6 +3728,56 @@ def test_clear_before_active_registration_retries_then_reaches_idle(
     assert node.published_goal is None
 
 
+def test_clear_before_active_accepted_cancel_spawns_no_retry(tmp_path, monkeypatch):
+    # The initial CancelGoal matched the goal (accepted), so no registration
+    # race occurred and a confirming status must not send a duplicate cancel.
+    client = _FakeCancelClient(return_code=0, results=(1,))
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "clear_navigation",
+            "state_payload",
+            "action_status_callback",
+            "_retry_startup_cancel",
+        ),
+    )
+    client.future.done_flag = True
+    node.publish_goal({"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0})
+    body = node.clear_navigation()
+    assert body["navigation_control"]["state"] == "clearing"
+    assert len(client.requests) == 1
+
+    spawned = []
+
+    class _RecordingThread:
+        def __init__(self, target=None, args=(), name=None, daemon=None):
+            spawned.append((target, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(web_control_node.threading, "Thread", _RecordingThread)
+
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(1, 7)]))
+    assert spawned == []
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+
+    # The original accepted cancel's terminal settles the clear to Idle without
+    # ever issuing a second cancel request.
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(3, 7)]))
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(5, 7)]))
+    snapshot = node.navigation_control.snapshot("site_a")
+    assert snapshot["state"] == "idle"
+    assert snapshot["has_goal"] is False
+    assert node.published_goal is None
+    assert len(client.requests) == 1
+
+
 def test_clear_registration_retry_empty_restores_navigating(tmp_path):
     client = _FakeCancelClient(return_code=0, results=())
     node = _navigation_node(

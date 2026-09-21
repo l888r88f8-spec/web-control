@@ -94,6 +94,10 @@ class NavigationControl:
         # to the goal being replaced and must not end the new transition.
         self._transition_floor = -1
         self._awaiting_active = False
+        # Set only when a Clear's first CancelGoal returned ``empty`` while the
+        # goal was still awaiting an active status; consumed by the first
+        # confirming accepted/executing so at most one retry is ever sent.
+        self._retry_cancel_on_active = False
         if self._record is not None:
             self._phase = self._record["phase"]
             if self._phase == PAUSING:
@@ -138,8 +142,10 @@ class NavigationControl:
 
         Returns ``"retry_cancel"`` once when a cancellation must be retried: at
         startup for an interrupted Pause against the still-active goal, or when
-        a Clear that raced goal registration sees the goal finally confirmed by
-        a newer ``accepted``/``executing`` status.
+        a Clear whose first CancelGoal returned ``empty`` (it raced goal
+        registration) sees the goal finally confirmed by a newer
+        ``accepted``/``executing`` status.  A Clear whose first cancel was
+        already accepted keeps clearing without sending a duplicate cancel.
 
         After a fresh goal publish or a resume, ``_transition_floor`` holds the
         goal stamp of the replaced goal.  While the new goal is awaiting an
@@ -161,15 +167,20 @@ class NavigationControl:
                 if status_name in ("accepted", "executing"):
                     self._awaiting_active = False
                     self._transition_floor = -1
+                    retry_cancel = self._retry_cancel_on_active
+                    self._retry_cancel_on_active = False
                     if self._phase == CLEARING:
-                        # The clear's first cancel raced goal registration.
-                        # Keep clearing and request exactly one retry now that
-                        # the Action server has confirmed the goal.
+                        # Keep clearing until a terminal status settles it.  A
+                        # retry is only due if the first CancelGoal matched no
+                        # goal (it raced registration); an already accepted
+                        # cancel is in flight and must not be duplicated.
                         self._active = True
                         self._last_status_stamp = max(
                             self._last_status_stamp, goal_stamp
                         )
-                        return "retry_cancel"
+                        if retry_cancel:
+                            return "retry_cancel"
+                        return None
                 elif status_name in ("canceled", "succeeded", "aborted"):
                     self._awaiting_active = False
                     self._transition_floor = -1
@@ -258,6 +269,7 @@ class NavigationControl:
         registration, has no destination to keep and becomes ``idle``.
         """
         self._active = False
+        self._retry_cancel_on_active = False
         self._current_goal = None
         if self._phase == RESUMING and self._record is not None:
             self._set_record_phase_locked(PAUSED, now)
@@ -280,6 +292,7 @@ class NavigationControl:
                 self._pending = None
             return
         self._active = False
+        self._retry_cancel_on_active = False
         if status_name == "canceled":
             if self._pending == PENDING_PAUSE:
                 self._set_record_phase_locked(PAUSED, now)
@@ -338,6 +351,7 @@ class NavigationControl:
             self._active = False
             self._transition_floor = self._last_status_stamp
             self._awaiting_active = True
+            self._retry_cancel_on_active = False
             # An operator publish supersedes any startup reconciliation.
             self._reconciled = True
 
@@ -380,6 +394,7 @@ class NavigationControl:
             if self._phase == PAUSING:
                 self._pending = PENDING_CLEAR
                 self._phase = CLEARING
+                self._retry_cancel_on_active = False
                 return False
             if self._phase == CLEARING:
                 raise NavigationConflictError("clear is already in progress")
@@ -400,6 +415,7 @@ class NavigationControl:
                     # the cancellation really settles.
                     self._phase = CLEARING
                     self._pending = PENDING_CLEAR
+                    self._retry_cancel_on_active = False
                     return True
                 self._current_goal = None
                 self._active = False
@@ -452,6 +468,7 @@ class NavigationControl:
         still be running, the goal is kept so Clear can be retried.
         """
         with self._lock:
+            self._retry_cancel_on_active = False
             if self._pending in (PENDING_PAUSE, PENDING_CLEAR):
                 self._clear_record_locked()
             self._pending = None
@@ -476,7 +493,11 @@ class NavigationControl:
             if self._pending != PENDING_CLEAR:
                 return
             if self._awaiting_active:
+                # Only this registration race justifies one retry once the goal
+                # is confirmed active.
+                self._retry_cancel_on_active = True
                 return
+            self._retry_cancel_on_active = False
             self._clear_record_locked()
             self._current_goal = None
             self._active = False
@@ -488,6 +509,7 @@ class NavigationControl:
         with self._lock:
             if self._phase != RESUMING or self._record is None:
                 return
+            self._retry_cancel_on_active = False
             self._set_record_phase_locked(PAUSED, now)
             self._phase = PAUSED
             self._pending = None
@@ -512,6 +534,7 @@ class NavigationControl:
             self._reconciled = False
             self._awaiting_active = False
             self._transition_floor = -1
+            self._retry_cancel_on_active = False
             if self._phase == NAVIGATING:
                 self._current_goal = None
                 self._active = False
