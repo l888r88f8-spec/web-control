@@ -87,6 +87,7 @@ from web_control.navigation_control import (
     NavigationTimeoutError,
     NavigationUnavailableError,
     PAUSING,
+    PENDING_CLEAR,
     RESUMING,
     select_action_status,
 )
@@ -1007,6 +1008,9 @@ class WebControlNode(Node):
                     count=0,
                 )
             self.navigation_control.note_no_active_goals(now)
+            with self.lock:
+                if not self.navigation_control.has_goal():
+                    self.published_goal = None
             return
         with self.lock:
             self.action_status.update(
@@ -1018,9 +1022,16 @@ class WebControlNode(Node):
         action = self.navigation_control.note_action_status(
             selected["name"], selected["goal_stamp"], now
         )
+        # Keep the node's published goal truthful: drop it once the control has
+        # no goal, but never while a clear is still pending or failed.
+        with self.lock:
+            if not self.navigation_control.has_goal():
+                self.published_goal = None
         if action == "retry_cancel":
+            clear_retry = self.navigation_control.pending_kind() == PENDING_CLEAR
             threading.Thread(
                 target=self._retry_startup_cancel,
+                args=(clear_retry,),
                 name="web_control_retry_cancel",
                 daemon=True,
             ).start()
@@ -1071,13 +1082,32 @@ class WebControlNode(Node):
         results = list(getattr(response, "goals_canceling", []) or [])
         return "accepted" if results else "empty"
 
-    def _retry_startup_cancel(self) -> None:
+    def _retry_startup_cancel(self, clear: bool | None = None) -> None:
+        """Retry a cancellation that raced goal registration or a restart.
+
+        ``clear`` selects the Clear registration retry so a failure reports a
+        truthful Navigating state with the goal retained; a Pause retry keeps
+        the previous behavior of leaving the transition in place when the
+        service is unavailable.
+        """
+        if clear is None:
+            clear = self.navigation_control.pending_kind() == PENDING_CLEAR
+        if clear and self.navigation_control.pending_kind() != PENDING_CLEAR:
+            return
         try:
             result = self._cancel_all_goals()
         except (NavigationUnavailableError, NavigationTimeoutError):
+            if clear:
+                self.navigation_control.note_cancel_failed(self.now_sec())
+                with self.lock:
+                    if not self.navigation_control.has_goal():
+                        self.published_goal = None
             return
         if result != "accepted":
             self.navigation_control.note_cancel_failed(self.now_sec())
+            with self.lock:
+                if not self.navigation_control.has_goal():
+                    self.published_goal = None
 
     def state_payload(self) -> dict[str, Any]:
         now = self.now_sec()
@@ -1403,7 +1433,9 @@ class WebControlNode(Node):
 
     def resume_navigation(self) -> dict[str, Any]:
         map_name = self.map_selection.load()
-        record = self.navigation_control.begin_resume(self.now_sec(), map_name)
+        record = self.navigation_control.begin_resume(
+            self.now_sec(), map_name, self.map_frame
+        )
         try:
             self._publish_goal_pose(record, record["frame"])
         except Exception as exc:
@@ -1430,16 +1462,26 @@ class WebControlNode(Node):
                 raise
             except NavigationUnavailableError:
                 self.navigation_control.note_cancel_failed(self.now_sec())
+                with self.lock:
+                    if not self.navigation_control.has_goal():
+                        self.published_goal = None
                 raise
             if result == "empty":
+                # An empty result while the goal is still awaiting its first
+                # active status only means registration raced the cancel; the
+                # control keeps clearing and retains the goal for the retry.
                 self.navigation_control.note_cancel_empty(self.now_sec())
             elif result == "rejected":
                 # The service refused; the goal may still be running, so keep
                 # the previous state instead of pretending the clear finished.
                 self.navigation_control.note_cancel_failed(self.now_sec())
+                with self.lock:
+                    if not self.navigation_control.has_goal():
+                        self.published_goal = None
                 raise NavigationUnavailableError("cancel goal request rejected")
         with self.lock:
-            self.published_goal = None
+            if not self.navigation_control.has_goal():
+                self.published_goal = None
         response = success_response("clear requested", self.now_sec())
         response["navigation_control"] = self.navigation_control.snapshot(map_name)
         return response

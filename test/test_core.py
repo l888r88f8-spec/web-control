@@ -3271,6 +3271,28 @@ def _arm_active_goal(node, pose=None):
     node.published_goal = dict(pose)
 
 
+class _GoalStamp:
+    def __init__(self, goal_stamp):
+        self.sec = goal_stamp // 1_000_000_000
+        self.nanosec = goal_stamp % 1_000_000_000
+
+
+class _GoalStatusInfo:
+    def __init__(self, goal_stamp):
+        self.stamp = _GoalStamp(goal_stamp)
+
+
+class _GoalStatus:
+    def __init__(self, value, goal_stamp):
+        self.status = value
+        self.goal_info = _GoalStatusInfo(goal_stamp)
+
+
+class _GoalStatusArray:
+    def __init__(self, statuses):
+        self.status_list = statuses
+
+
 def test_node_declares_cancel_goal_service_and_client():
     package_root = Path(__file__).resolve().parents[1]
     source = (package_root / "web_control" / "web_control_node.py").read_text(
@@ -3589,6 +3611,168 @@ def test_clear_while_pausing_reuses_cancel(tmp_path):
 
     node.navigation_control.note_action_status("canceled", 5, 12.0)
     assert node.navigation_control.snapshot("site_a")["state"] == "idle"
+
+
+def test_pause_then_clear_cancel_failure_discards_record_and_keeps_goal(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        methods=(
+            "_cancel_all_goals",
+            "pause_navigation",
+            "clear_navigation",
+            "state_payload",
+        ),
+    )
+    _arm_active_goal(node)
+    node.pause_navigation()
+    assert node.navigation_store.load()["phase"] == "pausing"
+    assert node.published_goal is not None
+
+    # Clear reuses the pause cancellation, so nothing is settled yet.
+    node.clear_navigation()
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+    assert node.published_goal is not None
+
+    # The in-flight cancellation failed (e.g. the service vanished).
+    node.navigation_control.note_cancel_failed(11.0)
+
+    assert node.navigation_store.load() is None
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "navigating"
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+    assert node.published_goal is not None
+
+
+def test_clear_before_active_sends_cancel_and_keeps_published_goal(tmp_path):
+    client = _FakeCancelClient(return_code=0, results=())
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "clear_navigation",
+            "state_payload",
+        ),
+    )
+    client.future.done_flag = True
+
+    node.publish_goal({"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0})
+    assert node.published_goal is not None
+
+    # The goal has not been confirmed active yet, but Clear must still ask the
+    # Action server to cancel it and keep the published goal until it settles.
+    body = node.clear_navigation()
+
+    assert body["navigation_control"]["state"] == "clearing"
+    assert body["navigation_control"]["has_goal"] is True
+    assert node.published_goal is not None
+    assert len(client.requests) == 1
+
+
+def test_clear_before_active_registration_retries_then_reaches_idle(
+    tmp_path, monkeypatch
+):
+    client = _FakeCancelClient(return_code=0, results=())
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "clear_navigation",
+            "state_payload",
+            "action_status_callback",
+            "_retry_startup_cancel",
+        ),
+    )
+    client.future.done_flag = True
+    node.publish_goal({"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0})
+    node.clear_navigation()
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+    assert len(client.requests) == 1
+
+    spawned = []
+
+    class _RecordingThread:
+        def __init__(self, target=None, args=(), name=None, daemon=None):
+            spawned.append((target, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(web_control_node.threading, "Thread", _RecordingThread)
+
+    # A newer accepted status confirms registration and queues exactly one retry.
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(1, 7)]))
+    assert spawned == [(node._retry_startup_cancel, (True,))]
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(2, 7)]))
+    assert len(spawned) == 1
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+
+    # The retried cancel is accepted; canceling keeps clearing, canceled settles.
+    client.results = [1]
+    node._retry_startup_cancel(True)
+    assert len(client.requests) == 2
+
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(3, 7)]))
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+    node.action_status_callback(_GoalStatusArray([_GoalStatus(5, 7)]))
+
+    snapshot = node.navigation_control.snapshot("site_a")
+    assert snapshot["state"] == "idle"
+    assert snapshot["has_goal"] is False
+    assert node.published_goal is None
+
+
+def test_clear_registration_retry_empty_restores_navigating(tmp_path):
+    client = _FakeCancelClient(return_code=0, results=())
+    node = _navigation_node(
+        tmp_path,
+        client=client,
+        methods=(
+            "_publish_goal_pose",
+            "_cancel_all_goals",
+            "publish_goal",
+            "clear_navigation",
+            "state_payload",
+            "_retry_startup_cancel",
+        ),
+    )
+    client.future.done_flag = True
+    node.publish_goal({"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0})
+    node.clear_navigation()
+    assert node.navigation_control.snapshot("site_a")["state"] == "clearing"
+
+    # The goal registers, but the retried cancel still matches no goal.
+    node.navigation_control.note_action_status("accepted", 7, 11.0)
+    node._retry_startup_cancel(True)
+
+    snapshot = node.state_payload()["navigation_control"]
+    assert snapshot["state"] == "navigating"
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+    assert node.published_goal is not None
+
+
+def test_resume_endpoint_rejects_saved_frame_mismatch(tmp_path):
+    node = _navigation_node(
+        tmp_path,
+        record=_paused_record(),
+        methods=("state_payload", "_publish_goal_pose", "resume_navigation"),
+    )
+    node.map_frame = "odom"
+
+    status, body = _serve_and_request(node, "/api/navigation/resume", {}, "POST")
+
+    assert status == 409
+    assert body["ok"] is False
+    assert node.goal_publications == []
+    assert node.navigation_store.load()["phase"] == "paused"
+    assert node.navigation_control.snapshot("site_a")["state"] == "paused"
 
 
 def test_clear_navigation_runtime_state_settles_control_and_goal(tmp_path):

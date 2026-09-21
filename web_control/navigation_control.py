@@ -121,6 +121,14 @@ class NavigationControl:
         with self._lock:
             return self._pending is not None and self._phase in (PAUSING, CLEARING)
 
+    def has_goal(self) -> bool:
+        with self._lock:
+            return self._has_goal_locked()
+
+    def pending_kind(self) -> str | None:
+        with self._lock:
+            return self._pending
+
     # -- Action status feed -------------------------------------------------
 
     def note_action_status(
@@ -128,8 +136,10 @@ class NavigationControl:
     ) -> str | None:
         """Apply a selected Action status; stale transition updates are ignored.
 
-        Returns ``"retry_cancel"`` once at startup when an interrupted Pause
-        must be retried against the still-active goal.
+        Returns ``"retry_cancel"`` once when a cancellation must be retried: at
+        startup for an interrupted Pause against the still-active goal, or when
+        a Clear that raced goal registration sees the goal finally confirmed by
+        a newer ``accepted``/``executing`` status.
 
         After a fresh goal publish or a resume, ``_transition_floor`` holds the
         goal stamp of the replaced goal.  While the new goal is awaiting an
@@ -151,6 +161,15 @@ class NavigationControl:
                 if status_name in ("accepted", "executing"):
                     self._awaiting_active = False
                     self._transition_floor = -1
+                    if self._phase == CLEARING:
+                        # The clear's first cancel raced goal registration.
+                        # Keep clearing and request exactly one retry now that
+                        # the Action server has confirmed the goal.
+                        self._active = True
+                        self._last_status_stamp = max(
+                            self._last_status_stamp, goal_stamp
+                        )
+                        return "retry_cancel"
                 elif status_name in ("canceled", "succeeded", "aborted"):
                     self._awaiting_active = False
                     self._transition_floor = -1
@@ -235,8 +254,8 @@ class NavigationControl:
         """Settle a new goal that ended before an active status confirmed it.
 
         A resuming goal returns to ``paused`` with its record kept so the
-        operator can try again; a normal new goal has no destination to keep
-        and becomes ``idle``.
+        operator can try again; a new goal, including one whose clear raced
+        registration, has no destination to keep and becomes ``idle``.
         """
         self._active = False
         self._current_goal = None
@@ -244,13 +263,18 @@ class NavigationControl:
             self._set_record_phase_locked(PAUSED, now)
             self._phase = PAUSED
         else:
+            self._clear_record_locked()
             self._phase = IDLE
         self._pending = None
 
     def _apply_status_locked(self, status_name: str, now: float) -> None:
         if status_name in ACTIVE_STATUS_NAMES:
             self._active = True
-            if self._phase in (RESUMING, CLEARING, PAUSED, IDLE):
+            if self._phase == CLEARING:
+                # A clear transition survives accepted/executing/canceling
+                # until a terminal status settles it.
+                return
+            if self._phase in (RESUMING, PAUSED, IDLE):
                 self._clear_record_locked()
                 self._phase = NAVIGATING
                 self._pending = None
@@ -269,14 +293,23 @@ class NavigationControl:
                 self._pending = None
             return
         if status_name in ("succeeded", "aborted"):
+            if self._phase == CLEARING:
+                # Clear always discards the destination; a terminal that ends
+                # the goal before "canceled" settles it just the same.
+                self._clear_record_locked()
+                self._current_goal = None
+                self._active = False
+                self._phase = IDLE
+                self._pending = None
+                return
             if self._record is not None:
-                if self._phase in (NAVIGATING, CLEARING, RESUMING, PAUSING):
+                if self._phase in (NAVIGATING, RESUMING, PAUSING):
                     self._current_goal = None
                     self._phase = PAUSED
                     self._pending = None
                 return
             self._current_goal = None
-            if self._phase in (NAVIGATING, CLEARING, RESUMING, PAUSING):
+            if self._phase in (NAVIGATING, RESUMING, PAUSING):
                 self._phase = IDLE
                 self._pending = None
 
@@ -305,6 +338,8 @@ class NavigationControl:
             self._active = False
             self._transition_floor = self._last_status_stamp
             self._awaiting_active = True
+            # An operator publish supersedes any startup reconciliation.
+            self._reconciled = True
 
     def begin_pause(
         self,
@@ -359,17 +394,25 @@ class NavigationControl:
                 self._phase = IDLE
                 return False
             if self._phase == NAVIGATING:
-                self._current_goal = None
-                if self._active:
+                if self._active or self._awaiting_active:
+                    # Also cancel a goal that was published but whose first
+                    # active status has not arrived yet; keep the goal until
+                    # the cancellation really settles.
                     self._phase = CLEARING
                     self._pending = PENDING_CLEAR
                     return True
+                self._current_goal = None
                 self._active = False
                 self._phase = IDLE
                 return False
             raise NavigationConflictError("no navigation goal to clear")
 
-    def begin_resume(self, now: float, current_map: str | None) -> dict[str, Any]:
+    def begin_resume(
+        self,
+        now: float,
+        current_map: str | None,
+        current_frame: str | None = None,
+    ) -> dict[str, Any]:
         """Mark the saved destination ``resuming`` and return it to publish."""
         with self._lock:
             if (
@@ -381,6 +424,10 @@ class NavigationControl:
             if current_map is None or self._record["map_name"] != current_map:
                 raise NavigationConflictError(
                     "paused goal belongs to a different map"
+                )
+            if current_frame is not None and self._record["frame"] != current_frame:
+                raise NavigationConflictError(
+                    "paused goal belongs to a different frame"
                 )
             self._set_record_phase_locked(RESUMING, now)
             self._phase = RESUMING
@@ -398,22 +445,43 @@ class NavigationControl:
             return dict(self._record)
 
     def note_cancel_failed(self, now: float) -> None:
-        """An explicit rejection or unavailable service ends the transition."""
+        """An explicit rejection or unavailable service ends the transition.
+
+        Either intent discards a persisted destination: Pause was abandoned and
+        Clear means the operator no longer wants the goal.  When the Action may
+        still be running, the goal is kept so Clear can be retried.
+        """
         with self._lock:
-            if self._pending == PENDING_PAUSE:
+            if self._pending in (PENDING_PAUSE, PENDING_CLEAR):
                 self._clear_record_locked()
             self._pending = None
-            self._phase = NAVIGATING if self._active else IDLE
+            if (
+                self._active
+                or self._awaiting_active
+                or self._current_goal is not None
+            ):
+                self._phase = NAVIGATING
+            else:
+                self._phase = IDLE
 
     def note_cancel_empty(self, now: float) -> None:
-        """A clear whose cancel matched no goal is already complete."""
+        """Handle a clear whose cancel matched no goal.
+
+        When the goal was published but has not been confirmed active yet, the
+        empty result may simply have raced registration.  Stay in ``clearing``
+        and retain the goal so the retry triggered by the confirming status can
+        cancel it; otherwise the clear is already complete.
+        """
         with self._lock:
-            if self._pending == PENDING_CLEAR:
-                self._clear_record_locked()
-                self._current_goal = None
-                self._active = False
-                self._phase = IDLE
-                self._pending = None
+            if self._pending != PENDING_CLEAR:
+                return
+            if self._awaiting_active:
+                return
+            self._clear_record_locked()
+            self._current_goal = None
+            self._active = False
+            self._phase = IDLE
+            self._pending = None
 
     def note_resume_publish_failed(self, now: float) -> None:
         """A definite publish failure restores the resumable paused state."""
@@ -441,6 +509,7 @@ class NavigationControl:
         still be resumed, while Navigating and Clearing settle to ``Idle``.
         """
         with self._lock:
+            self._reconciled = False
             self._awaiting_active = False
             self._transition_floor = -1
             if self._phase == NAVIGATING:

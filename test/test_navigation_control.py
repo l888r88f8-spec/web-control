@@ -128,6 +128,137 @@ def test_pausing_clear_reuses_cancel_and_discards_destination(tmp_path):
     assert store.load() is None
 
 
+def test_pausing_clear_survives_canceling_until_canceled(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is False
+
+    # An ordinary "canceling" status is the reused cancel already in flight; it
+    # must not destroy the clear transition before the terminal arrives.
+    control.note_action_status("canceling", 5, 11.0)
+    assert control.snapshot("site_a")["state"] == CLEARING
+
+    control.note_action_status("canceled", 5, 12.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_pausing_clear_terminal_success_discards_record(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is False
+
+    # The goal completed before the reused cancel settled.  Clear still wins:
+    # the destination is discarded and the state settles to Idle.
+    control.note_action_status("succeeded", 5, 11.0)
+
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+@pytest.mark.parametrize("active_status", ["accepted", "executing", "canceling"])
+def test_active_clear_survives_ordinary_active_status(tmp_path, active_status):
+    control, store = _control(tmp_path)
+    _arm(control)
+    assert control.begin_clear(10.0) is True
+
+    control.note_action_status(active_status, 7, 11.0)
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == CLEARING
+    assert snapshot["has_goal"] is True
+
+    control.note_action_status("canceled", 7, 12.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_pausing_clear_cancel_failure_discards_paused_record(tmp_path):
+    control, store = _control(tmp_path)
+    _arm(control)
+    control.begin_pause(
+        {"x": 1.0, "y": 2.0, "z": 0.0, "yaw": 0.5}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is False
+    assert store.load()["phase"] == "pausing"
+
+    # The operator chose Clear: the paused record must go even though the
+    # cancellation failed, and the still-running goal must stay clearable.
+    control.note_cancel_failed(11.0)
+
+    assert store.load() is None
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == NAVIGATING
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+    assert snapshot["can_pause"] is True
+
+
+def test_begin_clear_before_active_requests_cancel_and_keeps_goal(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+
+    assert control.begin_clear(10.0) is True
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == CLEARING
+    assert snapshot["has_goal"] is True
+
+
+def test_clear_before_active_empty_cancel_retries_after_registration(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+
+    # The first cancel raced goal registration and matched no goal: the clear
+    # must stay pending rather than claim success.
+    control.note_cancel_empty(10.0)
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == CLEARING
+    assert snapshot["has_goal"] is True
+
+    # A newer accepted confirms registration and asks for exactly one retry.
+    assert control.note_action_status("accepted", 7, 11.0) == "retry_cancel"
+    assert control.snapshot("site_a")["state"] == CLEARING
+    assert control.note_action_status("executing", 7, 12.0) is None
+
+    # The retried cancel is accepted and the terminal settles the clear.
+    control.note_action_status("canceling", 7, 13.0)
+    assert control.snapshot("site_a")["state"] == CLEARING
+    control.note_action_status("canceled", 7, 14.0)
+    assert control.snapshot("site_a")["state"] == IDLE
+    assert store.load() is None
+
+
+def test_clear_retry_failure_restores_navigating_with_goal(tmp_path):
+    control, store = _control(tmp_path)
+    control.record_goal_published(
+        {"x": 3.0, "y": 4.0, "z": 0.0, "yaw": 0.0}, "map", "site_a", 10.0
+    )
+    assert control.begin_clear(10.0) is True
+    control.note_cancel_empty(10.0)
+    assert control.note_action_status("accepted", 7, 11.0) == "retry_cancel"
+
+    # The retry matched no goal after the goal was confirmed active: report a
+    # truthful Navigating state and keep the goal so Clear can be retried.
+    control.note_cancel_failed(12.0)
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == NAVIGATING
+    assert snapshot["has_goal"] is True
+    assert snapshot["can_clear"] is True
+    assert snapshot["can_pause"] is True
+
+
 def test_clear_paused_goal_needs_no_cancel(tmp_path):
     control, store = _control(tmp_path, _record())
 
@@ -143,6 +274,18 @@ def test_resume_rejects_when_map_does_not_match(tmp_path):
         control.begin_resume(10.0, "site_b")
 
     assert control.snapshot("site_b")["state"] == PAUSED
+    assert store.load()["phase"] == "paused"
+
+
+def test_resume_rejects_when_frame_does_not_match(tmp_path):
+    control, store = _control(tmp_path, _record())
+
+    with pytest.raises(NavigationConflictError, match="different frame"):
+        control.begin_resume(10.0, "site_a", "odom")
+
+    snapshot = control.snapshot("site_a")
+    assert snapshot["state"] == PAUSED
+    assert snapshot["can_resume"] is True
     assert store.load()["phase"] == "paused"
 
 
@@ -305,6 +448,23 @@ def test_navigation_stopped_settles_each_phase(tmp_path):
     # Paused already has the right state.
     control, store = _control(tmp_path, _record())
     control.on_navigation_stopped(15.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+    assert store.load()["phase"] == "paused"
+
+
+def test_navigation_stopped_rearms_startup_reconciliation(tmp_path):
+    control, store = _control(tmp_path, _record(phase="pausing"))
+    # The first runtime reconciles the interrupted pause exactly once.
+    control.note_no_active_goals(9.0)
+    assert control.snapshot("site_a")["state"] == PAUSED
+    assert store.load()["phase"] == "paused"
+
+    control.on_navigation_stopped(10.0)
+
+    # A navigation process restart must reconcile the next runtime again
+    # instead of treating the first status as already processed.
+    assert control._reconciled is False
+    control.note_no_active_goals(11.0)
     assert control.snapshot("site_a")["state"] == PAUSED
     assert store.load()["phase"] == "paused"
 
