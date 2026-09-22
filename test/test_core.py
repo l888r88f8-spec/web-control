@@ -5062,3 +5062,244 @@ def test_web_control_yaml_declares_teleop_defaults():
     assert parameters["teleop_deadzone"] == 0.08
     assert parameters["teleop_command_timeout"] == 0.4
     assert parameters["teleop_publish_rate"] == 20.0
+
+
+def test_mapping_joystick_is_a_mapping_only_sibling_overlay():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    view_start = index_html.index('id="view3d"')
+    view_end = index_html.index('id="viewSystem"', view_start)
+    viewport = index_html[view_start:view_end]
+
+    assert 'id="mapCanvas3d"' in viewport
+    assert 'id="mappingJoystick" class="joystick" hidden' in viewport
+    assert viewport.index('id="mapCanvas3d"') < viewport.index('id="mappingJoystick"')
+    assert 'id="joystickBase"' in viewport
+    assert 'id="joystickKnob"' in viewport
+    assert 'id="joystickStatus"' in viewport
+
+    assert 'setMappingJoystickVisible(tab === "mapping")' in app_js
+    assert ".joystick {" in styles_css
+    assert "position: absolute;" in styles_css
+    assert ".stage.mapping-active .hud" in styles_css
+
+
+_MAPPING_JOYSTICK_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Mapping joystick");
+const blockEnd = source.indexOf("// --- End mapping joystick");
+if (blockStart < 0 || blockEnd < 0) throw new Error("mapping joystick block not found");
+const block = source.slice(blockStart, blockEnd);
+
+function makeElement() {
+  return {
+    hidden: false,
+    textContent: "",
+    className: "",
+    style: {},
+    captured: [],
+    listeners: {},
+    classList: {
+      values: new Set(),
+      toggle(name, on) {
+        if (on) this.values.add(name);
+        else this.values.delete(name);
+      },
+      contains(name) { return this.values.has(name); },
+    },
+    setPointerCapture(id) { this.captured.push(id); },
+    addEventListener(name, handler) { this.listeners[name] = handler; },
+    getBoundingClientRect() { return { left: 0, top: 0, width: 100, height: 100 }; },
+  };
+}
+
+const elements = {
+  mappingJoystick: makeElement(),
+  joystickKnob: makeElement(),
+  joystickStatus: makeElement(),
+};
+const stage = makeElement();
+global.document = {
+  hidden: false,
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) { return selector === ".stage" ? stage : null; },
+  addEventListener() {},
+};
+const intervalHandlers = new Map();
+let nextIntervalId = 1;
+global.window = {
+  addEventListener() {},
+  setInterval(handler) {
+    const id = nextIntervalId;
+    nextIntervalId += 1;
+    intervalHandlers.set(id, handler);
+    return id;
+  },
+  clearInterval(id) { intervalHandlers.delete(id); },
+};
+
+const beacons = [];
+try {
+  Object.defineProperty(globalThis, "navigator", {
+    value: { sendBeacon(url, body) { beacons.push({ url, body }); return true; } },
+    configurable: true,
+  });
+} catch (error) {
+  globalThis.navigator.sendBeacon = (url, body) => {
+    beacons.push({ url, body });
+    return true;
+  };
+}
+
+let fakeNow = 0;
+Date.now = () => fakeNow;
+
+const posts = [];
+global.postJson = async (url, payload) => {
+  posts.push({ url, payload });
+  const active = payload.throttle !== 0 || payload.steering !== 0;
+  return { ok: true, teleop: { active } };
+};
+global.fetchWithTimeout = async () => ({ ok: true });
+
+eval(block);
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+const baseElement = makeElement();
+let propagationStops = 0;
+function makeEvent(pointerId, clientX, clientY) {
+  return {
+    pointerId,
+    pointerType: "mouse",
+    clientX,
+    clientY,
+    currentTarget: baseElement,
+    preventDefault() {},
+    stopPropagation() { propagationStops += 1; },
+  };
+}
+
+const radius = 50;
+const upLeft = joystickAxes(-40, -40, radius);
+expect(upLeft.throttle > 0 && upLeft.steering > 0, "upper-left is forward and left");
+const upRight = joystickAxes(40, -40, radius);
+expect(upRight.throttle > 0 && upRight.steering < 0, "upper-right is forward and right");
+const downLeft = joystickAxes(-40, 40, radius);
+expect(downLeft.throttle < 0 && downLeft.steering > 0, "lower-left is reverse and left");
+const downRight = joystickAxes(40, 40, radius);
+expect(downRight.throttle < 0 && downRight.steering < 0, "lower-right is reverse and right");
+const horizontal = joystickAxes(-40, 0, radius);
+expect(horizontal.throttle === 0 && horizontal.steering > 0, "horizontal drag has zero throttle");
+const centered = joystickAxes(2, -2, radius);
+expect(centered.throttle === 0 && centered.steering === 0, "dead zone centers the axes");
+const clamped = joystickAxes(-100, -100, radius);
+expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the unit circle");
+
+(async () => {
+  fakeNow = 0;
+  await joystickPointerDown(makeEvent(1, 30, 30));
+  expect(posts.length === 1, "pointerdown sends the first command");
+  expect(posts[0].url === "/api/teleop", "pointerdown posts to /api/teleop");
+  expect(posts[0].payload.throttle > 0 && posts[0].payload.steering > 0, "pointerdown posts the upper-left axes");
+  expect(baseElement.captured.length === 1, "pointerdown captures the active pointer");
+  expect(propagationStops >= 1, "pointerdown stops propagation to the map canvas");
+  expect(elements.joystickKnob.style.transform === "translate(-20px, -20px)", "knob follows the pointer");
+  expect(intervalHandlers.size === 1, "pointerdown starts one fixed-rate send loop");
+
+  fakeNow = 100;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 2, "stationary hold continues sending at 10 Hz");
+
+  fakeNow = 150;
+  await joystickPointerMove(makeEvent(1, 50, 50));
+  expect(posts.length === 3, "returning to center sends one immediate zero");
+  expect(posts[2].payload.throttle === 0, "center transition posts zero throttle");
+
+  fakeNow = 250;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 3, "center hold does not stream zero commands");
+
+  await joystickPointerMove(makeEvent(1, 20, 20));
+  expect(posts.length === 4, "leaving center sends one immediate active command");
+
+  fakeNow = 300;
+  await joystickPointerMove(makeEvent(1, 10, 10));
+  expect(posts.length === 4, "active pointermove is throttled within 100 ms");
+
+  fakeNow = 350;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 5, "active hold sends again after 100 ms");
+
+  fakeNow = 400;
+  await joystickPointerMove(makeEvent(1, 20, 20));
+  expect(posts.length === 5, "active pointermove shares the send throttle");
+
+  const beforeSecondPointer = posts.length;
+  await joystickPointerDown(makeEvent(2, 80, 80));
+  expect(baseElement.captured.length === 1, "second pointer is not captured");
+  expect(posts.length === beforeSecondPointer, "second pointer does not take control");
+
+  fakeNow = 450;
+  await joystickPointerUp(makeEvent(1, 20, 20));
+  expect(posts[posts.length - 1].payload.throttle === 0, "release sends a zero throttle");
+  expect(posts[posts.length - 1].payload.steering === 0, "release sends a zero steering");
+  expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "release centers the knob");
+  expect(intervalHandlers.size === 0, "release clears the send loop");
+
+  fakeNow = 300;
+  await joystickPointerDown(makeEvent(3, -10, 90));
+  fakeNow = 400;
+  await joystickPointerCancel(makeEvent(3, -10, 90));
+  expect(posts[posts.length - 1].payload.throttle === 0, "cancel sends a zero command");
+
+  fakeNow = 500;
+  await joystickPointerDown(makeEvent(4, 10, 10));
+  fakeNow = 600;
+  await handleJoystickBlur();
+  expect(posts[posts.length - 1].payload.throttle === 0, "blur sends a zero command");
+
+  fakeNow = 700;
+  await joystickPointerDown(makeEvent(5, 10, 10));
+  document.hidden = true;
+  fakeNow = 800;
+  await handleVisibilityChange();
+  expect(posts[posts.length - 1].payload.throttle === 0, "hidden document sends a zero command");
+  document.hidden = false;
+
+  fakeNow = 900;
+  await joystickPointerDown(makeEvent(6, 10, 10));
+  await setMappingJoystickVisible(true);
+  expect(elements.mappingJoystick.hidden === false, "joystick is visible for Mapping");
+  expect(stage.classList.contains("mapping-active"), "HUD shift class is applied for Mapping");
+  fakeNow = 1000;
+  await setMappingJoystickVisible(false);
+  expect(elements.mappingJoystick.hidden === true, "joystick is hidden away from Mapping");
+  expect(!stage.classList.contains("mapping-active"), "HUD shift class is removed away from Mapping");
+  expect(posts[posts.length - 1].payload.throttle === 0, "tab switch sends a zero command");
+
+  fakeNow = 1100;
+  await joystickPointerDown(makeEvent(7, 10, 10));
+  handlePageHide();
+  expect(beacons.length === 1, "page shutdown sends one keepalive stop");
+  expect(JSON.parse(beacons[0].body).throttle === 0, "keepalive stop is a zero command");
+
+  console.log("mapping joystick ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_mapping_joystick_pointer_lifecycle_and_throttling_execute_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _MAPPING_JOYSTICK_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "mapping joystick ok" in completed.stdout

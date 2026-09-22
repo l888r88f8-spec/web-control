@@ -17,6 +17,14 @@
         <div id="view3d" class="viewport active">
           <canvas id="mapCanvas3d"></canvas>
           <div class="hud" id="hud">3D map ready</div>
+          <div id="mappingJoystick" class="joystick" hidden>
+            <div id="joystickBase" class="joystick-base">
+              <span class="joystick-axis joystick-axis-x"></span>
+              <span class="joystick-axis joystick-axis-y"></span>
+              <div id="joystickKnob" class="joystick-knob"></div>
+            </div>
+            <p id="joystickStatus" class="joystick-status" role="status" aria-live="polite">idle</p>
+          </div>
         </div>
         <div id="viewSystem" class="viewport system-viewport">
           <div class="system-board">

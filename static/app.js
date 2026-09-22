@@ -1113,6 +1113,197 @@ async function postNavigationCommand(path, failureLabel) {
 }
 // --- End navigation pause/resume controls
 
+// --- Mapping joystick
+const JOYSTICK_SEND_INTERVAL_MS = 100;
+const JOYSTICK_DEADZONE = 0.08;
+
+const teleop = {
+  pointerId: null,
+  active: false,
+  throttle: 0,
+  steering: 0,
+  lastSentAt: -Infinity,
+  sendTimer: null,
+};
+
+function joystickAxes(offsetX, offsetY, radius) {
+  if (!Number.isFinite(radius) || radius <= 0) return { throttle: 0, steering: 0 };
+  const clamp = (value) => Math.max(-1, Math.min(1, value));
+  const deadzone = (value) => (Math.abs(value) < JOYSTICK_DEADZONE ? 0 : value);
+  // Screen y grows downward, so up is forward; left is positive steering.
+  return {
+    throttle: deadzone(clamp(-offsetY / radius)),
+    steering: deadzone(clamp(-offsetX / radius)),
+  };
+}
+
+function joystickOffset(event, base) {
+  const rect = base.getBoundingClientRect();
+  const radius = Math.max(1, Math.min(rect.width, rect.height) / 2);
+  let dx = event.clientX - (rect.left + rect.width / 2);
+  let dy = event.clientY - (rect.top + rect.height / 2);
+  const distance = Math.hypot(dx, dy);
+  if (distance > radius) {
+    dx = (dx / distance) * radius;
+    dy = (dy / distance) * radius;
+  }
+  return { dx, dy, radius };
+}
+
+function renderJoystickKnob(dx, dy) {
+  const knob = document.getElementById("joystickKnob");
+  if (!knob) return;
+  knob.style.transform = `translate(${dx}px, ${dy}px)`;
+}
+
+function setJoystickStatus(text, level) {
+  const element = document.getElementById("joystickStatus");
+  if (!element) return;
+  element.textContent = text;
+  element.className = `joystick-status ${level}`;
+}
+
+function resetJoystick() {
+  teleop.pointerId = null;
+  teleop.throttle = 0;
+  teleop.steering = 0;
+  renderJoystickKnob(0, 0);
+}
+
+function startTeleopSendLoop() {
+  if (teleop.sendTimer !== null) return;
+  teleop.sendTimer = window.setInterval(async () => {
+    if (!teleop.active || teleop.throttle === 0) return;
+    await sendTeleopCommand(teleop.throttle, teleop.steering);
+  }, JOYSTICK_SEND_INTERVAL_MS);
+}
+
+function stopTeleopSendLoop() {
+  if (teleop.sendTimer === null) return;
+  window.clearInterval(teleop.sendTimer);
+  teleop.sendTimer = null;
+}
+
+async function sendTeleopCommand(throttle, steering, force = false) {
+  const now = Date.now();
+  if (!force && now - teleop.lastSentAt < JOYSTICK_SEND_INTERVAL_MS) return false;
+  teleop.lastSentAt = now;
+  try {
+    const response = await postJson("/api/teleop", { throttle, steering });
+    const accepted = response && response.teleop ? response.teleop : null;
+    if (accepted && accepted.active) setJoystickStatus("active", "active");
+    else setJoystickStatus("stopped", "idle");
+    return true;
+  } catch (error) {
+    teleop.active = false;
+    resetJoystick();
+    teleop.lastSentAt = -Infinity;
+    setJoystickStatus(`error: ${error.message}`, "error");
+    return false;
+  }
+}
+
+async function stopTeleop(reason) {
+  const wasActive = teleop.active || teleop.pointerId !== null;
+  stopTeleopSendLoop();
+  resetJoystick();
+  teleop.active = false;
+  teleop.lastSentAt = -Infinity;
+  if (!wasActive) {
+    setJoystickStatus("idle", "idle");
+    return;
+  }
+  setJoystickStatus("stopped", "idle");
+  await sendTeleopCommand(0, 0, true);
+}
+
+function sendTeleopKeepaliveStop() {
+  const body = JSON.stringify({ throttle: 0, steering: 0 });
+  if (navigator && typeof navigator.sendBeacon === "function") {
+    navigator.sendBeacon("/api/teleop", body);
+    return;
+  }
+  fetchWithTimeout("/api/teleop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: true,
+  }).catch(() => {});
+}
+
+async function joystickPointerDown(event) {
+  if (teleop.pointerId !== null) return;
+  event.preventDefault();
+  event.stopPropagation();
+  teleop.pointerId = event.pointerId;
+  teleop.active = true;
+  startTeleopSendLoop();
+  const base = event.currentTarget;
+  if (base && typeof base.setPointerCapture === "function") {
+    base.setPointerCapture(event.pointerId);
+  }
+  const offset = joystickOffset(event, base);
+  renderJoystickKnob(offset.dx, offset.dy);
+  const axes = joystickAxes(offset.dx, offset.dy, offset.radius);
+  teleop.throttle = axes.throttle;
+  teleop.steering = axes.steering;
+  await sendTeleopCommand(axes.throttle, axes.steering, true);
+}
+
+async function joystickPointerMove(event) {
+  if (!teleop.active || teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const wasMoving = teleop.throttle !== 0;
+  const offset = joystickOffset(event, event.currentTarget);
+  renderJoystickKnob(offset.dx, offset.dy);
+  const axes = joystickAxes(offset.dx, offset.dy, offset.radius);
+  teleop.throttle = axes.throttle;
+  teleop.steering = axes.steering;
+  const isMoving = axes.throttle !== 0;
+  await sendTeleopCommand(axes.throttle, axes.steering, wasMoving !== isMoving);
+}
+
+async function joystickPointerUp(event) {
+  if (teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  await stopTeleop("release");
+}
+
+async function joystickPointerCancel(event) {
+  if (teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  await stopTeleop("cancel");
+}
+
+async function handleJoystickBlur() {
+  await stopTeleop("blur");
+}
+
+async function handleVisibilityChange() {
+  if (document.hidden) await stopTeleop("hidden");
+}
+
+function handlePageHide() {
+  if (!teleop.active && teleop.pointerId === null) return;
+  stopTeleopSendLoop();
+  resetJoystick();
+  teleop.active = false;
+  teleop.lastSentAt = -Infinity;
+  sendTeleopKeepaliveStop();
+}
+
+async function setMappingJoystickVisible(visible) {
+  const joystick = document.getElementById("mappingJoystick");
+  if (joystick) joystick.hidden = !visible;
+  const stage = document.querySelector(".stage");
+  if (stage) stage.classList.toggle("mapping-active", visible);
+  if (!visible && teleop.active) await stopTeleop("tab");
+}
+// --- End mapping joystick
+
 function maybeClearGoalFromActionStatus() {
   if (!state.activeGoal || !state.navigationAction || !state.navigationAction.data) return;
   const status = state.navigationAction.data.status;
@@ -1159,6 +1350,7 @@ function setTab(tab) {
   document.getElementById("view3d").classList.toggle("active", tab === "3d" || tab === "mapping");
   document.getElementById("viewSystem").classList.toggle("active", tab === "system");
   document.querySelector(".app").classList.toggle("system-mode", tab === "system");
+  setMappingJoystickVisible(tab === "mapping");
   const panelName = tab === "system" ? "" : (tab === "mapping" ? "mapping" : "navigation");
   document.querySelectorAll("[data-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.panel === panelName);
@@ -1334,6 +1526,19 @@ function attachEvents() {
   document.getElementById("cancelSaveMap").addEventListener("click", () => document.getElementById("saveMapDialog").close());
   document.getElementById("saveMapDestination").addEventListener("input", (event) => event.target.setCustomValidity(""));
   document.getElementById("saveMapForm").addEventListener("submit", submitSaveMap);
+
+  const joystickBase = document.getElementById("joystickBase");
+  if (joystickBase) {
+    joystickBase.addEventListener("pointerdown", joystickPointerDown);
+    joystickBase.addEventListener("pointermove", joystickPointerMove);
+    joystickBase.addEventListener("pointerup", joystickPointerUp);
+    joystickBase.addEventListener("pointercancel", joystickPointerCancel);
+    joystickBase.addEventListener("lostpointercapture", joystickPointerCancel);
+    joystickBase.addEventListener("contextmenu", (event) => event.preventDefault());
+  }
+  window.addEventListener("blur", handleJoystickBlur);
+  window.addEventListener("pagehide", handlePageHide);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 
   mapCanvas3d.addEventListener("contextmenu", (event) => event.preventDefault());
   mapCanvas3d.addEventListener("wheel", (event) => {
