@@ -5912,3 +5912,121 @@ def test_mapping_joystick_layout_mode_persists_and_clamps_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "joystick layout ok" in completed.stdout
+
+
+def test_sidebar_toggle_is_single_accessible_button():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    assert index_html.count('id="sidebarToggle"') == 1
+    assert 'aria-controls="controlPanel"' in index_html
+    assert 'id="controlPanel"' in index_html
+    assert 'class="sidebar-toggle"' in index_html
+
+    assert "grid-template-columns: minmax(0, 1fr) var(--panel-width, 360px);" in styles_css
+    assert ".app.sidebar-collapsed" in styles_css
+    assert "transition: grid-template-columns 260ms ease;" in styles_css
+    assert ".app.sidebar-collapsed .panel" in styles_css
+    assert ".app.system-mode .sidebar-toggle" in styles_css
+    assert "var(--panel-width, 340px);" in styles_css
+
+    assert "function setSidebarCollapsed(collapsed)" in app_js
+    assert "function toggleSidebar()" in app_js
+    assert "function observeMapStageResize()" in app_js
+    assert "new ResizeObserver" in app_js
+    assert 'document.getElementById("sidebarToggle").addEventListener' in app_js
+
+
+_SIDEBAR_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Sidebar collapse");
+const blockEnd = source.indexOf("// --- End sidebar collapse");
+if (blockStart < 0 || blockEnd < 0) throw new Error("sidebar block not found");
+const block = source.slice(blockStart, blockEnd);
+if (block.includes("localStorage") || block.includes("sessionStorage")) {
+  throw new Error("sidebar state must not be persisted");
+}
+
+function makeElement() {
+  const classes = new Set();
+  return {
+    hidden: false,
+    attributes: {},
+    classList: {
+      toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+  };
+}
+
+const appElement = makeElement();
+const stageElement = makeElement();
+const toggleElement = makeElement();
+const elements = { sidebarToggle: toggleElement };
+const observers = [];
+global.document = {
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) {
+    if (selector === ".app") return appElement;
+    if (selector === ".stage") return stageElement;
+    return null;
+  },
+};
+global.ResizeObserver = class {
+  constructor(callback) { this.callback = callback; this.target = null; observers.push(this); }
+  observe(target) { this.target = target; }
+};
+let resizeCalls = 0;
+let layoutCalls = 0;
+global.resizeAll = () => { resizeCalls += 1; };
+global.applyJoystickLayout = () => { layoutCalls += 1; };
+
+const sidebarApi = new Function(block + `
+return { sidebarState, setSidebarCollapsed, toggleSidebar, observeMapStageResize };`)();
+const { sidebarState, setSidebarCollapsed, toggleSidebar, observeMapStageResize } =
+  sidebarApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+expect(sidebarState.collapsed === false, "sidebar starts expanded");
+setSidebarCollapsed(false);
+expect(toggleElement.getAttribute("aria-expanded") === "true", "expanded aria state");
+expect(toggleElement.getAttribute("aria-label") === "Collapse sidebar", "expanded label");
+
+toggleSidebar();
+expect(sidebarState.collapsed === true, "toggle collapses");
+expect(appElement.classList.contains("sidebar-collapsed"), "collapsed class applied");
+expect(toggleElement.getAttribute("aria-expanded") === "false", "collapsed aria state");
+expect(toggleElement.getAttribute("aria-label") === "Expand sidebar", "collapsed label");
+
+toggleSidebar();
+expect(sidebarState.collapsed === false, "toggle expands");
+expect(!appElement.classList.contains("sidebar-collapsed"), "collapsed class removed");
+expect(toggleElement.getAttribute("aria-expanded") === "true", "re-expanded aria state");
+
+observeMapStageResize();
+expect(observers.length === 1, "one ResizeObserver created");
+expect(observers[0].target === stageElement, "map stage observed");
+observers[0].callback();
+expect(resizeCalls === 1, "renderer resized on stage change");
+expect(layoutCalls === 1, "joystick layout recalculated on stage change");
+
+console.log("sidebar collapse ok");
+"""
+
+
+def test_sidebar_collapse_state_toggles_without_persistence_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _SIDEBAR_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "sidebar collapse ok" in completed.stdout

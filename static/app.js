@@ -1668,6 +1668,39 @@ function updateHudPlacement() {
 }
 // --- End joystick layout
 
+// --- Sidebar collapse
+const sidebarState = { collapsed: false };
+
+function setSidebarCollapsed(collapsed) {
+  sidebarState.collapsed = Boolean(collapsed);
+  const app = document.querySelector(".app");
+  if (app) app.classList.toggle("sidebar-collapsed", sidebarState.collapsed);
+  const toggle = document.getElementById("sidebarToggle");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(!sidebarState.collapsed));
+    toggle.setAttribute(
+      "aria-label",
+      sidebarState.collapsed ? "Expand sidebar" : "Collapse sidebar",
+    );
+  }
+}
+
+function toggleSidebar() {
+  setSidebarCollapsed(!sidebarState.collapsed);
+}
+
+function observeMapStageResize() {
+  if (typeof ResizeObserver !== "function") return;
+  const stage = document.querySelector(".stage");
+  if (!stage) return;
+  const observer = new ResizeObserver(() => {
+    resizeAll();
+    if (typeof applyJoystickLayout === "function") applyJoystickLayout();
+  });
+  observer.observe(stage);
+}
+// --- End sidebar collapse
+
 function maybeClearGoalFromActionStatus() {
   if (!state.activeGoal || !state.navigationAction || !state.navigationAction.data) return;
   const status = state.navigationAction.data.status;
@@ -1887,6 +1920,8 @@ function attachEvents() {
   );
   document.getElementById("mapSelect").addEventListener("change", (event) => selectMap(event.target.value));
   document.getElementById("refreshMaps").addEventListener("click", () => refreshMaps(true));
+  document.getElementById("sidebarToggle").addEventListener("click", toggleSidebar);
+  observeMapStageResize();
   document.getElementById("openSaveMap").addEventListener("click", () => {
     saveMapSubmissionError = null;
     const dialog = document.getElementById("saveMapDialog");
@@ -2027,6 +2062,7 @@ function start() {
   pollPose();
   refreshMaps();
   refreshJoystickPreferences();
+  setSidebarCollapsed(false);
   setInterval(pollState, 1000);
   setInterval(pollMappingState, 1000);
   setInterval(pollPose, 100);
