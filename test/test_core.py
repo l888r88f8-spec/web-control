@@ -368,6 +368,162 @@ def test_frontend_uses_threejs_3d_map_without_2d_tab():
     assert 'static/vendor' in setup_py
 
 
+def test_frontend_hosts_liquid_glass_defs():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    defs_start = index_html.index('id="liquidGlassDefs"')
+    defs_tag = index_html[index_html.rindex("<svg", 0, defs_start) : index_html.index(">", defs_start)]
+    assert 'class="glass-defs"' in defs_tag
+    assert 'aria-hidden="true"' in defs_tag
+    assert 'focusable="false"' in defs_tag
+    assert defs_start < index_html.index('<main class="app">')
+    assert 'id="view3d"' in index_html
+    assert 'id="viewSystem"' in index_html
+
+
+def test_liquid_glass_helper_exports_provenance_and_static_assets():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    source = (static_dir / "liquid-glass.js").read_text(encoding="utf-8")
+
+    for name in (
+        "initLiquidGlass",
+        "detectGlassMode",
+        "applyGlassMode",
+        "glassMode",
+        "glassMotionReduced",
+    ):
+        assert f"export function {name}" in source
+    assert "https://github.com/shuding/liquid-glass" in source
+    assert "independently implemented" in source
+    assert "data:image/png;base64," in source
+    assert source.count('"feImage"') == 1
+    assert source.count('"feDisplacementMap"') == 1
+    assert "requestAnimationFrame" not in source
+    assert "setInterval" not in source
+    assert "ResizeObserver" not in source
+    assert "localStorage" not in source
+    assert "sessionStorage" not in source
+
+
+def test_liquid_glass_wiring_in_app():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'import { initLiquidGlass, glassMotionReduced } from "./liquid-glass.js";' in app_js
+    assert "initLiquidGlass();" in app_js
+
+
+_LIQUID_GLASS_CAPABILITY_NODE_HARNESS = r"""
+const { pathToFileURL } = require("url");
+const path = process.env.LIQUID_GLASS;
+
+function stub({
+  search = "",
+  userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+  brands = [{ brand: "Chromium", version: "120" }],
+  saveData = false,
+  reducedTransparency = false,
+  reducedMotion = false,
+  supports = true,
+} = {}) {
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      userAgent,
+      userAgentData: { brands },
+      connection: { saveData, addEventListener() {} },
+    },
+  });
+  globalThis.location = { search };
+  globalThis.window = globalThis;
+  globalThis.CSS = { supports: () => supports };
+  globalThis.matchMedia = (query) => ({
+    matches: /prefers-reduced-transparency/.test(query) ? reducedTransparency : reducedMotion,
+    addEventListener() {},
+  });
+  globalThis.document = {
+    documentElement: {
+      lastMode: null,
+      classList: { toggle() {} },
+      setAttribute(name, value) { if (name === "data-glass-mode") this.lastMode = value; },
+    },
+    querySelector() { return null; },
+  };
+}
+
+async function load(caseName) {
+  return import(pathToFileURL(path).href + "?case=" + encodeURIComponent(caseName));
+}
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+(async () => {
+  // Chromium with CSS.supports and no restrictions is full mode.
+  stub();
+  let mod = await load("chromium");
+  expect(mod.detectGlassMode() === "full", "chromium full mode");
+
+  // Firefox is light even when CSS.supports is optimistic.
+  stub({ userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0", brands: [] });
+  mod = await load("firefox");
+  expect(mod.detectGlassMode() === "light", "firefox light mode");
+
+  // Save-data downgrades a capable engine.
+  stub({ saveData: true });
+  mod = await load("save-data");
+  expect(mod.detectGlassMode() === "light", "save-data light mode");
+
+  // Reduced transparency disables glass entirely.
+  stub({ reducedTransparency: true });
+  mod = await load("reduced-transparency");
+  expect(mod.detectGlassMode() === "off", "reduced transparency off mode");
+
+  // The query override wins over every automatic rule.
+  stub({ search: "?glass=off", reducedTransparency: true, saveData: true });
+  mod = await load("override-off");
+  expect(mod.detectGlassMode() === "off", "query override wins");
+  stub({ search: "?glass=full", reducedTransparency: true });
+  mod = await load("override-full");
+  expect(mod.detectGlassMode() === "full", "query override can force full");
+
+  // The programmatic override wins over a conflicting query value.
+  stub({ search: "?glass=off" });
+  mod = await load("override-programmatic");
+  mod.initLiquidGlass();
+  globalThis.__webControlSetGlassMode("full");
+  expect(mod.detectGlassMode() === "full", "programmatic override wins over the query");
+
+  // applyGlassMode records and mirrors the applied mode.
+  stub();
+  mod = await load("apply-mode");
+  mod.applyGlassMode("off");
+  expect(mod.glassMode() === "off", "applyGlassMode stores the applied mode");
+  expect(globalThis.document.documentElement.lastMode === "off", "data-glass-mode mirrors the mode");
+
+  console.log("liquid glass capabilities ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+
+def test_liquid_glass_capability_detection_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    liquid_glass = Path(__file__).resolve().parents[1] / "static" / "liquid-glass.js"
+    completed = subprocess.run(
+        ["node", "-e", _LIQUID_GLASS_CAPABILITY_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LIQUID_GLASS": str(liquid_glass)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "liquid glass capabilities ok" in completed.stdout
+
+
 def test_frontend_exposes_mapping_tab_and_mapping_sidebar():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")

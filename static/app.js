@@ -1,4 +1,5 @@
 import * as THREE from "./vendor/three.module.js";
+import { initLiquidGlass, glassMotionReduced } from "./liquid-glass.js";
 
 const LAYERS = {
   local_map: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
@@ -45,6 +46,8 @@ const state = {
 };
 
 let saveMapSubmissionError = null;
+
+initLiquidGlass();
 
 const mapCanvas3d = document.getElementById("mapCanvas3d");
 const hud = document.getElementById("hud");
