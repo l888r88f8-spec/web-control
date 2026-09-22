@@ -313,7 +313,6 @@ input {
   overflow: auto;
   padding: 64px 18px 18px;
   background: var(--system-bg);
-  background-attachment: fixed;
 }
 
 .system-board {

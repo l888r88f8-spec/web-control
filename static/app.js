@@ -1778,8 +1778,13 @@ function applyEffectiveSidebar() {
     panel.setAttribute("aria-hidden", String(effective));
   }
   syncSidebarToggle(toggle);
-  if (effective && panel && toggle && panel.contains(document.activeElement)) {
-    toggle.focus();
+  if (effective && panel && panel.contains(document.activeElement)) {
+    // System mode hides the toggle, so hand focus to the visible system tab.
+    const focusTarget =
+      state.view === "system"
+        ? document.getElementById("tabSystem") || document.querySelector("#viewTabs .tab.active")
+        : toggle;
+    if (focusTarget) focusTarget.focus();
   }
   return true;
 }
@@ -1805,7 +1810,7 @@ function observeMapStageResize() {
 // --- End sidebar collapse
 
 // --- Page transition state machine
-const LAYOUT_SETTLE_FALLBACK_MS = 520;
+const LAYOUT_SETTLE_FALLBACK_MS = 420;
 const LAYOUT_TRANSITION_PROPS = new Set(["grid-template-columns", "opacity", "transform"]);
 
 const pageTransition = {
@@ -1923,16 +1928,30 @@ function maybeClearGoalFromActionStatus() {
 }
 
 const GLASS_DROP_FALLBACK_MS = 520;
+const glassDropCleanups = new WeakMap();
+
+function clearGlassDrop(element) {
+  const pending = glassDropCleanups.get(element);
+  if (!pending) return;
+  glassDropCleanups.delete(element);
+  element.removeEventListener("animationend", pending.clear);
+  window.clearTimeout(pending.timerId);
+  element.classList.remove("glass-drop");
+}
 
 function markGlassDrop(element) {
   if (!element) return;
+  // Rapid re-marks must not stack listeners or timers: retire the prior
+  // cleanup before arming the next one.
+  clearGlassDrop(element);
   element.classList.remove("glass-drop");
   // One forced reflow restarts the keyframes when the same element is re-marked.
   void element.offsetWidth;
   element.classList.add("glass-drop");
-  const clear = () => element.classList.remove("glass-drop");
+  const clear = () => clearGlassDrop(element);
   element.addEventListener("animationend", clear, { once: true });
-  window.setTimeout(clear, GLASS_DROP_FALLBACK_MS);
+  const timerId = window.setTimeout(clear, GLASS_DROP_FALLBACK_MS);
+  glassDropCleanups.set(element, { clear, timerId });
 }
 
 function setMode(mode) {

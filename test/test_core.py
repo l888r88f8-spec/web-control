@@ -1768,7 +1768,7 @@ def test_frontend_layout_transition_state_machine_static():
         encoding="utf-8"
     )
 
-    assert "const LAYOUT_SETTLE_FALLBACK_MS = 520;" in app_js
+    assert "const LAYOUT_SETTLE_FALLBACK_MS = 420;" in app_js
     for name in (
         "beginLayoutTransition",
         "settleLayoutTransition",
@@ -2191,6 +2191,95 @@ def test_glass_drop_class_is_timed_and_forced_reflowed():
     assert "const GLASS_DROP_FALLBACK_MS = 520;" in app_js
 
 
+_GLASS_DROP_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("const GLASS_DROP_FALLBACK_MS = 520;");
+const end = source.indexOf("function setMode(mode)");
+if (start < 0 || end < 0) throw new Error("glass drop block not found");
+const block = source.slice(start, end);
+
+const timers = new Map();
+let nextTimer = 1;
+const windowStub = {
+  setTimeout(fn, ms) { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
+  clearTimeout(id) { timers.delete(id); },
+};
+
+let reflows = 0;
+function makeElement() {
+  const classes = new Set();
+  const listeners = new Set();
+  const element = {
+    classList: {
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    addEventListener(type, handler) { listeners.add(handler); },
+    removeEventListener(type, handler) { listeners.delete(handler); },
+  };
+  Object.defineProperty(element, "offsetWidth", { get() { reflows += 1; return 0; } });
+  element.liveListeners = listeners;
+  element.classes = classes;
+  return element;
+}
+
+const api = new Function("window", block + "\nreturn { markGlassDrop };");
+const { markGlassDrop } = api(windowStub);
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+const element = makeElement();
+markGlassDrop(element);
+markGlassDrop(element);
+markGlassDrop(element);
+expect(reflows === 3, "each mark forces exactly one reflow restart");
+expect(element.liveListeners.size === 1, "rapid re-marks keep exactly one live listener");
+expect(timers.size === 1, "rapid re-marks keep exactly one live fallback timeout");
+expect(element.classes.has("glass-drop"), "the drop class is active after re-marking");
+
+// Firing the surviving animationend retires the class, listener and timeout.
+const listener = Array.from(element.liveListeners)[0];
+listener();
+expect(!element.classes.has("glass-drop"), "animationend clears the drop class");
+expect(element.liveListeners.size === 0, "animationend removes the live listener");
+expect(timers.size === 0, "animationend clears the pending fallback timeout");
+
+// The fallback timeout alone also retires everything.
+markGlassDrop(element);
+expect(element.liveListeners.size === 1 && timers.size === 1, "a fresh mark re-arms cleanup");
+const timer = Array.from(timers.values())[0];
+expect(timer.ms === 520, "the fallback uses the documented delay");
+timer.fn();
+expect(!element.classes.has("glass-drop"), "the fallback clears the drop class");
+expect(element.liveListeners.size === 0, "the fallback removes the live listener");
+expect(timers.size === 0, "the fallback clears its own handle");
+
+// A missing target is a safe no-op.
+const reflowsBefore = reflows;
+markGlassDrop(null);
+expect(reflows === reflowsBefore && timers.size === 0, "marking a missing element is a no-op");
+
+console.log("glass drop cleanup ok");
+"""
+
+
+def test_glass_drop_rapid_remark_keeps_single_cleanup_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _GLASS_DROP_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "glass drop cleanup ok" in completed.stdout
+
+
 def test_mode_control_uses_ios_sliding_segmented_selector():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -2216,7 +2305,9 @@ def test_frontend_uses_immersive_glass_light_environment():
     assert "@keyframes ambientDrift" in styles_css
     assert "@keyframes sheenSweep" in styles_css
     assert "mix-blend-mode: screen" in styles_css
-    assert "background-attachment: fixed" in styles_css
+    # The mounted viewport animates transform/opacity, so a fixed background
+    # attachment would force full-viewport repaints on every frame.
+    assert "background-attachment" not in styles_css
     assert ".panel section::before" in styles_css
     assert ".system-card:hover" in styles_css
     assert "transform: translateY(-2px)" in styles_css
@@ -4355,6 +4446,100 @@ def test_layout_transition_fallback_namespaces_execute_under_node():
     assert "layout fallback namespaces ok" in completed.stdout
 
 
+_RENDER_LOOP_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("let mapRenderFrame = null;");
+const end = source.indexOf("function canvasPoint(event)");
+if (start < 0 || end < 0) throw new Error("map render loop block not found");
+const block = source.slice(start, end);
+
+const frames = new Map();
+let nextFrame = 1;
+let renderCalls = 0;
+let cameraUpdates = 0;
+const state = { view: "3d" };
+const renderer = { render() { renderCalls += 1; } };
+const scene = {};
+const camera = {};
+const updateCamera = () => { cameraUpdates += 1; };
+const requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+const cancelAnimationFrame = (id) => { frames.delete(id); };
+
+const api = new Function(
+  "state", "renderer", "scene", "camera", "updateCamera",
+  "requestAnimationFrame", "cancelAnimationFrame",
+  block + `
+return { mapViewActive, render, ensureMapRenderLoop, pauseMapRenderLoop, frameId: () => mapRenderFrame };`,
+)(state, renderer, scene, camera, updateCamera, requestAnimationFrame, cancelAnimationFrame);
+const { mapViewActive, render, ensureMapRenderLoop, pauseMapRenderLoop, frameId } = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function flushFrame() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((fn) => fn());
+}
+
+// Repeated ensure in a map view produces exactly one pending rAF.
+state.view = "3d";
+expect(mapViewActive() === true, "3d is a map view");
+ensureMapRenderLoop();
+ensureMapRenderLoop();
+ensureMapRenderLoop();
+expect(frames.size === 1, "repeated ensure schedules one pending rAF");
+expect(frameId() !== null, "the pending frame id is tracked");
+
+// Running that frame renders once and schedules exactly one follow-up frame.
+renderCalls = 0;
+cameraUpdates = 0;
+flushFrame();
+expect(renderCalls === 1, "the map frame renders once");
+expect(cameraUpdates === 1, "the map frame updates the camera once");
+expect(frames.size === 1, "the map render schedules exactly one next frame");
+expect(frameId() !== null, "the follow-up frame id is tracked");
+
+// Pause cancels and nulls the pending rAF.
+pauseMapRenderLoop();
+expect(frames.size === 0, "pause cancels the pending frame");
+expect(frameId() === null, "pause nulls the tracked frame id");
+
+// System is not a map view: ensure and render never schedule.
+state.view = "system";
+expect(mapViewActive() === false, "system is not a map view");
+ensureMapRenderLoop();
+expect(frames.size === 0, "system never schedules through ensure");
+renderCalls = 0;
+render();
+expect(renderCalls === 1, "a direct render still draws");
+expect(frames.size === 0, "system does not reschedule a frame after render");
+expect(frameId() === null, "system leaves no tracked frame");
+
+// Mapping is a map view and schedules exactly one frame.
+state.view = "mapping";
+expect(mapViewActive() === true, "mapping is a map view");
+ensureMapRenderLoop();
+expect(frames.size === 1, "mapping schedules one pending frame");
+
+console.log("render loop ok");
+"""
+
+
+def test_map_render_loop_lifecycle_executes_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _RENDER_LOOP_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "render loop ok" in completed.stdout
+
+
 _RESIZE_CACHE_NODE_HARNESS = r"""
 const fs = require("fs");
 const source = fs.readFileSync(process.env.APP_JS, "utf8");
@@ -4378,7 +4563,7 @@ const block = source.slice(sliceStart, end);
 
 const sizes = [];
 let updateProjectionCalls = 0;
-const renderer = { setSize(width, height) { sizes.push([width, height]); } };
+const renderer = { setSize(width, height, updateStyle) { sizes.push([width, height, updateStyle]); } };
 const camera = { aspect: 0, updateProjectionMatrix() { updateProjectionCalls += 1; } };
 let rect = { width: 800.4, height: 600.6 };
 const mapCanvas3d = { getBoundingClientRect: () => rect };
@@ -4405,6 +4590,8 @@ expect(updateProjectionCalls === 2, "a changed size must update the projection a
 expect(thirdChanged === true, "a changed size reports a changed buffer");
 expect(sizes[0][0] === 800 && sizes[0][1] === 601, "the drawing buffer uses integer dimensions");
 expect(sizes[1][0] === 900 && sizes[1][1] === 601, "the changed buffer uses integer dimensions");
+expect(sizes[0][2] === false, "renderer.setSize must not update the canvas CSS style");
+expect(sizes[1][2] === false, "renderer.setSize keeps the CSS style untouched on resize");
 
 console.log("resize cache ok");
 """
@@ -7325,3 +7512,119 @@ def test_sidebar_collapse_state_toggles_without_persistence_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "sidebar collapse ok" in completed.stdout
+
+
+_SIDEBAR_FOCUS_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Sidebar collapse");
+const blockEnd = source.indexOf("// --- End sidebar collapse");
+if (blockStart < 0 || blockEnd < 0) throw new Error("sidebar block not found");
+const block = source.slice(blockStart, blockEnd);
+
+function makeElement() {
+  const classes = new Set();
+  return {
+    hidden: false,
+    inert: false,
+    attributes: {},
+    focused: false,
+    containsActive: false,
+    classList: {
+      toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    contains() { return this.containsActive; },
+    focus() { this.focused = true; },
+  };
+}
+
+const appElement = makeElement();
+const panelElement = makeElement();
+const toggleElement = makeElement();
+const systemTabElement = makeElement();
+const elements = {
+  sidebarToggle: toggleElement,
+  controlPanel: panelElement,
+  tabSystem: systemTabElement,
+};
+global.document = {
+  activeElement: null,
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) {
+    if (selector === ".app") return appElement;
+    return null;
+  },
+};
+global.state = { view: "3d" };
+global.beginLayoutTransition = () => 1;
+global.noteLayoutResize = () => {};
+
+const sidebarApi = new Function(block + `
+return { sidebarState, applyEffectiveSidebar };`)();
+const { sidebarState, applyEffectiveSidebar } = sidebarApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function resetFocus() {
+  toggleElement.focused = false;
+  systemTabElement.focused = false;
+}
+
+// Manual collapse in a navigation view focuses the visible toggle.
+global.document.activeElement = panelElement;
+panelElement.containsActive = true;
+sidebarState.collapsed = true;
+global.state.view = "3d";
+resetFocus();
+expect(applyEffectiveSidebar() === true, "manual collapse changes the effective state");
+expect(toggleElement.focused === true, "navigation collapse focuses the visible toggle");
+expect(systemTabElement.focused === false, "navigation collapse does not focus the system tab");
+
+// Re-expanding hands no focus because the panel becomes interactive again.
+sidebarState.collapsed = false;
+expect(applyEffectiveSidebar() === true, "manual expand changes the effective state");
+
+// Entering System focuses the system tab while the toggle is hidden.
+global.state.view = "system";
+resetFocus();
+expect(applyEffectiveSidebar() === true, "system entry changes the effective state");
+expect(systemTabElement.focused === true, "system entry focuses the system tab");
+expect(toggleElement.focused === false, "system entry never focuses the hidden toggle");
+
+// Leaving System restores the in-page expansion without stealing focus.
+global.state.view = "3d";
+resetFocus();
+expect(applyEffectiveSidebar() === true, "leaving system changes the effective state");
+expect(toggleElement.focused === false && systemTabElement.focused === false,
+  "leaving system does not move focus");
+
+// Focus outside the collapsing panel is left untouched in System mode.
+global.document.activeElement = makeElement();
+panelElement.containsActive = false;
+global.state.view = "system";
+resetFocus();
+expect(applyEffectiveSidebar() === true, "a second system entry changes the effective state");
+expect(systemTabElement.focused === false && toggleElement.focused === false,
+  "focus outside the panel is never redirected");
+
+console.log("sidebar focus target ok");
+"""
+
+
+def test_sidebar_system_entry_focuses_visible_tab_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _SIDEBAR_FOCUS_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "sidebar focus target ok" in completed.stdout
