@@ -833,7 +833,17 @@ select {
   padding: 8px;
 }
 
-.actions button:disabled {
+.process-controls {
+  margin-bottom: 12px;
+}
+
+.process-controls .start-log,
+.process-controls .stop-log {
+  padding: 8px;
+}
+
+.actions button:disabled,
+.process-controls button:disabled {
   border-color: rgba(148, 163, 184, 0.22);
   background: rgba(148, 163, 184, 0.12);
   color: rgba(148, 163, 184, 0.72);
@@ -841,7 +851,8 @@ select {
   box-shadow: none;
 }
 
-.actions button:disabled:hover {
+.actions button:disabled:hover,
+.process-controls button:disabled:hover {
   border-color: rgba(148, 163, 184, 0.22);
   background: rgba(148, 163, 184, 0.12);
   transform: none;

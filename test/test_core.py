@@ -603,18 +603,166 @@ def test_3d_paths_use_tube_geometry_for_thicker_visible_tracks():
     assert "new THREE.LineBasicMaterial" not in update_block
 
 
-def test_frontend_exposes_managed_start_controls():
+def test_navigation_readiness_owns_managed_process_toggles():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    readiness_start = index_html.index("<h2>Navigation Readiness</h2>")
+    readiness_end = index_html.index("</section>", readiness_start)
+    readiness = index_html[readiness_start:readiness_end]
+    terminal_start = index_html.index("<h2>Terminal Logs</h2>")
+    terminal_end = index_html.index("<h2>Layers</h2>", terminal_start)
+    terminals = index_html[terminal_start:terminal_end]
+
+    assert readiness.index('data-managed-target="localization"') < readiness.index(
+        'data-managed-target="navigation"'
+    )
+    assert readiness.index('data-managed-target="navigation"') < readiness.index(
+        'id="navigationReady"'
+    )
+    assert "Start Localization" in readiness
+    assert "Start Navigation" in readiness
+    assert 'data-start-target="localization"' not in terminals
+    assert 'data-stop-target="localization"' not in terminals
+    assert 'data-start-target="navigation"' not in terminals
+    assert 'data-stop-target="navigation"' not in terminals
+    assert 'data-start-target="mapping"' in index_html
+    assert 'data-stop-target="mapping"' in index_html
+
+
+def test_frontend_preserves_managed_endpoints_and_mapping_logs():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
 
-    assert 'data-start-target="localization"' in index_html
-    assert 'data-start-target="navigation"' in index_html
-    assert 'data-start-target="mapping"' in index_html
+    assert "/api/managed/start" in app_js
+    assert "/api/managed/stop" in app_js
     assert 'id="mappingLogState"' in index_html
     assert 'id="mappingLogs"' in index_html
-    assert "/api/managed/start" in app_js
     assert 'updateTerminalLog("mapping", data.logs && data.logs.mapping);' in app_js
+
+
+_MANAGED_PROCESS_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+
+function jsFunctionBody(signature) {
+  const start = source.indexOf(signature);
+  if (start < 0) throw new Error("missing function: " + signature);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = brace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error("unterminated function: " + signature);
+}
+
+function makeElement() {
+  const classes = new Set();
+  return {
+    textContent: "",
+    disabled: false,
+    attributes: {},
+    classList: {
+      toggle(name, on) {
+        if (on) classes.add(name);
+        else classes.delete(name);
+      },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+  };
+}
+
+const localizationButton = makeElement();
+const navigationButton = makeElement();
+const elements = {
+  localizationProcessToggle: localizationButton,
+  navigationProcessToggle: navigationButton,
+};
+global.document = {
+  getElementById(id) { return elements[id] || null; },
+};
+
+const state = {
+  localizationRunning: false,
+  navigationRunning: false,
+  managedProcessPending: { localization: null, navigation: null },
+};
+
+const startCalls = {};
+const stopCalls = {};
+let resolveNavigationStart = null;
+
+function startManagedTarget(target) {
+  startCalls[target] = (startCalls[target] || 0) + 1;
+  if (target === "navigation") {
+    return new Promise((resolve) => { resolveNavigationStart = resolve; });
+  }
+  return Promise.resolve();
+}
+
+function stopManagedTarget(target) {
+  stopCalls[target] = (stopCalls[target] || 0) + 1;
+  return Promise.resolve();
+}
+
+eval(jsFunctionBody("function managedProcessRunning")
+  + "\n" + jsFunctionBody("function updateManagedProcessButton")
+  + "\n" + jsFunctionBody("async function toggleManagedTarget"));
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+expect(source.includes("[data-managed-target]"), "toggle event selector missing");
+expect(source.includes("[data-start-target]"), "mapping start selector missing");
+expect(source.includes("[data-stop-target]"), "mapping stop selector missing");
+
+(async () => {
+  updateManagedProcessButton("localization");
+  expect(localizationButton.textContent === "Start Localization", "initial localization label");
+  expect(localizationButton.disabled === false, "initial localization enabled");
+  expect(localizationButton.getAttribute("aria-pressed") === "false", "initial aria state");
+
+  state.localizationRunning = true;
+  updateManagedProcessButton("localization");
+  expect(localizationButton.textContent === "Stop Localization", "running localization label");
+  expect(localizationButton.classList.contains("stop-log"), "running stop style");
+
+  const pending = toggleManagedTarget("navigation");
+  expect(navigationButton.disabled === true, "pending navigation disabled");
+  toggleManagedTarget("navigation");
+  expect(startCalls.navigation === 1, "duplicate navigation start blocked");
+  expect(localizationButton.disabled === false, "localization remains independent");
+  resolveNavigationStart();
+  await pending;
+  expect(navigationButton.disabled === false, "navigation re-enabled after request");
+
+  state.navigationRunning = true;
+  await toggleManagedTarget("navigation");
+  expect(stopCalls.navigation === 1, "running navigation stops");
+  console.log("managed process toggles ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_frontend_managed_process_toggles_follow_running_and_pending_state():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _MANAGED_PROCESS_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "managed process toggles ok" in completed.stdout
 
 
 def test_terminal_logs_section_is_above_layers_section():

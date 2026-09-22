@@ -33,6 +33,7 @@ const state = {
   mapSelectPending: false,
   localizationRunning: false,
   navigationRunning: false,
+  managedProcessPending: { localization: null, navigation: null },
   saveMapState: null,
   hideCompletedPaths: false,
   showPaths: true,
@@ -842,6 +843,7 @@ function updateTerminalLog(target, summary) {
     if (target === "localization") state.localizationRunning = running;
     else state.navigationRunning = running;
     updateMapSelectionLock();
+    updateManagedProcessButton(target);
   }
   const lines = Array.isArray(summary.lines) ? summary.lines : [];
   const seq = typeof summary.seq === "number" ? summary.seq : undefined;
@@ -891,6 +893,39 @@ function updateTerminalLog(target, summary) {
   } else {
     stateElement.textContent = `error ${summary.returncode}`;
     stateElement.className = "pill error";
+  }
+}
+
+function managedProcessRunning(target) {
+  return target === "localization" ? state.localizationRunning : state.navigationRunning;
+}
+
+function updateManagedProcessButton(target) {
+  const button = document.getElementById(`${target}ProcessToggle`);
+  if (!button) return;
+  const running = managedProcessRunning(target);
+  const pending = state.managedProcessPending[target];
+  const label = target === "localization" ? "Localization" : "Navigation";
+  const action = running ? "Stop" : "Start";
+  button.textContent = pending ? `${pending === "stop" ? "Stopping" : "Starting"} ${label}...` : `${action} ${label}`;
+  button.disabled = Boolean(pending);
+  button.classList.toggle("start-log", !running);
+  button.classList.toggle("stop-log", running);
+  button.setAttribute("aria-pressed", String(running));
+  button.setAttribute("aria-busy", String(Boolean(pending)));
+}
+
+async function toggleManagedTarget(target) {
+  if (state.managedProcessPending[target]) return;
+  const running = managedProcessRunning(target);
+  state.managedProcessPending[target] = running ? "stop" : "start";
+  updateManagedProcessButton(target);
+  try {
+    if (running) await stopManagedTarget(target);
+    else await startManagedTarget(target);
+  } finally {
+    state.managedProcessPending[target] = null;
+    updateManagedProcessButton(target);
   }
 }
 
@@ -1261,6 +1296,9 @@ function attachEvents() {
   document.getElementById("publishPose").addEventListener("click", publishPose);
   document.querySelectorAll("[data-start-target]").forEach((button) => button.addEventListener("click", () => startManagedTarget(button.dataset.startTarget)));
   document.querySelectorAll("[data-stop-target]").forEach((button) => button.addEventListener("click", () => stopManagedTarget(button.dataset.stopTarget)));
+  document.querySelectorAll("[data-managed-target]").forEach((button) =>
+    button.addEventListener("click", () => toggleManagedTarget(button.dataset.managedTarget))
+  );
   document.getElementById("mapSelect").addEventListener("change", (event) => selectMap(event.target.value));
   document.getElementById("refreshMaps").addEventListener("click", () => refreshMaps(true));
   document.getElementById("openSaveMap").addEventListener("click", () => {

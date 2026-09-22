@@ -75,6 +75,10 @@
 
         <section>
           <h2>Navigation Readiness</h2>
+          <div class="actions process-controls">
+            <button id="localizationProcessToggle" class="start-log" data-managed-target="localization" type="button" aria-pressed="false">Start Localization</button>
+            <button id="navigationProcessToggle" class="start-log" data-managed-target="navigation" type="button" aria-pressed="false">Start Navigation</button>
+          </div>
           <div id="navigationReady" class="readiness waiting">waiting for relocalization</div>
         </section>
 
@@ -142,20 +146,12 @@
                 <span>Localization</span>
                 <span id="localizationLogState" class="pill waiting">disabled</span>
               </div>
-              <div class="terminal-actions">
-                <button class="start-log" data-start-target="localization" type="button">Start</button>
-                <button class="stop-log" data-stop-target="localization" type="button">Stop</button>
-              </div>
               <pre id="localizationLogs"></pre>
             </article>
             <article class="terminal">
               <div class="terminal-header">
                 <span>Navigation</span>
                 <span id="navigationLogState" class="pill waiting">disabled</span>
-              </div>
-              <div class="terminal-actions">
-                <button class="start-log" data-start-target="navigation" type="button">Start</button>
-                <button class="stop-log" data-stop-target="navigation" type="button">Stop</button>
               </div>
               <pre id="navigationLogs"></pre>
             </article>
