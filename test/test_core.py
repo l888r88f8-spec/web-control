@@ -31,6 +31,7 @@ from web_control.core import (
     yaw_from_quaternion,
 )
 from web_control.navigation_control import PENDING_CLEAR
+from web_control.teleop import TeleopController
 
 
 def test_yaw_quaternion_round_trip():
@@ -4919,3 +4920,145 @@ def test_frontend_path_height_uses_ros_z():
     assert "pathPointToThree(point)" in _js_function_body(
         app_js, "function updateMappingPath"
     )
+
+
+class _MutableClock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _FakeVector3:
+    def __init__(self) -> None:
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+
+class _FakeTwist:
+    def __init__(self) -> None:
+        self.linear = _FakeVector3()
+        self.angular = _FakeVector3()
+
+
+def _teleop_node(clock=None, published=None, **overrides):
+    parameters = {
+        "max_linear_speed": 1.5,
+        "wheelbase": 0.65,
+        "max_steer_angle": 0.461,
+        "steering_exponent": 0.5,
+        "deadzone": 0.08,
+        "command_timeout": 0.4,
+        "publish_rate": 20.0,
+    }
+    parameters.update(overrides)
+    node = type("_TeleopNodeStub", (), {})()
+    node.now_sec = lambda: 10.0
+    node.get_logger = lambda: _LoggerStub()
+    node.teleop = TeleopController(clock=clock or (lambda: 0.0), **parameters)
+    node.cmd_vel_publications = published if published is not None else []
+    node.cmd_vel_pub = _FakePublisher(node.cmd_vel_publications)
+    for name in (
+        "apply_teleop_command",
+        "publish_teleop_twist",
+        "teleop_timer_callback",
+        "cleanup_teleop",
+    ):
+        setattr(
+            node,
+            name,
+            MethodType(getattr(web_control_node.WebControlNode, name), node),
+        )
+    return node
+
+
+def test_teleop_handler_accepts_command_and_returns_mapped_twist():
+    node = _teleop_node()
+
+    status, body = _serve_and_request(
+        node, "/api/teleop", {"throttle": 0.5, "steering": 0.25}, "POST"
+    )
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["teleop"]["throttle"] == 0.5
+    assert body["teleop"]["steering"] == 0.25
+    assert body["teleop"]["linear_x"] == pytest.approx(0.75)
+    assert body["teleop"]["active"] is True
+    assert node.cmd_vel_publications == []
+
+
+def test_teleop_handler_rejects_invalid_payloads_without_replacing_command():
+    node = _teleop_node()
+    node.teleop.apply_command({"throttle": 0.5, "steering": 0.0}, 0.0)
+
+    for payload in (
+        [],
+        {},
+        {"throttle": "fast", "steering": 0.0},
+        {"throttle": 0.5},
+        {"throttle": float("nan"), "steering": 0.0},
+    ):
+        status, body = _serve_and_request(node, "/api/teleop", payload, "POST")
+        assert status == 400, payload
+        assert body["ok"] is False
+
+    command = node.teleop.poll_publish(0.0)
+    assert command is not None
+    assert command["linear_x"] == pytest.approx(0.75)
+
+
+def test_teleop_timer_publishes_active_command_then_exactly_one_zero(monkeypatch):
+    monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
+    clock = _MutableClock(0.0)
+    node = _teleop_node(clock=clock)
+
+    node.teleop_timer_callback()
+    assert node.cmd_vel_publications == []
+
+    node.teleop.apply_command({"throttle": 1.0, "steering": 0.0}, 0.0)
+    node.teleop_timer_callback()
+    assert len(node.cmd_vel_publications) == 1
+    assert node.cmd_vel_publications[0].linear.x == pytest.approx(1.5)
+    assert node.cmd_vel_publications[0].angular.z == pytest.approx(0.0)
+
+    clock.now = 0.400001
+    node.teleop_timer_callback()
+    assert len(node.cmd_vel_publications) == 2
+    assert node.cmd_vel_publications[1].linear.x == 0.0
+
+    clock.now = 0.5
+    node.teleop_timer_callback()
+    assert len(node.cmd_vel_publications) == 2
+
+
+def test_teleop_cleanup_publishes_exactly_one_zero_on_shutdown(monkeypatch):
+    monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
+    node = _teleop_node()
+    node.teleop.apply_command({"throttle": 0.5, "steering": 0.0}, 0.0)
+
+    node.cleanup_teleop()
+
+    assert len(node.cmd_vel_publications) == 1
+    assert node.cmd_vel_publications[0].linear.x == 0.0
+    assert node.cmd_vel_publications[0].angular.z == 0.0
+    assert node.teleop.poll_publish(0.0) is None
+
+
+def test_web_control_yaml_declares_teleop_defaults():
+    package_root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (package_root / "config" / "web_control.yaml").read_text(encoding="utf-8")
+    )
+    parameters = config["web_control"]["ros__parameters"]
+
+    assert parameters["teleop_cmd_vel_topic"] == "/cmd_vel"
+    assert parameters["teleop_max_linear_speed"] == 1.5
+    assert parameters["teleop_wheelbase"] == 0.65
+    assert parameters["teleop_max_steer_angle"] == 0.461
+    assert parameters["teleop_steering_exponent"] == 0.5
+    assert parameters["teleop_deadzone"] == 0.08
+    assert parameters["teleop_command_timeout"] == 0.4
+    assert parameters["teleop_publish_rate"] == 20.0

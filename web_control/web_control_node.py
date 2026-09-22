@@ -23,7 +23,7 @@ try:
         PackageNotFoundError,
         get_package_share_directory,
     )
-    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
     from nav_msgs.msg import Odometry, Path as PathMsg
     from rclpy.node import Node
     from rclpy.qos import (
@@ -40,6 +40,7 @@ except ModuleNotFoundError:
     PackageNotFoundError = Exception
     get_package_share_directory = None
     PoseStamped = None
+    Twist = None
     PoseWithCovarianceStamped = None
     Odometry = None
     PathMsg = None
@@ -93,6 +94,7 @@ from web_control.navigation_control import (
     select_action_status,
 )
 from web_control.navigation_store import NavigationStore, default_navigation_path
+from web_control.teleop import TeleopController
 
 LAYER_NAMES = {"local_map", "mapcloud", "mapground"}
 MAPPING_LAYER_NAMES = {"global_map", "ground"}
@@ -478,6 +480,14 @@ class WebControlNode(Node):
         self.declare_parameter("mapping_launch_args", "use_rviz:=false")
         self.declare_parameter("managed_log_lines", 400)
         self.declare_parameter("viewer_timeout_sec", 10.0)
+        self.declare_parameter("teleop_cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("teleop_max_linear_speed", 1.5)
+        self.declare_parameter("teleop_wheelbase", 0.65)
+        self.declare_parameter("teleop_max_steer_angle", 0.461)
+        self.declare_parameter("teleop_steering_exponent", 0.5)
+        self.declare_parameter("teleop_deadzone", 0.08)
+        self.declare_parameter("teleop_command_timeout", 0.4)
+        self.declare_parameter("teleop_publish_rate", 20.0)
 
         self.host = self.get_parameter("host").value
         self.port = int(self.get_parameter("port").value)
@@ -487,6 +497,23 @@ class WebControlNode(Node):
         self.stale_timeout = float(self.get_parameter("stale_timeout_sec").value)
         self.managed_log_lines = int(self.get_parameter("managed_log_lines").value)
         self.viewer_timeout = float(self.get_parameter("viewer_timeout_sec").value)
+        self.teleop = TeleopController(
+            max_linear_speed=float(
+                self.get_parameter("teleop_max_linear_speed").value
+            ),
+            wheelbase=float(self.get_parameter("teleop_wheelbase").value),
+            max_steer_angle=float(
+                self.get_parameter("teleop_max_steer_angle").value
+            ),
+            steering_exponent=float(
+                self.get_parameter("teleop_steering_exponent").value
+            ),
+            deadzone=float(self.get_parameter("teleop_deadzone").value),
+            command_timeout=float(
+                self.get_parameter("teleop_command_timeout").value
+            ),
+            publish_rate=float(self.get_parameter("teleop_publish_rate").value),
+        )
         self.static_dir = package_static_dir()
 
         self.map_root = Path.home() / "map"
@@ -559,6 +586,14 @@ class WebControlNode(Node):
             PoseStamped,
             str(self.get_parameter("goal_topic").value),
             5,
+        )
+        self.cmd_vel_pub = self.create_publisher(
+            Twist,
+            str(self.get_parameter("teleop_cmd_vel_topic").value),
+            10,
+        )
+        self.teleop_timer = self.create_timer(
+            1.0 / self.teleop.publish_rate, self.teleop_timer_callback
         )
 
         layer_topics = {
@@ -1427,6 +1462,29 @@ class WebControlNode(Node):
         msg.pose.orientation.w = q["w"]
         self.goal_pub.publish(msg)
 
+    def apply_teleop_command(self, payload: Any) -> dict[str, Any]:
+        """Validate and store one teleop command; the timer publishes it."""
+        command = self.teleop.apply_command(payload)
+        response = success_response("teleop command accepted", self.now_sec())
+        response["teleop"] = command
+        return response
+
+    def publish_teleop_twist(self, command: dict[str, Any]) -> None:
+        msg = Twist()
+        msg.linear.x = float(command["linear_x"])
+        msg.angular.z = float(command["angular_z"])
+        self.cmd_vel_pub.publish(msg)
+
+    def teleop_timer_callback(self) -> None:
+        command = self.teleop.poll_publish()
+        if command is None:
+            return
+        self.publish_teleop_twist(command)
+
+    def cleanup_teleop(self) -> None:
+        """Publish exactly one zero Twist before the node shuts down."""
+        self.publish_teleop_twist(self.teleop.stop())
+
     def pause_navigation(self) -> dict[str, Any]:
         map_name = self.map_selection.load()
         if map_name is None:
@@ -1673,6 +1731,8 @@ class WebControlNode(Node):
                         )
                     elif self.path == "/api/viewer":
                         self.send_json(node.viewer_heartbeat(payload))
+                    elif self.path == "/api/teleop":
+                        self.send_json(node.apply_teleop_command(payload))
                     elif self.path == "/api/mapping/save_map":
                         self.send_json(node.start_save_map(payload))
                     else:
@@ -1729,6 +1789,7 @@ class WebControlNode(Node):
         return Handler
 
     def destroy_node(self) -> bool:
+        self.cleanup_teleop()
         self.cleanup_save_map()
         self.stop_managed_processes()
         self.stop_http_server()

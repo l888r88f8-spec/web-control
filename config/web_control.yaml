@@ -35,3 +35,11 @@ web_control:
     mapping_launch_args: ""                                       # Extra mapping launch args
     managed_log_lines: 400               # Terminal log lines kept per process
     viewer_timeout_sec: 10.0             # Viewer heartbeat timeout seconds
+    teleop_cmd_vel_topic: "/cmd_vel"           # Hunter velocity command topic
+    teleop_max_linear_speed: 1.5              # Max forward/reverse speed (m/s)
+    teleop_wheelbase: 0.65                    # Hunter wheelbase (m)
+    teleop_max_steer_angle: 0.461             # Max central steering angle (rad)
+    teleop_steering_exponent: 0.5             # Steering curve exponent
+    teleop_deadzone: 0.08                     # Normalized center dead zone
+    teleop_command_timeout: 0.4               # Watchdog timeout (s)
+    teleop_publish_rate: 20.0                 # Active command publish rate (Hz)
