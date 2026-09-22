@@ -2862,6 +2862,8 @@ def _selection_node(tmp_path, selection=None, running=(), **overrides):
         "require_valid_selection",
         "managed_start_command",
         "start_managed_target",
+        "ui_preferences_payload",
+        "save_ui_preferences",
     ):
         setattr(
             node,
@@ -3034,6 +3036,90 @@ def test_maps_handler_select_allowed_while_only_mapping_runs(tmp_path):
     assert status == 200
     assert body["selection"]["name"] == "site_b"
     assert node.map_selection.load() == "site_b"
+
+
+def test_ui_preferences_get_returns_defaults_and_saved_values(tmp_path):
+    node = _selection_node(tmp_path)
+
+    status, body = _serve_and_request(node, "/api/ui/preferences")
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["joystick"] == {"size": 180, "x_ratio": 0.05, "y_ratio": 0.75}
+
+    node.map_selection.save_joystick_preferences(
+        {"size": 230, "x_ratio": 0.2, "y_ratio": 0.6}
+    )
+
+    status, body = _serve_and_request(node, "/api/ui/preferences")
+
+    assert status == 200
+    assert body["joystick"] == {"size": 230, "x_ratio": 0.2, "y_ratio": 0.6}
+
+
+def test_ui_preferences_post_persists_complete_object_and_preserves_selection(tmp_path):
+    _make_map_dir(tmp_path / "map", "site_a")
+    node = _selection_node(tmp_path, selection="site_a")
+    node.map_selection.path.write_text(
+        json.dumps({"name": "site_a", "ui": {"theme": "dark"}, "extra": 1}) + "\n",
+        encoding="utf-8",
+    )
+
+    status, body = _serve_and_request(
+        node,
+        "/api/ui/preferences",
+        {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65},
+        "POST",
+    )
+
+    assert status == 200
+    assert body["ok"] is True
+    assert body["joystick"] == {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65}
+    assert node.map_selection.load() == "site_a"
+    payload = json.loads(node.map_selection.path.read_text(encoding="utf-8"))
+    assert payload == {
+        "name": "site_a",
+        "ui": {
+            "theme": "dark",
+            "joystick": {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65},
+        },
+        "extra": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"size": 139, "x_ratio": 0.5, "y_ratio": 0.5},
+        {"size": 261, "x_ratio": 0.5, "y_ratio": 0.5},
+        {"size": "210", "x_ratio": 0.5, "y_ratio": 0.5},
+        {"size": float("nan"), "x_ratio": 0.5, "y_ratio": 0.5},
+        {"size": 210, "x_ratio": -0.01, "y_ratio": 0.5},
+        {"size": 210, "x_ratio": 0.5, "y_ratio": 1.01},
+        {"size": 210, "x_ratio": 0.5},
+    ],
+)
+def test_ui_preferences_post_rejects_invalid_payload_without_changing_file(
+    tmp_path, payload
+):
+    node = _selection_node(tmp_path)
+    node.map_selection.save_joystick_preferences(
+        {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
+    )
+    before = node.map_selection.path.read_text(encoding="utf-8")
+
+    status, body = _serve_and_request(node, "/api/ui/preferences", payload, "POST")
+
+    assert status == 400
+    assert body["ok"] is False
+    assert node.map_selection.path.read_text(encoding="utf-8") == before
+    assert node.map_selection.load_joystick_preferences() == {
+        "size": 200,
+        "x_ratio": 0.2,
+        "y_ratio": 0.8,
+    }
 
 
 def test_managed_start_command_uses_tiled_map_without_writing_cache(tmp_path):

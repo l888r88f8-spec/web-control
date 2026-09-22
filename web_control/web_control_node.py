@@ -824,6 +824,21 @@ class WebControlNode(Node):
             "stamp": self.now_sec(),
         }
 
+    def ui_preferences_payload(self) -> dict[str, Any]:
+        """Return the validated joystick layout shared by every browser."""
+        return {
+            "ok": True,
+            "joystick": self.map_selection.load_joystick_preferences(),
+            "stamp": self.now_sec(),
+        }
+
+    def save_ui_preferences(self, payload: Any) -> dict[str, Any]:
+        """Validate and atomically merge a complete joystick setting."""
+        validated = self.map_selection.save_joystick_preferences(payload)
+        response = success_response("ui preferences saved", self.now_sec())
+        response["joystick"] = validated
+        return response
+
     def select_map(self, payload: Any) -> dict[str, Any]:
         """Validate and persist ``payload["name"]`` as the next launch map."""
         if not isinstance(payload, dict):
@@ -1684,6 +1699,8 @@ class WebControlNode(Node):
                         self.send_json(node.state_payload())
                     elif parsed.path == "/api/maps":
                         self.send_json(node.maps_payload())
+                    elif parsed.path == "/api/ui/preferences":
+                        self.send_json(node.ui_preferences_payload())
                     elif parsed.path == "/api/pose":
                         self.send_json(node.pose_payload())
                     elif parsed.path == "/api/map2d":
@@ -1734,6 +1751,8 @@ class WebControlNode(Node):
                         self.send_json(node.publish_initialpose(payload))
                     elif self.path == "/api/maps/select":
                         self.send_json(node.select_map(payload))
+                    elif self.path == "/api/ui/preferences":
+                        self.send_json(node.save_ui_preferences(payload))
                     elif self.path == "/api/goal":
                         self.send_json(node.publish_goal(payload))
                     elif self.path == "/api/navigation/pause":
