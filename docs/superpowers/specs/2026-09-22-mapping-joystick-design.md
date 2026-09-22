@@ -72,12 +72,23 @@ While the joystick is held outside the dead zone, the browser posts normalized
 axes to `/api/teleop` at approximately 10 Hz:
 
 ```json
-{"throttle": 0.6, "steering": -0.4}
+{
+  "throttle": 0.6,
+  "steering": -0.4,
+  "client_id": "per-tab-session-id",
+  "seq": 42
+}
 ```
 
 The HTTP response reports the accepted normalized axes and calculated Twist.
 The browser uses the existing finite request timeout and displays a small
 joystick status for active, stopped, or error states.
+
+Every browser tab reuses its viewer session ID as `client_id` and increments
+`seq` before starting each request, including a stop request. The backend keeps
+the latest accepted sequence for each client under the controller lock and
+ignores an older or duplicate request. A delayed active request therefore
+cannot overwrite a newer release or page-shutdown stop.
 
 The ROS node owns a `geometry_msgs/msg/Twist` publisher on the configured
 `/cmd_vel` topic. A 20 Hz ROS timer publishes the latest nonzero active command.
