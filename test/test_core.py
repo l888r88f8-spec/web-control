@@ -5871,6 +5871,22 @@ def test_readme_documents_navigation_pause_and_cancel_service():
     assert "cancel_goal_service" in readme
 
 
+def test_readme_documents_liquid_glass_transitions():
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Liquid Glass" in readme
+    assert "shuding/liquid-glass" in readme
+    assert "SVG" in readme
+    assert "?glass=" in readme
+    assert "prefers-reduced-motion" in readme
+    assert "prefers-reduced-transparency" in readme
+    assert "saveData" in readme
+    assert "独立实现" in readme
+    assert "config/web_control.yaml" not in readme
+
+
 class _PathMessageStub:
     def __init__(self, points, frame_id="map"):
         self.header = SimpleNamespace(frame_id=frame_id)

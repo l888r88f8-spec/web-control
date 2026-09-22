@@ -42,11 +42,24 @@ ros2 launch web_control web_control.launch.py
 ## 折叠右侧信息栏
 
 - 地图区域与右侧信息栏交界处（垂直居中）有一个切换按钮；折叠与展开复用同一个 DOM 按钮，只有箭头方向与 `aria-expanded` / `aria-label` 变化。
-- 折叠时网格中的侧边栏轨道在约 `260ms` 内过渡到 `0px`，面板内容同时淡出并轻微右移；展开时反向播放，切换按钮跟随移动的边界，不会跳到新位置。
-- 地图区域上的 `ResizeObserver` 在过渡期间调用现有的 Three.js `resizeAll()` 并重新计算摇杆布局，让画布宽高比与分辨率保持同步。
+- 折叠时网格中的侧边栏轨道在约 `380ms` 内过渡到 `0px`，面板内容同时淡出并轻微右移；展开时反向播放，切换按钮跟随移动的边界，不会跳到新位置。
+- 地图区域上的 `ResizeObserver` 与窗口 resize 在布局过渡期间只标记“待刷新”，过渡结算时才调用一次 Three.js `resizeAll()`，随后同步渲染一帧；画布宽高比与摇杆布局因此不会逐帧重建，也不会在过渡中途调整绘制缓冲区。
 - 折叠后 `#controlPanel` 设为 `inert`，其中的控件不可聚焦或点击；展开时恢复。
 - 折叠状态只保存在当前页面内存中，不写入后端、`sessionStorage` 或 `localStorage`；每次页面加载都从展开状态开始。
-- **System** 标签页继续使用现有的隐藏面板布局并隐藏该切换按钮；返回 **Navigation** 或 **Mapping** 时恢复当前页面内的折叠状态并显示同一个按钮。
+- **System** 标签页与侧栏折叠共用同一个有效折叠值（`sidebarState.collapsed || state.view === "system"`）和同一段 `--panel-width` 过渡，不再用 display 隐藏面板；侧栏切换按钮在 System 中淡出并置为不可点击，返回 **Navigation** 或 **Mapping** 时恢复当前页面内的折叠状态并显示同一个按钮。
+
+## Liquid Glass 页面过渡
+
+视图切换与侧栏折叠共用同一套布局过渡状态机，玻璃材质分三档，只由 `static/liquid-glass.js`（能力探测）、`static/styles.css`（材质与动效）和 `static/app.js`（状态机）实现，不新增依赖。
+
+- **三档材质**：`glass-full` 仅对顶部标签滑块、模式滑块和侧栏切换镜片三个装饰元素使用共享的 SVG `feImage` + `feDisplacementMap` 位移滤镜 `url(#liquidDrop)`；`glass-light` 仅对侧栏、HUD、保存对话框、System 卡片、CPU 核心面板和摇杆底座各加一层 `blur()`；`glass-off` 使用不透明高对比度颜色。WebGL 画布、终端/日志文本、密集数据、实时摇杆旋钮和安全操作按钮不做位移或背景模糊。
+- **能力与回退顺序**：手动覆盖优先；其次 `prefers-reduced-transparency: reduce` → `off`；其次 `navigator.connection.saveData === true` → `light`；其次 Chromium 且 `CSS.supports("backdrop-filter", "url(#liquidDrop)")` 成立 → `full`；否则 `light`。
+- **`?glass=` 覆盖**：URL 参数 `?glass=full`、`?glass=light`、`?glass=off`，或运行时 `window.__webControlSetGlassMode("full" | "light" | "off")` 可强制档位；覆盖只保留在当前页面内存，不写入后端或浏览器存储。
+- **降低动态与透明度**：`prefers-reduced-motion: reduce` 把 `--layout-transition-ms` 和 `--glass-drop-ms` 压到 `1ms`、关闭关键帧与背景动画，状态机在下一帧直接结算；`prefers-reduced-transparency: reduce` 通过 `glass-off` 提供不透明表面。隐藏视图与折叠面板使用 `inert` 和 `aria-hidden`，焦点移到可见的标签或侧栏按钮，`:focus-visible` 为 2px 焦点环，粗指针设备点击目标不小于 44px。
+- **挂载式 System 过渡**：`#view3d` 与 `#viewSystem` 始终挂载，通过 `opacity`/`visibility`/`pointer-events`/`inert` 交叉淡入淡出而不是 `display` 切换；进入 System 与手动折叠共用同一个有效折叠值和 `--panel-width` 网格过渡，离开 System 时恢复页面内折叠状态。
+- **无白闪的延后 resize**：布局过渡期间不调用 `renderer.setSize`；`ResizeObserver` 与窗口 resize 只标记待刷新，结算时只执行一次 `resizeAll()`，随后在同一任务内同步 `renderer.render`。画布清屏色 `setClearColor(0x0b0f19, 1)` 与 CSS `--scene-bg` 都匹配 `scene.background`；地图视图隐藏时暂停渲染循环，恢复时先同步渲染一帧。
+- **静态位移贴图**：`128x64` RGBA PNG，R/G 通道分别编码水平/垂直位移（中性值 `128`），在 `static/liquid-glass.js` 中作为 `LIQUID_DROP_MAP` 常量一次性内嵌，页面加载时只注入一次，不会在 resize、切换标签或动画帧中重新生成。
+- **概念来源**：位移技术参考 [shuding/liquid-glass](https://github.com/shuding/liquid-glass) 演示的静态 `feImage` + `feDisplacementMap` 思路；本仓库的滤镜标记、位移贴图和能力探测均为独立实现，未复制上游代码或素材，当前无需附带上游 MIT 声明。若今后复制非平凡上游内容，须先补充版权与许可声明及 `THIRD_PARTY_NOTICES` 再评审。
 
 ## 暂停与恢复导航（Pause / Resume / Clear）
 
