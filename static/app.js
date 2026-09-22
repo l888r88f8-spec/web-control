@@ -53,11 +53,13 @@ const mapCanvas3d = document.getElementById("mapCanvas3d");
 const hud = document.getElementById("hud");
 const VIEWER_SESSION_KEY = "web_control_viewer_id";
 
+const SCENE_BG = 0x0b0f19;
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0f19);
+scene.background = new THREE.Color(SCENE_BG);
 const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 5000);
 const renderer = new THREE.WebGLRenderer({ canvas: mapCanvas3d, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setClearColor(0x0b0f19, 1);
 const raycaster = new THREE.Raycaster();
 raycaster.params.Points.threshold = 0.35;
 const pointerNdc = new THREE.Vector2();
@@ -189,10 +191,35 @@ function updateCamera() {
   camera.lookAt(target);
 }
 
+let mapRenderFrame = null;
+
+function mapViewActive() {
+  return state.view === "3d" || state.view === "mapping";
+}
+
 function render() {
+  if (mapRenderFrame !== null) {
+    cancelAnimationFrame(mapRenderFrame);
+    mapRenderFrame = null;
+  }
   updateCamera();
   renderer.render(scene, camera);
-  requestAnimationFrame(render);
+  if (mapViewActive()) {
+    mapRenderFrame = requestAnimationFrame(render);
+  }
+}
+
+function ensureMapRenderLoop() {
+  if (mapRenderFrame === null && mapViewActive()) {
+    mapRenderFrame = requestAnimationFrame(render);
+  }
+}
+
+function pauseMapRenderLoop() {
+  if (mapRenderFrame !== null) {
+    cancelAnimationFrame(mapRenderFrame);
+    mapRenderFrame = null;
+  }
 }
 
 function canvasPoint(event) {
@@ -1312,7 +1339,11 @@ async function handleJoystickBlur() {
 }
 
 async function handleVisibilityChange() {
-  if (document.hidden) await stopTeleop("hidden");
+  if (document.hidden) {
+    await stopTeleop("hidden");
+    return;
+  }
+  noteLayoutResize();
 }
 
 function handlePageHide() {
@@ -1708,21 +1739,43 @@ function updateHudPlacement() {
 
 // --- Sidebar collapse
 const sidebarState = { collapsed: false };
+// The effective collapse starts false because the initial DOM is expanded.
+let appliedEffectiveCollapse = false;
+
+function syncSidebarToggle(toggle) {
+  if (!toggle) return;
+  toggle.setAttribute("aria-expanded", String(!sidebarState.collapsed));
+  toggle.setAttribute(
+    "aria-label",
+    sidebarState.collapsed ? "Expand sidebar" : "Collapse sidebar",
+  );
+}
+
+function applyEffectiveSidebar() {
+  const effective = sidebarState.collapsed || state.view === "system";
+  const app = document.querySelector(".app");
+  const panel = document.getElementById("controlPanel");
+  const toggle = document.getElementById("sidebarToggle");
+  if (appliedEffectiveCollapse === effective) {
+    syncSidebarToggle(toggle);
+    return false;
+  }
+  appliedEffectiveCollapse = effective;
+  if (app) app.classList.toggle("sidebar-collapsed", effective);
+  if (panel) {
+    panel.inert = effective;
+    panel.setAttribute("aria-hidden", String(effective));
+  }
+  syncSidebarToggle(toggle);
+  if (effective && panel && toggle && panel.contains(document.activeElement)) {
+    toggle.focus();
+  }
+  return true;
+}
 
 function setSidebarCollapsed(collapsed) {
   sidebarState.collapsed = Boolean(collapsed);
-  const app = document.querySelector(".app");
-  if (app) app.classList.toggle("sidebar-collapsed", sidebarState.collapsed);
-  const panel = document.getElementById("controlPanel");
-  if (panel) panel.inert = sidebarState.collapsed;
-  const toggle = document.getElementById("sidebarToggle");
-  if (toggle) {
-    toggle.setAttribute("aria-expanded", String(!sidebarState.collapsed));
-    toggle.setAttribute(
-      "aria-label",
-      sidebarState.collapsed ? "Expand sidebar" : "Collapse sidebar",
-    );
-  }
+  if (applyEffectiveSidebar()) beginLayoutTransition();
 }
 
 function toggleSidebar() {
@@ -1734,12 +1787,106 @@ function observeMapStageResize() {
   const stage = document.querySelector(".stage");
   if (!stage) return;
   const observer = new ResizeObserver(() => {
-    resizeAll();
-    if (typeof applyJoystickLayout === "function") applyJoystickLayout();
+    noteLayoutResize();
   });
   observer.observe(stage);
 }
 // --- End sidebar collapse
+
+// --- Page transition state machine
+const LAYOUT_SETTLE_FALLBACK_MS = 420;
+const LAYOUT_TRANSITION_PROPS = new Set(["grid-template-columns", "opacity", "transform"]);
+
+const pageTransition = {
+  active: false,
+  token: 0,
+  pendingFlush: false,
+  fallbackId: null,
+  resizeFrameId: null,
+};
+
+function beginLayoutTransition() {
+  pageTransition.token += 1;
+  const token = pageTransition.token;
+  pageTransition.active = true;
+  pageTransition.pendingFlush = true;
+  if (pageTransition.fallbackId !== null) {
+    clearTimeout(pageTransition.fallbackId);
+  }
+  if (glassMotionReduced()) {
+    pageTransition.fallbackId = requestAnimationFrame(
+      () => settleLayoutTransition(token),
+    );
+  } else {
+    pageTransition.fallbackId = setTimeout(
+      () => settleLayoutTransition(token),
+      LAYOUT_SETTLE_FALLBACK_MS,
+    );
+  }
+  return token;
+}
+
+function settleLayoutTransition(token) {
+  if (token !== pageTransition.token) return; // stale request
+  if (pageTransition.fallbackId !== null) {
+    cancelAnimationFrame(pageTransition.fallbackId);
+    clearTimeout(pageTransition.fallbackId);
+    pageTransition.fallbackId = null;
+  }
+  pageTransition.active = false;
+  if (pageTransition.pendingFlush) {
+    pageTransition.pendingFlush = false;
+    doDeferredLayoutFlush();
+  }
+}
+
+function noteLayoutResize() {
+  if (pageTransition.active) {
+    pageTransition.pendingFlush = true;
+    return;
+  }
+  if (pageTransition.resizeFrameId !== null) return;
+  pageTransition.resizeFrameId = requestAnimationFrame(() => {
+    pageTransition.resizeFrameId = null;
+    doDeferredLayoutFlush();
+  });
+}
+
+function doDeferredLayoutFlush() {
+  if (pageTransition.active) {
+    // Never resize the drawing buffer mid-transition; the settle will flush.
+    pageTransition.pendingFlush = true;
+    return;
+  }
+  resizeAll(); // the only renderer.setSize call site
+  applyJoystickLayout();
+  updateHudPlacement();
+  renderer.render(scene, camera); // synchronous settle frame
+}
+
+const layoutTransitionTargets = new Set();
+
+function handleLayoutTransitionEnd(event) {
+  if (!pageTransition.active) return;
+  if (!LAYOUT_TRANSITION_PROPS.has(event.propertyName)) return;
+  if (!layoutTransitionTargets.has(event.target)) return;
+  settleLayoutTransition(pageTransition.token);
+}
+
+function attachLayoutTransitionListener() {
+  const targets = [
+    document.querySelector(".app"),
+    document.getElementById("view3d"),
+    document.getElementById("viewSystem"),
+    document.getElementById("viewTabs"),
+  ];
+  targets.forEach((element) => {
+    if (element) layoutTransitionTargets.add(element);
+  });
+  const appEl = document.querySelector(".app");
+  if (appEl) appEl.addEventListener("transitionend", handleLayoutTransitionEnd);
+}
+// --- End page transition state machine
 
 function maybeClearGoalFromActionStatus() {
   if (!state.activeGoal || !state.navigationAction || !state.navigationAction.data) return;
@@ -1792,26 +1939,52 @@ function setMode(mode) {
   updateTargetMarkers();
 }
 
+function focusIfInside(container, target) {
+  if (!container || !target) return;
+  const active = document.activeElement;
+  if (active && active !== document.body && container.contains(active)) target.focus();
+}
+
 function setTab(tab) {
+  const view3d = document.getElementById("view3d");
+  const viewSystem = document.getElementById("viewSystem");
+  const viewTabs = document.getElementById("viewTabs");
+  const previous3dActive = view3d.classList.contains("active");
+  const previousSystemActive = viewSystem.classList.contains("active");
+  const previousPanel = document.querySelector(".panel-view.active");
+  const previousTab = viewTabs.dataset.active;
+
   state.view = tab;
-  document.getElementById("viewTabs").dataset.active = tab;
+  viewTabs.dataset.active = tab;
   document.getElementById("tab3dMap").classList.toggle("active", tab === "3d");
   document.getElementById("tabMapping").classList.toggle("active", tab === "mapping");
   document.getElementById("tabSystem").classList.toggle("active", tab === "system");
-  document.getElementById("view3d").classList.toggle("active", tab === "3d" || tab === "mapping");
-  document.getElementById("viewSystem").classList.toggle("active", tab === "system");
+
+  const isMapView = tab === "3d" || tab === "mapping";
+  view3d.classList.toggle("active", isMapView);
+  viewSystem.classList.toggle("active", tab === "system");
+  view3d.inert = !isMapView;
+  view3d.setAttribute("aria-hidden", String(!isMapView));
+  viewSystem.inert = tab !== "system";
+  viewSystem.setAttribute("aria-hidden", String(tab !== "system"));
+
   document.querySelector(".app").classList.toggle("system-mode", tab === "system");
+
+  // Safety state commits synchronously: hiding the joystick also fires the
+  // teleop stop, and leaving layout mode must never wait for the transition.
   setMappingJoystickVisible(tab === "mapping");
-  if (tab === "mapping") {
-    applyJoystickLayout();
-  } else {
+  if (tab !== "mapping") {
     exitJoystickLayout();
-    updateHudPlacement();
   }
+
   const panelName = tab === "system" ? "" : (tab === "mapping" ? "mapping" : "navigation");
   document.querySelectorAll("[data-panel]").forEach((panel) => {
+    const isActive = panel.dataset.panel === panelName;
     panel.classList.toggle("active", panel.dataset.panel === panelName);
+    panel.inert = !isActive;
+    panel.setAttribute("aria-hidden", String(!isActive));
   });
+
   layerGroup.visible = tab === "3d";
   pathGroup.visible = tab === "3d";
   markerGroup.visible = tab === "3d";
@@ -1819,11 +1992,43 @@ function setTab(tab) {
   mappingLayerGroup.visible = tab === "mapping";
   mappingPathGroup.visible = tab === "mapping";
   mappingVehicleGroup.visible = tab === "mapping";
+
+  const viewChanged =
+    view3d.classList.contains("active") !== previous3dActive ||
+    viewSystem.classList.contains("active") !== previousSystemActive;
+  const panelChanged = document.querySelector(".panel-view.active") !== previousPanel;
+  const sidebarChanged = applyEffectiveSidebar();
+
+  if (viewChanged || panelChanged || sidebarChanged) {
+    if (previousTab !== tab) markGlassDrop(viewTabs);
+    beginLayoutTransition();
+  }
+
+  const activeTabButton =
+    tab === "system"
+      ? document.getElementById("tabSystem")
+      : tab === "mapping"
+        ? document.getElementById("tabMapping")
+        : document.getElementById("tab3dMap");
+  if (previous3dActive && !view3d.classList.contains("active")) {
+    focusIfInside(view3d, activeTabButton);
+  }
+  if (previousSystemActive && !viewSystem.classList.contains("active")) {
+    focusIfInside(viewSystem, activeTabButton);
+  }
+  if (previousPanel && previousPanel !== document.querySelector(".panel-view.active")) {
+    focusIfInside(previousPanel, activeTabButton);
+  }
+
+  if (isMapView) {
+    ensureMapRenderLoop();
+  } else {
+    pauseMapRenderLoop();
+  }
+
   if (tab === "3d") {
-    resizeAll();
     pollMaps3d(true);
   } else if (tab === "mapping") {
-    resizeAll();
     pollMappingState();
     pollMapping3d(true);
     pollMappingPath();
@@ -1919,7 +2124,7 @@ async function startManagedTarget(target) {
 }
 
 function attachEvents() {
-  window.addEventListener("resize", resizeAll);
+  window.addEventListener("resize", noteLayoutResize);
   document.getElementById("tab3dMap").addEventListener("click", () => setTab("3d"));
   document.getElementById("tabMapping").addEventListener("click", () => setTab("mapping"));
   document.getElementById("tabSystem").addEventListener("click", () => setTab("system"));
@@ -1976,6 +2181,7 @@ function attachEvents() {
   document.getElementById("refreshMaps").addEventListener("click", () => refreshMaps(true));
   document.getElementById("sidebarToggle").addEventListener("click", toggleSidebar);
   observeMapStageResize();
+  attachLayoutTransitionListener();
   document.getElementById("openSaveMap").addEventListener("click", () => {
     saveMapSubmissionError = null;
     const dialog = document.getElementById("saveMapDialog");
@@ -2019,7 +2225,6 @@ function attachEvents() {
   if (joystickSettings) joystickSettings.addEventListener("click", enterJoystickLayout);
   const joystickDone = document.getElementById("joystickDone");
   if (joystickDone) joystickDone.addEventListener("click", exitJoystickLayout);
-  window.addEventListener("resize", applyJoystickLayout);
 
   mapCanvas3d.addEventListener("contextmenu", (event) => event.preventDefault());
   mapCanvas3d.addEventListener("wheel", (event) => {

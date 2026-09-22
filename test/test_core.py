@@ -1686,7 +1686,172 @@ def test_frontend_polls_system_api_only_for_system_tab():
     assert 'setTab("system")' in app_js
 
 
-def test_system_tab_hides_sidebar_and_expands_stage():
+def test_frontend_mounts_viewports_and_uses_inert():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    assert 'id="view3d"' in index_html
+    assert 'id="viewSystem"' in index_html
+    assert index_html.index('id="view3d"') < index_html.index('id="viewSystem"')
+
+    viewport = _css_rule_block(styles_css, ".viewport")
+    assert "display: none;" not in viewport
+    assert "position: absolute;" in viewport
+    assert "opacity: 0;" in viewport
+    assert "visibility: hidden;" in viewport
+    assert "pointer-events: none;" in viewport
+
+    active = _css_rule_block(styles_css, ".viewport.active")
+    assert "display: block;" not in active
+    assert "opacity: 1;" in active
+    assert "visibility: visible;" in active
+    assert "pointer-events: auto;" in active
+
+    assert "view3d.inert = !isMapView;" in app_js
+    assert 'view3d.setAttribute("aria-hidden", String(!isMapView));' in app_js
+    assert 'viewSystem.inert = tab !== "system";' in app_js
+    assert 'viewSystem.setAttribute("aria-hidden", String(tab !== "system"));' in app_js
+    assert "panel.inert = !isActive;" in app_js
+    assert 'panel.setAttribute("aria-hidden", String(!isActive));' in app_js
+
+
+def test_glass_no_filter_on_webgl_canvas():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    canvas = _css_rule_block(styles_css, "#mapCanvas3d")
+    assert "background-color: var(--scene-bg);" in canvas
+    assert "backdrop-filter" not in canvas
+    assert "filter:" not in canvas
+    view3d = _css_rule_block(styles_css, "#view3d")
+    assert "backdrop-filter" not in view3d
+    assert "filter:" not in view3d
+    assert "--scene-bg: #0b0f19;" in styles_css
+
+
+def test_frontend_layout_transition_state_machine_static():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const LAYOUT_SETTLE_FALLBACK_MS = 420;" in app_js
+    for name in (
+        "beginLayoutTransition",
+        "settleLayoutTransition",
+        "noteLayoutResize",
+        "doDeferredLayoutFlush",
+        "attachLayoutTransitionListener",
+    ):
+        assert f"function {name}(" in app_js
+    assert "pageTransition" in app_js
+    assert 'window.addEventListener("resize", noteLayoutResize);' in app_js
+    assert 'window.addEventListener("resize", resizeAll);' not in app_js
+    assert 'window.addEventListener("resize", applyJoystickLayout);' not in app_js
+    for property_name in ("grid-template-columns", "opacity", "transform"):
+        assert property_name in app_js
+    assert app_js.count("renderer.setSize(") == 1
+    resize_body = _js_function_body(app_js, "function resizeAll()")
+    assert "renderer.setSize(" in resize_body
+    assert "resizeAll();" not in app_js[
+        app_js.index("function setTab(tab)") : app_js.index("function selectedPosePayload")
+    ]
+
+
+def test_frontend_white_flash_fix_present():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const SCENE_BG = 0x0b0f19;" in app_js
+    assert "scene.background = new THREE.Color(SCENE_BG);" in app_js
+    assert "renderer.setClearColor(0x0b0f19, 1);" in app_js
+
+    render_body = _js_function_body(app_js, "function render()")
+    assert "mapViewActive()" in render_body
+    assert "requestAnimationFrame(render)" in render_body
+    assert "cancelAnimationFrame(mapRenderFrame);" in render_body
+    assert "function mapViewActive()" in app_js
+    assert "function ensureMapRenderLoop()" in app_js
+    assert "function pauseMapRenderLoop()" in app_js
+
+    flush_body = _js_function_body(app_js, "function doDeferredLayoutFlush()")
+    assert "resizeAll();" in flush_body
+    assert "applyJoystickLayout();" in flush_body
+    assert "updateHudPlacement();" in flush_body
+    assert "renderer.render(scene, camera);" in flush_body
+
+    assert "--scene-bg: #0b0f19;" in styles_css
+    assert "background-color: var(--scene-bg);" in styles_css
+
+
+def test_frontend_safety_invariants_in_set_tab():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    set_tab_block = app_js[
+        app_js.index("function setTab(tab)") : app_js.index("function selectedPosePayload")
+    ]
+
+    assert 'setMappingJoystickVisible(tab === "mapping");' in set_tab_block
+    assert "exitJoystickLayout();" in set_tab_block
+    assert set_tab_block.index("setMappingJoystickVisible") < set_tab_block.index(
+        "beginLayoutTransition();"
+    )
+    assert "resizeAll();" not in set_tab_block
+    assert "markGlassDrop(viewTabs);" in set_tab_block
+    assert "if (applyEffectiveSidebar()) beginLayoutTransition();" in app_js
+    assert "function applyEffectiveSidebar()" in app_js
+
+    sidebar_block = app_js[
+        app_js.index("// --- Sidebar collapse") : app_js.index("// --- End sidebar collapse")
+    ]
+    assert "localStorage" not in sidebar_block
+    assert "sessionStorage" not in sidebar_block
+    assert "function persistJoystickPreferences()" in app_js
+    assert 'postJson("/api/ui/preferences"' in app_js
+    assert "function selectMap(" in app_js
+
+
+def test_frontend_sidebar_and_system_use_shared_collapse():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    assert '<div class="panel-views">' in index_html
+    assert index_html.index('class="panel-views"') < index_html.index('id="navigationSidebar"')
+    panel_views = _css_rule_block(styles_css, ".panel-views")
+    assert "position: relative;" in panel_views
+
+    panel_view = _css_rule_block(styles_css, ".panel-view")
+    assert "display: none;" not in panel_view
+    assert "opacity: 0;" in panel_view
+    active_panel_view = _css_rule_block(styles_css, ".panel-view.active")
+    assert "display: block;" not in active_panel_view
+    assert "position: relative;" in active_panel_view
+    inactive_panel_view = _css_rule_block(styles_css, ".panel-view:not(.active)")
+    assert "position: absolute;" in inactive_panel_view
+    assert "inset: 0;" in inactive_panel_view
+
+    combined_start = styles_css.index(".app.sidebar-collapsed .panel,")
+    combined_body = styles_css[
+        styles_css.index("{", combined_start) + 1 : styles_css.index("}", combined_start)
+    ]
+    assert "opacity: 0;" in combined_body
+    assert "transform: translateX(12px);" in combined_body
+    assert "pointer-events: none;" in combined_body
+
+    toggle_start = styles_css.index(".app.system-mode .sidebar-toggle {")
+    toggle_body = styles_css[toggle_start : styles_css.index("}", toggle_start)]
+    assert "display: none;" not in toggle_body
+    assert "opacity: 0;" in toggle_body
+    assert "visibility: hidden;" in toggle_body
+
+    assert 'const effective = sidebarState.collapsed || state.view === "system";' in app_js
+    assert "function syncSidebarToggle(toggle)" in app_js
+    assert "let appliedEffectiveCollapse = false;" in app_js
+
+
+def test_system_tab_uses_shared_sidebar_collapse_model():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     app_js = (static_dir / "app.js").read_text(encoding="utf-8")
     styles_css = (static_dir / "styles.css").read_text(encoding="utf-8")
@@ -1697,11 +1862,16 @@ def test_system_tab_hides_sidebar_and_expands_stage():
     assert 'document.querySelector(".app").classList.toggle("system-mode", tab === "system");' in set_tab_block
     assert 'const panelName = tab === "system" ? "" : (tab === "mapping" ? "mapping" : "navigation");' in set_tab_block
     assert "panel.dataset.panel === panelName" in set_tab_block
+    assert "applyEffectiveSidebar();" in set_tab_block
+
     assert ".app.system-mode" in styles_css
     assert ".app.system-mode .panel" in styles_css
     system_panel_start = styles_css.index(".app.system-mode .panel")
     system_panel_block = styles_css[system_panel_start : styles_css.index("}", system_panel_start)]
-    assert "display: none;" in system_panel_block
+    assert "display: none;" not in system_panel_block
+    assert "opacity: 0;" in system_panel_block
+
+    assert 'const effective = sidebarState.collapsed || state.view === "system";' in app_js
 
 
 def test_cpu_core_rows_are_reused_so_bars_slide_to_targets():
@@ -3890,6 +4060,173 @@ def test_frontend_map_selector_behavior_executes_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "map panel behavior ok" in completed.stdout
+
+
+_LAYOUT_TRANSITION_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Page transition state machine");
+const blockEnd = source.indexOf("// --- End page transition state machine");
+if (blockStart < 0 || blockEnd < 0) throw new Error("page transition block not found");
+const block = source.slice(blockStart, blockEnd);
+
+let reduceMotion = false;
+global.glassMotionReduced = () => reduceMotion;
+let resizeCalls = 0;
+let layoutCalls = 0;
+let hudCalls = 0;
+let renderCalls = 0;
+global.resizeAll = () => { resizeCalls += 1; };
+global.applyJoystickLayout = () => { layoutCalls += 1; };
+global.updateHudPlacement = () => { hudCalls += 1; };
+global.renderer = { render: () => { renderCalls += 1; } };
+global.scene = {};
+global.camera = {};
+
+const timers = new Map();
+const frames = new Map();
+let nextTimer = 1000;
+let nextFrame = 1;
+global.setTimeout = (fn) => { const id = nextTimer++; timers.set(id, fn); return id; };
+global.clearTimeout = (id) => { timers.delete(id); };
+global.requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+global.cancelAnimationFrame = (id) => { frames.delete(id); };
+
+function flushTimers() {
+  const pending = Array.from(timers.values());
+  timers.clear();
+  pending.forEach((fn) => fn());
+}
+
+function flushFrames() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((fn) => fn());
+}
+
+function makeElement() {
+  const listeners = {};
+  return {
+    addEventListener(type, handler) { (listeners[type] = listeners[type] || []).push(handler); },
+    dispatch(type, event) { (listeners[type] || []).forEach((handler) => handler(event)); },
+  };
+}
+
+const appEl = makeElement();
+const view3dEl = makeElement();
+const viewSystemEl = makeElement();
+const viewTabsEl = makeElement();
+global.document = {
+  querySelector(selector) { return selector === ".app" ? appEl : null; },
+  getElementById(id) {
+    if (id === "view3d") return view3dEl;
+    if (id === "viewSystem") return viewSystemEl;
+    if (id === "viewTabs") return viewTabsEl;
+    return null;
+  },
+};
+
+const transitionApi = new Function(block + `
+return { pageTransition, beginLayoutTransition, settleLayoutTransition, noteLayoutResize, doDeferredLayoutFlush, attachLayoutTransitionListener };`)();
+const {
+  pageTransition, beginLayoutTransition, settleLayoutTransition,
+  noteLayoutResize, doDeferredLayoutFlush, attachLayoutTransitionListener,
+} = transitionApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function resetCounters() { resizeCalls = 0; layoutCalls = 0; hudCalls = 0; renderCalls = 0; }
+
+attachLayoutTransitionListener();
+
+// Rapid requests: the newest token wins and the previous fallback is cancelled.
+resetCounters();
+const firstToken = beginLayoutTransition();
+const secondToken = beginLayoutTransition();
+expect(secondToken === firstToken + 1, "each request bumps the token");
+flushTimers();
+expect(resizeCalls === 1, "one flush for rapid requests");
+expect(layoutCalls === 1, "one joystick layout for rapid requests");
+expect(renderCalls === 1, "one synchronous render for rapid requests");
+expect(pageTransition.active === false, "controller returns to stable");
+settleLayoutTransition(firstToken);
+expect(resizeCalls === 1, "a stale token never flushes");
+
+// A tracked transitionend settles; untracked properties and targets are ignored.
+resetCounters();
+beginLayoutTransition();
+appEl.dispatch("transitionend", { propertyName: "color", target: viewSystemEl });
+appEl.dispatch("transitionend", { propertyName: "opacity", target: makeElement() });
+expect(resizeCalls === 0, "untracked events are ignored");
+appEl.dispatch("transitionend", { propertyName: "opacity", target: viewSystemEl });
+expect(resizeCalls === 1, "a tracked transitionend settles");
+expect(renderCalls === 1, "a tracked transitionend performs the settle render");
+
+// A stale event for an old token does not flush.
+resetCounters();
+beginLayoutTransition();
+const liveToken = beginLayoutTransition();
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
+expect(resizeCalls === 1, "the newest token settles");
+settleLayoutTransition(liveToken - 1);
+expect(resizeCalls === 1, "old tokens are ignored after settling");
+
+// No transitionend: the fallback timer settles.
+resetCounters();
+beginLayoutTransition();
+flushTimers();
+expect(resizeCalls === 1, "the fallback settles without transitionend");
+expect(renderCalls === 1, "the fallback renders once");
+
+// Reduced motion settles on the next animation frame, not the fallback timer.
+reduceMotion = true;
+resetCounters();
+beginLayoutTransition();
+flushTimers();
+expect(resizeCalls === 0, "reduced motion ignores the fallback timer");
+flushFrames();
+expect(resizeCalls === 1, "reduced motion settles on the next frame");
+reduceMotion = false;
+
+// A resize storm while pending coalesces into the single settle flush.
+resetCounters();
+beginLayoutTransition();
+noteLayoutResize();
+noteLayoutResize();
+noteLayoutResize();
+expect(resizeCalls === 0, "no setSize while a transition is pending");
+flushFrames();
+expect(resizeCalls === 0, "pending resize requests do not schedule a frame");
+flushTimers();
+expect(resizeCalls === 1, "the settle flush resizes once");
+expect(layoutCalls === 1, "the settle flush applies joystick layout once");
+expect(hudCalls === 1, "the settle flush updates HUD placement once");
+expect(renderCalls === 1, "the settle flush renders exactly once");
+
+// Flushing while pending defers instead of resizing mid-transition.
+resetCounters();
+beginLayoutTransition();
+doDeferredLayoutFlush();
+expect(resizeCalls === 0, "a direct flush during a transition is deferred");
+flushTimers();
+expect(resizeCalls === 1, "the deferred flush runs at settle");
+
+console.log("page transition ok");
+"""
+
+
+def test_frontend_layout_transition_state_machine_executes_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _LAYOUT_TRANSITION_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "page transition ok" in completed.stdout
 
 
 class _FakeCancelResponse:
@@ -6645,7 +6982,7 @@ def test_sidebar_toggle_is_single_accessible_button():
 
     assert "grid-template-columns: minmax(0, 1fr) var(--panel-width, 360px);" in styles_css
     assert ".app.sidebar-collapsed" in styles_css
-    assert "transition: grid-template-columns 260ms ease;" in styles_css
+    assert "transition: grid-template-columns var(--layout-transition-ms) ease;" in styles_css
     assert ".app.sidebar-collapsed .panel" in styles_css
     assert ".app.system-mode .sidebar-toggle" in styles_css
     assert "var(--panel-width, 340px);" in styles_css
@@ -6653,6 +6990,7 @@ def test_sidebar_toggle_is_single_accessible_button():
     assert "function setSidebarCollapsed(collapsed)" in app_js
     assert "function toggleSidebar()" in app_js
     assert "function observeMapStageResize()" in app_js
+    assert "function applyEffectiveSidebar()" in app_js
     assert "new ResizeObserver" in app_js
     assert 'document.getElementById("sidebarToggle").addEventListener' in app_js
 
@@ -6674,12 +7012,15 @@ function makeElement() {
     hidden: false,
     inert: false,
     attributes: {},
+    focused: false,
     classList: {
       toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
       contains(name) { return classes.has(name); },
     },
     setAttribute(name, value) { this.attributes[name] = value; },
     getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    contains() { return false; },
+    focus() { this.focused = true; },
   };
 }
 
@@ -6690,6 +7031,7 @@ const panelElement = makeElement();
 const elements = { sidebarToggle: toggleElement, controlPanel: panelElement };
 const observers = [];
 global.document = {
+  activeElement: null,
   getElementById(id) { return elements[id] || null; },
   querySelector(selector) {
     if (selector === ".app") return appElement;
@@ -6701,15 +7043,15 @@ global.ResizeObserver = class {
   constructor(callback) { this.callback = callback; this.target = null; observers.push(this); }
   observe(target) { this.target = target; }
 };
-let resizeCalls = 0;
-let layoutCalls = 0;
-global.resizeAll = () => { resizeCalls += 1; };
-global.applyJoystickLayout = () => { layoutCalls += 1; };
+let transitions = 0;
+let resizeNotes = 0;
+global.state = { view: "3d" };
+global.beginLayoutTransition = () => { transitions += 1; return transitions; };
+global.noteLayoutResize = () => { resizeNotes += 1; };
 
 const sidebarApi = new Function(block + `
-return { sidebarState, setSidebarCollapsed, toggleSidebar, observeMapStageResize };`)();
-const { sidebarState, setSidebarCollapsed, toggleSidebar, observeMapStageResize } =
-  sidebarApi;
+return { sidebarState, applyEffectiveSidebar, setSidebarCollapsed, toggleSidebar, observeMapStageResize };`)();
+const { sidebarState, applyEffectiveSidebar, setSidebarCollapsed, toggleSidebar, observeMapStageResize } = sidebarApi;
 
 function expect(condition, message) { if (!condition) throw new Error(message); }
 
@@ -6718,6 +7060,7 @@ setSidebarCollapsed(false);
 expect(toggleElement.getAttribute("aria-expanded") === "true", "expanded aria state");
 expect(toggleElement.getAttribute("aria-label") === "Collapse sidebar", "expanded label");
 expect(panelElement.inert === false, "expanded panel is interactive");
+expect(transitions === 0, "no transition for an unchanged sidebar");
 
 toggleSidebar();
 expect(sidebarState.collapsed === true, "toggle collapses");
@@ -6725,19 +7068,33 @@ expect(appElement.classList.contains("sidebar-collapsed"), "collapsed class appl
 expect(toggleElement.getAttribute("aria-expanded") === "false", "collapsed aria state");
 expect(toggleElement.getAttribute("aria-label") === "Expand sidebar", "collapsed label");
 expect(panelElement.inert === true, "collapsed panel is inert");
+expect(transitions === 1, "collapse starts one transition");
 
 toggleSidebar();
 expect(sidebarState.collapsed === false, "toggle expands");
 expect(!appElement.classList.contains("sidebar-collapsed"), "collapsed class removed");
 expect(toggleElement.getAttribute("aria-expanded") === "true", "re-expanded aria state");
 expect(panelElement.inert === false, "re-expanded panel is interactive");
+expect(transitions === 2, "expand starts one transition");
+
+// Entering System collapses the effective sidebar but keeps the in-page state.
+global.state.view = "system";
+expect(applyEffectiveSidebar() === true, "entering system changes the effective collapse");
+expect(appElement.classList.contains("sidebar-collapsed"), "system collapses the sidebar");
+expect(sidebarState.collapsed === false, "in-page state is unchanged by system");
+expect(toggleElement.getAttribute("aria-label") === "Collapse sidebar", "system keeps the in-page label");
+
+// Leaving System restores the in-page expanded state.
+global.state.view = "3d";
+expect(applyEffectiveSidebar() === true, "leaving system changes the effective collapse");
+expect(!appElement.classList.contains("sidebar-collapsed"), "leaving system restores expansion");
+expect(applyEffectiveSidebar() === false, "an unchanged effective state starts no work");
 
 observeMapStageResize();
 expect(observers.length === 1, "one ResizeObserver created");
 expect(observers[0].target === stageElement, "map stage observed");
 observers[0].callback();
-expect(resizeCalls === 1, "renderer resized on stage change");
-expect(layoutCalls === 1, "joystick layout recalculated on stage change");
+expect(resizeNotes === 1, "stage changes are coalesced through noteLayoutResize");
 
 console.log("sidebar collapse ok");
 """

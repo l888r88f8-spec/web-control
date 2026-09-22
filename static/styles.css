@@ -138,14 +138,6 @@ input {
   --panel-width: 0px;
 }
 
-.app.system-mode {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.app.system-mode .panel {
-  display: none;
-}
-
 .stage {
   position: relative;
   min-width: 0;
@@ -275,13 +267,34 @@ input {
 }
 
 .viewport {
-  display: none;
   position: absolute;
   inset: 0;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--layout-transition-ms) ease,
+              visibility 0s linear var(--layout-transition-ms);
 }
 
 .viewport.active {
-  display: block;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity var(--layout-transition-ms) ease,
+              visibility 0s linear 0s;
+}
+
+#view3d {
+  z-index: 0;
+  background: var(--scene-bg);
+}
+
+#viewSystem {
+  z-index: 1;
+}
+
+#mapCanvas3d {
+  background-color: var(--scene-bg);
 }
 
 .system-viewport {
@@ -715,7 +728,8 @@ canvas {
   transition: opacity var(--layout-transition-ms) ease, transform var(--layout-transition-ms) ease;
 }
 
-.app.sidebar-collapsed .panel {
+.app.sidebar-collapsed .panel,
+.app.system-mode .panel {
   opacity: 0;
   transform: translateX(12px);
   pointer-events: none;
@@ -757,7 +771,11 @@ canvas {
 }
 
 .app.system-mode .sidebar-toggle {
-  display: none;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--layout-transition-ms) ease,
+              visibility 0s linear var(--layout-transition-ms);
 }
 
 .panel header {
@@ -798,12 +816,30 @@ header + section {
   margin-top: 16px;
 }
 
+.panel-views {
+  position: relative;
+}
+
 .panel-view {
-  display: none;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--layout-transition-ms) ease,
+              visibility 0s linear var(--layout-transition-ms);
 }
 
 .panel-view.active {
-  display: block;
+  position: relative;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition: opacity var(--layout-transition-ms) ease,
+              visibility 0s linear 0s;
+}
+
+.panel-view:not(.active) {
+  position: absolute;
+  inset: 0;
 }
 
 .panel section {
