@@ -15,6 +15,9 @@ import time
 from typing import Any, Callable
 
 
+MAX_CLIENT_ID_LENGTH = 128
+
+
 def _finite_number(value: Any, name: str) -> float:
     """Return ``value`` as a finite float, rejecting booleans and strings."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -23,6 +26,23 @@ def _finite_number(value: Any, name: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite")
     return number
+
+
+def _client_id(value: Any) -> str:
+    """Return a trimmed nonempty bounded per-tab client identifier."""
+    if not isinstance(value, str):
+        raise ValueError("client_id must be a nonempty bounded string")
+    client_id = value.strip()
+    if not client_id or len(client_id) > MAX_CLIENT_ID_LENGTH:
+        raise ValueError("client_id must be a nonempty bounded string")
+    return client_id
+
+
+def _sequence(value: Any) -> int:
+    """Return ``value`` as a positive integer, rejecting bools and floats."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("seq must be a positive integer")
+    return value
 
 
 def validate_teleop_parameters(
@@ -47,6 +67,8 @@ def validate_teleop_parameters(
     for name, value in positive.items():
         if _finite_number(value, name) <= 0.0:
             raise ValueError(f"{name} must be positive")
+    if not (0.0 < _finite_number(max_steer_angle, "max_steer_angle") < math.pi / 2.0):
+        raise ValueError("max_steer_angle must be within (0, pi/2)")
     zone = _finite_number(deadzone, "deadzone")
     if zone < 0.0 or zone >= 0.5:
         raise ValueError("deadzone must be within [0, 0.5)")
@@ -88,6 +110,8 @@ class TeleopController:
         self._active: dict[str, Any] | None = None
         self._last_command_at: float | None = None
         self._zero_pending = False
+        self._closed = False
+        self._last_seq: dict[str, int] = {}
 
     def map_axes(self, throttle: Any, steering: Any) -> dict[str, Any]:
         """Clamp, dead-zone, and Ackermann-map normalized axes to a command."""
@@ -114,17 +138,34 @@ class TeleopController:
             "angular_z": angular_velocity,
         }
 
-    def apply_command(self, payload: Any, now: float | None = None) -> dict[str, Any]:
-        """Validate and store one command; invalid input leaves state untouched."""
+    def apply_command(
+        self, payload: Any, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Validate and store one command; invalid input leaves state untouched.
+
+        Returns the accepted command, or ``None`` when the payload's per-client
+        ``seq`` is not newer than the last accepted sequence.  A stale command
+        is ignored entirely so it can never re-arm the watchdog after a newer
+        stop.  Calls after :meth:`stop` are rejected because shutdown is
+        terminal.
+        """
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         if "throttle" not in payload:
             raise ValueError("missing throttle")
         if "steering" not in payload:
             raise ValueError("missing steering")
+        client_id = _client_id(payload.get("client_id"))
+        seq = _sequence(payload.get("seq"))
         command = self.map_axes(payload["throttle"], payload["steering"])
         timestamp = self.clock() if now is None else now
         with self._lock:
+            if self._closed:
+                raise RuntimeError("teleop controller is closed")
+            last_seq = self._last_seq.get(client_id)
+            if last_seq is not None and seq <= last_seq:
+                return None
+            self._last_seq[client_id] = seq
             if command["active"]:
                 self._active = command
                 self._last_command_at = timestamp
@@ -144,6 +185,8 @@ class TeleopController:
         """
         timestamp = self.clock() if now is None else now
         with self._lock:
+            if self._closed:
+                return None
             if self._active is not None:
                 last = self._last_command_at
                 if last is not None and timestamp - last <= self.command_timeout:
@@ -156,12 +199,21 @@ class TeleopController:
                 return self._zero_command()
             return None
 
-    def stop(self) -> dict[str, Any]:
-        """Clear the watchdog and return the one zero command for shutdown."""
+    def stop(self) -> dict[str, Any] | None:
+        """Close the controller and return one zero, then ``None`` forever.
+
+        The first call atomically marks the controller closed and clears all
+        watchdog state, so a later or in-flight ``apply_command`` can never
+        re-arm motion during shutdown.
+        """
         with self._lock:
+            if self._closed:
+                return None
+            self._closed = True
             self._active = None
             self._last_command_at = None
             self._zero_pending = False
+            self._last_seq.clear()
             return self._zero_command()
 
     @staticmethod

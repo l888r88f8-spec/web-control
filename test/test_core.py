@@ -4978,11 +4978,20 @@ def test_teleop_handler_accepts_command_and_returns_mapped_twist():
     node = _teleop_node()
 
     status, body = _serve_and_request(
-        node, "/api/teleop", {"throttle": 0.5, "steering": 0.25}, "POST"
+        node,
+        "/api/teleop",
+        {
+            "throttle": 0.5,
+            "steering": 0.25,
+            "client_id": "tab-session",
+            "seq": 1,
+        },
+        "POST",
     )
 
     assert status == 200
     assert body["ok"] is True
+    assert body["stale"] is False
     assert body["teleop"]["throttle"] == 0.5
     assert body["teleop"]["steering"] == 0.25
     assert body["teleop"]["linear_x"] == pytest.approx(0.75)
@@ -4992,14 +5001,22 @@ def test_teleop_handler_accepts_command_and_returns_mapped_twist():
 
 def test_teleop_handler_rejects_invalid_payloads_without_replacing_command():
     node = _teleop_node()
-    node.teleop.apply_command({"throttle": 0.5, "steering": 0.0}, 0.0)
+    node.teleop.apply_command(
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab-session", "seq": 1},
+        0.0,
+    )
 
     for payload in (
         [],
         {},
-        {"throttle": "fast", "steering": 0.0},
+        {"throttle": "fast", "steering": 0.0, "client_id": "tab-session", "seq": 2},
         {"throttle": 0.5},
-        {"throttle": float("nan"), "steering": 0.0},
+        {
+            "throttle": float("nan"),
+            "steering": 0.0,
+            "client_id": "tab-session",
+            "seq": 2,
+        },
     ):
         status, body = _serve_and_request(node, "/api/teleop", payload, "POST")
         assert status == 400, payload
@@ -5010,6 +5027,52 @@ def test_teleop_handler_rejects_invalid_payloads_without_replacing_command():
     assert command["linear_x"] == pytest.approx(0.75)
 
 
+def test_teleop_handler_ignores_stale_commands_after_newer_zero():
+    node = _teleop_node()
+
+    status, body = _serve_and_request(
+        node,
+        "/api/teleop",
+        {"throttle": 0.0, "steering": 0.0, "client_id": "tab-session", "seq": 2},
+        "POST",
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["stale"] is False
+
+    status, body = _serve_and_request(
+        node,
+        "/api/teleop",
+        {"throttle": 1.0, "steering": 0.0, "client_id": "tab-session", "seq": 1},
+        "POST",
+    )
+    assert status == 200
+    assert body["ok"] is True
+    assert body["stale"] is True
+    assert "teleop" not in body
+
+    zero = node.teleop.poll_publish(0.0)
+    assert zero is not None
+    assert zero["linear_x"] == 0.0
+    assert node.teleop.poll_publish(0.0) is None
+
+
+def test_teleop_handler_rejects_invalid_client_identity():
+    node = _teleop_node()
+
+    for payload in (
+        {"throttle": 0.5, "steering": 0.0},
+        {"throttle": 0.5, "steering": 0.0, "client_id": "", "seq": 1},
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab", "seq": 0},
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab", "seq": True},
+    ):
+        status, body = _serve_and_request(node, "/api/teleop", payload, "POST")
+        assert status == 400, payload
+        assert body["ok"] is False
+
+    assert node.teleop.poll_publish(0.0) is None
+
+
 def test_teleop_timer_publishes_active_command_then_exactly_one_zero(monkeypatch):
     monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
     clock = _MutableClock(0.0)
@@ -5018,7 +5081,9 @@ def test_teleop_timer_publishes_active_command_then_exactly_one_zero(monkeypatch
     node.teleop_timer_callback()
     assert node.cmd_vel_publications == []
 
-    node.teleop.apply_command({"throttle": 1.0, "steering": 0.0}, 0.0)
+    node.teleop.apply_command(
+        {"throttle": 1.0, "steering": 0.0, "client_id": "tab-session", "seq": 1}, 0.0
+    )
     node.teleop_timer_callback()
     assert len(node.cmd_vel_publications) == 1
     assert node.cmd_vel_publications[0].linear.x == pytest.approx(1.5)
@@ -5034,10 +5099,35 @@ def test_teleop_timer_publishes_active_command_then_exactly_one_zero(monkeypatch
     assert len(node.cmd_vel_publications) == 2
 
 
+def test_teleop_timer_publishes_nonzero_steering_angular_z(monkeypatch):
+    monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
+    node = _teleop_node(clock=_MutableClock(0.0))
+
+    node.teleop.apply_command(
+        {"throttle": 0.6, "steering": 0.25, "client_id": "tab-session", "seq": 1}, 0.0
+    )
+    node.teleop_timer_callback()
+
+    assert len(node.cmd_vel_publications) == 1
+    expected_angle = 0.25 ** 0.5 * 0.461
+    twist = node.cmd_vel_publications[0]
+    assert twist.linear.x == pytest.approx(0.9)
+    assert twist.angular.z == pytest.approx(0.9 / 0.65 * math.tan(expected_angle))
+    assert twist.angular.z > 0.0
+
+    node.teleop.apply_command(
+        {"throttle": 0.6, "steering": -0.25, "client_id": "tab-session", "seq": 2}, 0.0
+    )
+    node.teleop_timer_callback()
+    assert node.cmd_vel_publications[1].angular.z < 0.0
+
+
 def test_teleop_cleanup_publishes_exactly_one_zero_on_shutdown(monkeypatch):
     monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
     node = _teleop_node()
-    node.teleop.apply_command({"throttle": 0.5, "steering": 0.0}, 0.0)
+    node.teleop.apply_command(
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab-session", "seq": 1}, 0.0
+    )
 
     node.cleanup_teleop()
 
@@ -5045,6 +5135,54 @@ def test_teleop_cleanup_publishes_exactly_one_zero_on_shutdown(monkeypatch):
     assert node.cmd_vel_publications[0].linear.x == 0.0
     assert node.cmd_vel_publications[0].angular.z == 0.0
     assert node.teleop.poll_publish(0.0) is None
+
+
+def test_teleop_cleanup_is_idempotent_and_stop_is_terminal(monkeypatch):
+    monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
+    node = _teleop_node()
+    node.teleop.apply_command(
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab-session", "seq": 1}, 0.0
+    )
+
+    node.cleanup_teleop()
+    node.cleanup_teleop()
+
+    assert len(node.cmd_vel_publications) == 1
+    assert node.cmd_vel_publications[0].linear.x == 0.0
+    with pytest.raises(RuntimeError):
+        node.apply_teleop_command(
+            {
+                "throttle": 1.0,
+                "steering": 0.0,
+                "client_id": "tab-session",
+                "seq": 2,
+            }
+        )
+
+
+def test_teleop_cleanup_swallows_twist_publish_failure(monkeypatch):
+    monkeypatch.setattr(web_control_node, "Twist", _FakeTwist)
+    node = _teleop_node()
+    node.teleop.apply_command(
+        {"throttle": 0.5, "steering": 0.0, "client_id": "tab-session", "seq": 1}, 0.0
+    )
+    errors = []
+
+    class _RecordingLogger(_LoggerStub):
+        def error(self, message, *args, **kwargs):
+            errors.append(message)
+
+    class _RaisingPublisher:
+        def publish(self, msg):
+            raise RuntimeError("cmd_vel publish failed")
+
+    node.get_logger = lambda: _RecordingLogger()
+    node.cmd_vel_pub = _RaisingPublisher()
+
+    node.cleanup_teleop()  # must not raise so destroy_node can continue
+
+    assert errors
+    assert "cmd_vel publish failed" in errors[0]
 
 
 def test_web_control_yaml_declares_teleop_defaults():
@@ -5155,17 +5293,34 @@ try {
 let fakeNow = 0;
 Date.now = () => fakeNow;
 
+global.viewerSessionId = () => "tab-session";
+
 const posts = [];
+const deferred = [];
+let deferRequests = false;
+let failNextRequest = false;
 global.postJson = async (url, payload) => {
   posts.push({ url, payload });
+  if (failNextRequest) {
+    failNextRequest = false;
+    throw new Error("network down");
+  }
   const active = payload.throttle !== 0 || payload.steering !== 0;
+  if (deferRequests) {
+    return await new Promise((resolve, reject) => {
+      deferred.push({ resolve, reject, payload, active });
+    });
+  }
   return { ok: true, teleop: { active } };
 };
 global.fetchWithTimeout = async () => ({ ok: true });
 
-eval(block);
+eval(block + "\nglobalThis.__teleopState = teleop;");
+const teleopState = globalThis.__teleopState;
 
 function expect(condition, message) { if (!condition) throw new Error(message); }
+
+expect(teleopState.clientId === "tab-session", "joystick reuses viewerSessionId for client_id");
 
 const baseElement = makeElement();
 let propagationStops = 0;
@@ -5202,6 +5357,8 @@ expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the u
   await joystickPointerDown(makeEvent(1, 30, 30));
   expect(posts.length === 1, "pointerdown sends the first command");
   expect(posts[0].url === "/api/teleop", "pointerdown posts to /api/teleop");
+  expect(posts[0].payload.client_id === teleopState.clientId, "active send carries the tab client_id");
+  expect(Number.isInteger(posts[0].payload.seq) && posts[0].payload.seq > 0, "active send carries a positive integer seq");
   expect(posts[0].payload.throttle > 0 && posts[0].payload.steering > 0, "pointerdown posts the upper-left axes");
   expect(baseElement.captured.length === 1, "pointerdown captures the active pointer");
   expect(propagationStops >= 1, "pointerdown stops propagation to the map canvas");
@@ -5245,6 +5402,8 @@ expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the u
   await joystickPointerUp(makeEvent(1, 20, 20));
   expect(posts[posts.length - 1].payload.throttle === 0, "release sends a zero throttle");
   expect(posts[posts.length - 1].payload.steering === 0, "release sends a zero steering");
+  expect(posts[posts.length - 1].payload.client_id === posts[0].payload.client_id, "stop shares the active client_id");
+  expect(posts[posts.length - 1].payload.seq > posts[0].payload.seq, "stop seq is higher than the active seq");
   expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "release centers the knob");
   expect(intervalHandlers.size === 0, "release clears the send loop");
 
@@ -5281,9 +5440,84 @@ expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the u
 
   fakeNow = 1100;
   await joystickPointerDown(makeEvent(7, 10, 10));
+  const seqBeforePageHide = teleopState.seq;
   handlePageHide();
   expect(beacons.length === 1, "page shutdown sends one keepalive stop");
-  expect(JSON.parse(beacons[0].body).throttle === 0, "keepalive stop is a zero command");
+  const beacon = JSON.parse(beacons[0].body);
+  expect(beacon.throttle === 0, "keepalive stop is a zero command");
+  expect(beacon.client_id === teleopState.clientId, "keepalive stop carries the tab client_id");
+  expect(Number.isInteger(beacon.seq) && beacon.seq > seqBeforePageHide, "keepalive stop increments seq");
+
+  let previousSeq = 0;
+  for (const post of posts) {
+    expect(post.payload.client_id === teleopState.clientId, "every teleop post carries the tab client_id");
+    expect(Number.isInteger(post.payload.seq) && post.payload.seq > previousSeq, "teleop seq strictly increases");
+    previousSeq = post.payload.seq;
+  }
+
+  // A failed nonzero send clears the loop but keeps the stop obligation.
+  teleopState.stopRequired = false;
+  teleopState.pointerId = null;
+  teleopState.active = false;
+  fakeNow = 1200;
+  failNextRequest = true;
+  await joystickPointerDown(makeEvent(8, 20, 20));
+  expect(intervalHandlers.size === 0, "failed active send clears the interval");
+  expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "failed active send centers the knob");
+  expect(teleopState.pointerId === null, "failed active send releases the pointer");
+  expect(teleopState.stopRequired === true, "failed active send leaves stopRequired true");
+
+  const beforeFailureRelease = posts.length;
+  fakeNow = 1300;
+  await joystickPointerUp(makeEvent(8, 20, 20));
+  expect(posts.length === beforeFailureRelease + 1, "release after failure still sends a stop");
+  expect(posts[posts.length - 1].payload.throttle === 0, "release after failure sends zero");
+  expect(teleopState.stopRequired === false, "successful zero clears stopRequired");
+
+  // stopRequired survives a failed zero and is only cleared by a successful zero.
+  teleopState.stopRequired = true;
+  failNextRequest = true;
+  fakeNow = 1400;
+  await stopTeleop("failed-zero");
+  expect(teleopState.stopRequired === true, "failed zero request keeps stopRequired true");
+
+  const beforeSuccessfulZero = posts.length;
+  fakeNow = 1500;
+  await stopTeleop("retry-zero");
+  expect(teleopState.stopRequired === false, "successful zero clears stopRequired");
+  expect(posts.length === beforeSuccessfulZero + 1, "retry zero is sent");
+  const afterClearedZero = posts.length;
+  fakeNow = 1550;
+  await stopTeleop("already-stopped");
+  expect(posts.length === afterClearedZero, "no continuous zero loop once stopRequired is clear");
+
+  // Deferred/out-of-order: the stop must carry a higher seq than the slow active.
+  teleopState.stopRequired = false;
+  teleopState.pointerId = null;
+  teleopState.active = false;
+  teleopState.throttle = 0;
+  teleopState.steering = 0;
+  deferRequests = true;
+  fakeNow = 1600;
+  const downPromise = joystickPointerDown(makeEvent(10, 20, 20));
+  const activePost = posts[posts.length - 1];
+  expect(teleopState.stopRequired === true, "nonzero request sets stopRequired before it resolves");
+  fakeNow = 1700;
+  const upPromise = joystickPointerUp(makeEvent(10, 20, 20));
+  const stopPost = posts[posts.length - 1];
+  expect(stopPost.payload.throttle === 0 && stopPost.payload.steering === 0, "deferred stop is zero");
+  expect(stopPost.payload.client_id === activePost.payload.client_id, "deferred stop shares client_id");
+  expect(stopPost.payload.seq > activePost.payload.seq, "deferred stop seq is higher");
+  const stopEntry = deferred.find((entry) => entry.payload === stopPost.payload);
+  const activeEntry = deferred.find((entry) => entry.payload === activePost.payload);
+  expect(stopEntry && activeEntry, "both deferred requests are pending");
+  stopEntry.resolve({ ok: true, teleop: { active: false } });
+  await upPromise;
+  expect(teleopState.stopRequired === false, "out-of-order stop success clears stopRequired");
+  activeEntry.resolve({ ok: true, stale: true });
+  await downPromise;
+  expect(teleopState.stopRequired === false, "stale active response does not re-arm stopRequired");
+  deferRequests = false;
 
   console.log("mapping joystick ok");
 })().catch((error) => { console.error(error); process.exit(1); });

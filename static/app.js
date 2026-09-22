@@ -1118,6 +1118,9 @@ const JOYSTICK_SEND_INTERVAL_MS = 100;
 const JOYSTICK_DEADZONE = 0.08;
 
 const teleop = {
+  clientId: viewerSessionId(),
+  seq: 0,
+  stopRequired: false,
   pointerId: null,
   active: false,
   throttle: 0,
@@ -1188,15 +1191,28 @@ async function sendTeleopCommand(throttle, steering, force = false) {
   const now = Date.now();
   if (!force && now - teleop.lastSentAt < JOYSTICK_SEND_INTERVAL_MS) return false;
   teleop.lastSentAt = now;
+  const isStop = throttle === 0 && steering === 0;
+  // Set the stop obligation before the request can reach the server so a
+  // failure can never leave an un-stopped command behind.
+  if (!isStop) teleop.stopRequired = true;
+  teleop.seq += 1;
   try {
-    const response = await postJson("/api/teleop", { throttle, steering });
+    const response = await postJson("/api/teleop", {
+      throttle,
+      steering,
+      client_id: teleop.clientId,
+      seq: teleop.seq,
+    });
+    if (response && response.stale) return true;
+    if (isStop) teleop.stopRequired = false;
     const accepted = response && response.teleop ? response.teleop : null;
     if (accepted && accepted.active) setJoystickStatus("active", "active");
     else setJoystickStatus("stopped", "idle");
     return true;
   } catch (error) {
-    teleop.active = false;
+    stopTeleopSendLoop();
     resetJoystick();
+    teleop.active = false;
     teleop.lastSentAt = -Infinity;
     setJoystickStatus(`error: ${error.message}`, "error");
     return false;
@@ -1204,7 +1220,7 @@ async function sendTeleopCommand(throttle, steering, force = false) {
 }
 
 async function stopTeleop(reason) {
-  const wasActive = teleop.active || teleop.pointerId !== null;
+  const wasActive = teleop.active || teleop.pointerId !== null || teleop.stopRequired;
   stopTeleopSendLoop();
   resetJoystick();
   teleop.active = false;
@@ -1218,7 +1234,13 @@ async function stopTeleop(reason) {
 }
 
 function sendTeleopKeepaliveStop() {
-  const body = JSON.stringify({ throttle: 0, steering: 0 });
+  teleop.seq += 1;
+  const body = JSON.stringify({
+    throttle: 0,
+    steering: 0,
+    client_id: teleop.clientId,
+    seq: teleop.seq,
+  });
   if (navigator && typeof navigator.sendBeacon === "function") {
     navigator.sendBeacon("/api/teleop", body);
     return;
@@ -1265,14 +1287,16 @@ async function joystickPointerMove(event) {
 }
 
 async function joystickPointerUp(event) {
-  if (teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
+  if (teleop.pointerId === null && !teleop.stopRequired) return;
+  if (teleop.pointerId !== null && event.pointerId !== teleop.pointerId) return;
   event.preventDefault();
   event.stopPropagation();
   await stopTeleop("release");
 }
 
 async function joystickPointerCancel(event) {
-  if (teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
+  if (teleop.pointerId === null && !teleop.stopRequired) return;
+  if (teleop.pointerId !== null && event.pointerId !== teleop.pointerId) return;
   event.preventDefault();
   event.stopPropagation();
   await stopTeleop("cancel");
@@ -1287,7 +1311,7 @@ async function handleVisibilityChange() {
 }
 
 function handlePageHide() {
-  if (!teleop.active && teleop.pointerId === null) return;
+  if (!teleop.active && teleop.pointerId === null && !teleop.stopRequired) return;
   stopTeleopSendLoop();
   resetJoystick();
   teleop.active = false;
@@ -1300,7 +1324,7 @@ async function setMappingJoystickVisible(visible) {
   if (joystick) joystick.hidden = !visible;
   const stage = document.querySelector(".stage");
   if (stage) stage.classList.toggle("mapping-active", visible);
-  if (!visible && teleop.active) await stopTeleop("tab");
+  if (!visible && (teleop.active || teleop.stopRequired)) await stopTeleop("tab");
 }
 // --- End mapping joystick
 

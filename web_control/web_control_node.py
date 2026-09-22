@@ -1463,9 +1463,19 @@ class WebControlNode(Node):
         self.goal_pub.publish(msg)
 
     def apply_teleop_command(self, payload: Any) -> dict[str, Any]:
-        """Validate and store one teleop command; the timer publishes it."""
+        """Validate and store one teleop command; the timer publishes it.
+
+        A per-tab sequence number makes late requests harmless: a command older
+        than the last accepted one for the same client is reported as stale with
+        HTTP 200 so the browser never treats it as a transport error.
+        """
         command = self.teleop.apply_command(payload)
+        if command is None:
+            response = success_response("stale teleop command ignored", self.now_sec())
+            response["stale"] = True
+            return response
         response = success_response("teleop command accepted", self.now_sec())
+        response["stale"] = False
         response["teleop"] = command
         return response
 
@@ -1482,8 +1492,19 @@ class WebControlNode(Node):
         self.publish_teleop_twist(command)
 
     def cleanup_teleop(self) -> None:
-        """Publish exactly one zero Twist before the node shuts down."""
-        self.publish_teleop_twist(self.teleop.stop())
+        """Publish exactly one zero Twist before the node shuts down.
+
+        ``stop`` is terminal, so a second cleanup is a no-op.  A failing
+        ``/cmd_vel`` publish is logged rather than raised so ``destroy_node``
+        can still tear down the rest of the node.
+        """
+        command = self.teleop.stop()
+        if command is None:
+            return
+        try:
+            self.publish_teleop_twist(command)
+        except Exception as exc:
+            self.get_logger().error(f"failed to publish teleop stop command: {exc}")
 
     def pause_navigation(self) -> dict[str, Any]:
         map_name = self.map_selection.load()
