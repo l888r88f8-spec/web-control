@@ -1127,6 +1127,7 @@ const teleop = {
   steering: 0,
   lastSentAt: -Infinity,
   sendTimer: null,
+  layoutMode: false,
 };
 
 function joystickAxes(offsetX, offsetY, radius) {
@@ -1254,6 +1255,7 @@ function sendTeleopKeepaliveStop() {
 }
 
 async function joystickPointerDown(event) {
+  if (teleop.layoutMode) return;
   if (teleop.pointerId !== null) return;
   event.preventDefault();
   event.stopPropagation();
@@ -1328,6 +1330,344 @@ async function setMappingJoystickVisible(visible) {
 }
 // --- End mapping joystick
 
+// --- Joystick layout
+const JOYSTICK_MIN_SIZE = 140;
+const JOYSTICK_MAX_SIZE = 260;
+const JOYSTICK_DEFAULT_SIZE = 180;
+const JOYSTICK_DEFAULT_X_RATIO = 0.05;
+const JOYSTICK_DEFAULT_Y_RATIO = 0.75;
+const JOYSTICK_VIEWPORT_MARGIN = 12;
+const HUD_CORNER_MARGIN = 12;
+
+const joystickLayout = {
+  size: JOYSTICK_DEFAULT_SIZE,
+  xRatio: JOYSTICK_DEFAULT_X_RATIO,
+  yRatio: JOYSTICK_DEFAULT_Y_RATIO,
+  mode: false,
+  gesture: null,
+  saveError: null,
+};
+
+function clampNumber(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function finiteNumberOr(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function clampedJoystickSize(value) {
+  return clampNumber(value, JOYSTICK_MIN_SIZE, JOYSTICK_MAX_SIZE);
+}
+
+function joystickViewport() {
+  return document.getElementById("view3d");
+}
+
+function joystickContainer() {
+  return document.getElementById("mappingJoystick");
+}
+
+function applyJoystickSize() {
+  const joystick = joystickContainer();
+  if (!joystick) return;
+  joystick.style.setProperty("--joystick-size", `${joystickLayout.size}px`);
+}
+
+function joystickBounds(width, height, viewportWidth, viewportHeight) {
+  return {
+    maxLeft: Math.max(
+      JOYSTICK_VIEWPORT_MARGIN,
+      viewportWidth - width - JOYSTICK_VIEWPORT_MARGIN,
+    ),
+    maxTop: Math.max(
+      JOYSTICK_VIEWPORT_MARGIN,
+      viewportHeight - height - JOYSTICK_VIEWPORT_MARGIN,
+    ),
+  };
+}
+
+function applyJoystickLayout() {
+  const joystick = joystickContainer();
+  const viewport = joystickViewport();
+  applyJoystickSize();
+  if (!joystick || !viewport) return;
+  const viewportWidth = viewport.clientWidth || 0;
+  const viewportHeight = viewport.clientHeight || 0;
+  if (!viewportWidth || !viewportHeight) {
+    updateHudPlacement();
+    return;
+  }
+  const width = joystick.offsetWidth || 0;
+  const height = joystick.offsetHeight || 0;
+  const bounds = joystickBounds(width, height, viewportWidth, viewportHeight);
+  const left = clampNumber(
+    joystickLayout.xRatio * viewportWidth - width / 2,
+    JOYSTICK_VIEWPORT_MARGIN,
+    bounds.maxLeft,
+  );
+  const top = clampNumber(
+    joystickLayout.yRatio * viewportHeight - height / 2,
+    JOYSTICK_VIEWPORT_MARGIN,
+    bounds.maxTop,
+  );
+  joystick.style.left = `${left}px`;
+  joystick.style.top = `${top}px`;
+  updateHudPlacement();
+}
+
+function joystickRatiosFromPosition(left, top, width, height, viewport) {
+  const viewportWidth = Math.max(1, viewport.clientWidth || 1);
+  const viewportHeight = Math.max(1, viewport.clientHeight || 1);
+  return {
+    xRatio: clampNumber((left + width / 2) / viewportWidth, 0, 1),
+    yRatio: clampNumber((top + height / 2) / viewportHeight, 0, 1),
+  };
+}
+
+function beginJoystickMove(event) {
+  if (!joystickLayout.mode || joystickLayout.gesture) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const joystick = joystickContainer();
+  const viewport = joystickViewport();
+  if (!joystick || !viewport) return;
+  const joystickRect = joystick.getBoundingClientRect();
+  const viewportRect = viewport.getBoundingClientRect();
+  joystickLayout.gesture = {
+    kind: "move",
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    left: joystickRect.left - viewportRect.left,
+    top: joystickRect.top - viewportRect.top,
+    width: joystick.offsetWidth || 0,
+    height: joystick.offsetHeight || 0,
+  };
+  const handle = event.currentTarget;
+  if (handle && typeof handle.setPointerCapture === "function") {
+    handle.setPointerCapture(event.pointerId);
+  }
+}
+
+function moveJoystickGesture(event) {
+  const gesture = joystickLayout.gesture;
+  if (!gesture || gesture.kind !== "move" || event.pointerId !== gesture.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const joystick = joystickContainer();
+  const viewport = joystickViewport();
+  if (!joystick || !viewport) return;
+  const viewportWidth = viewport.clientWidth || 0;
+  const viewportHeight = viewport.clientHeight || 0;
+  const bounds = joystickBounds(gesture.width, gesture.height, viewportWidth, viewportHeight);
+  const left = clampNumber(
+    gesture.left + (event.clientX - gesture.startX),
+    JOYSTICK_VIEWPORT_MARGIN,
+    bounds.maxLeft,
+  );
+  const top = clampNumber(
+    gesture.top + (event.clientY - gesture.startY),
+    JOYSTICK_VIEWPORT_MARGIN,
+    bounds.maxTop,
+  );
+  joystick.style.left = `${left}px`;
+  joystick.style.top = `${top}px`;
+  const ratios = joystickRatiosFromPosition(
+    left,
+    top,
+    gesture.width,
+    gesture.height,
+    viewport,
+  );
+  joystickLayout.xRatio = ratios.xRatio;
+  joystickLayout.yRatio = ratios.yRatio;
+  updateHudPlacement();
+}
+
+function beginJoystickResize(event) {
+  if (!joystickLayout.mode || joystickLayout.gesture) return;
+  event.preventDefault();
+  event.stopPropagation();
+  joystickLayout.gesture = {
+    kind: "resize",
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    startSize: joystickLayout.size,
+  };
+  const handle = event.currentTarget;
+  if (handle && typeof handle.setPointerCapture === "function") {
+    handle.setPointerCapture(event.pointerId);
+  }
+}
+
+function resizeJoystickGesture(event) {
+  const gesture = joystickLayout.gesture;
+  if (!gesture || gesture.kind !== "resize" || event.pointerId !== gesture.pointerId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const delta = event.clientX - gesture.startX + (event.clientY - gesture.startY);
+  joystickLayout.size = clampedJoystickSize(gesture.startSize + delta);
+  applyJoystickLayout();
+}
+
+async function finishJoystickGesture(event) {
+  const gesture = joystickLayout.gesture;
+  if (!gesture) return;
+  if (event && event.pointerId !== undefined && event.pointerId !== gesture.pointerId) return;
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  joystickLayout.gesture = null;
+  await persistJoystickPreferences();
+}
+
+function renderJoystickSettingsError() {
+  const element = document.getElementById("joystickSettingsError");
+  if (!element) return;
+  if (joystickLayout.saveError) {
+    element.hidden = false;
+    element.textContent = `Save failed: ${joystickLayout.saveError}`;
+  } else {
+    element.hidden = true;
+    element.textContent = "";
+  }
+}
+
+function setJoystickHandleAttributes() {
+  const settings = document.getElementById("joystickSettings");
+  if (settings) settings.setAttribute("aria-pressed", String(joystickLayout.mode));
+  const joystick = joystickContainer();
+  if (joystick) joystick.classList.toggle("layout-mode", joystickLayout.mode);
+}
+
+async function enterJoystickLayout() {
+  if (joystickLayout.mode) return;
+  teleop.layoutMode = true;
+  await stopTeleop("settings");
+  joystickLayout.mode = true;
+  joystickLayout.saveError = null;
+  setJoystickHandleAttributes();
+  renderJoystickSettingsError();
+  applyJoystickLayout();
+}
+
+function exitJoystickLayout() {
+  if (!joystickLayout.mode && !teleop.layoutMode) return;
+  teleop.layoutMode = false;
+  joystickLayout.mode = false;
+  joystickLayout.gesture = null;
+  setJoystickHandleAttributes();
+  renderJoystickSettingsError();
+  applyJoystickLayout();
+}
+
+async function persistJoystickPreferences() {
+  try {
+    const data = await postJson("/api/ui/preferences", {
+      size: joystickLayout.size,
+      x_ratio: joystickLayout.xRatio,
+      y_ratio: joystickLayout.yRatio,
+    });
+    const saved = data && data.joystick ? data.joystick : null;
+    if (saved) {
+      joystickLayout.size = clampedJoystickSize(
+        finiteNumberOr(saved.size, joystickLayout.size),
+      );
+      joystickLayout.xRatio = clampNumber(
+        finiteNumberOr(saved.x_ratio, joystickLayout.xRatio),
+        0,
+        1,
+      );
+      joystickLayout.yRatio = clampNumber(
+        finiteNumberOr(saved.y_ratio, joystickLayout.yRatio),
+        0,
+        1,
+      );
+    }
+    joystickLayout.saveError = null;
+    renderJoystickSettingsError();
+    applyJoystickLayout();
+    return true;
+  } catch (error) {
+    joystickLayout.saveError = error.message;
+    renderJoystickSettingsError();
+    applyJoystickLayout();
+    return false;
+  }
+}
+
+async function refreshJoystickPreferences() {
+  try {
+    const data = await getJson("/api/ui/preferences");
+    const saved = data && data.joystick ? data.joystick : null;
+    if (saved) {
+      joystickLayout.size = clampedJoystickSize(
+        finiteNumberOr(saved.size, JOYSTICK_DEFAULT_SIZE),
+      );
+      joystickLayout.xRatio = clampNumber(
+        finiteNumberOr(saved.x_ratio, JOYSTICK_DEFAULT_X_RATIO),
+        0,
+        1,
+      );
+      joystickLayout.yRatio = clampNumber(
+        finiteNumberOr(saved.y_ratio, JOYSTICK_DEFAULT_Y_RATIO),
+        0,
+        1,
+      );
+    }
+  } catch (_error) {
+    // Keep the defaults already in joystickLayout when the request fails.
+  }
+  applyJoystickLayout();
+}
+
+function overlapArea(first, second) {
+  const width = Math.max(
+    0,
+    Math.min(first.right, second.right) - Math.max(first.left, second.left),
+  );
+  const height = Math.max(
+    0,
+    Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top),
+  );
+  return width * height;
+}
+
+function updateHudPlacement() {
+  const stage = document.querySelector(".stage");
+  const hud = document.getElementById("hud");
+  const joystick = joystickContainer();
+  if (!stage || !hud) return;
+  if (state.view !== "mapping" || !joystick || joystick.hidden) {
+    stage.classList.remove("hud-lower-right");
+    return;
+  }
+  const stageRect = stage.getBoundingClientRect();
+  const joystickRect = joystick.getBoundingClientRect();
+  const width = hud.offsetWidth || 0;
+  const height = hud.offsetHeight || 0;
+  const lowerLeft = {
+    left: stageRect.left + HUD_CORNER_MARGIN,
+    right: stageRect.left + HUD_CORNER_MARGIN + width,
+    top: stageRect.bottom - HUD_CORNER_MARGIN - height,
+    bottom: stageRect.bottom - HUD_CORNER_MARGIN,
+  };
+  const lowerRight = {
+    left: stageRect.right - HUD_CORNER_MARGIN - width,
+    right: stageRect.right - HUD_CORNER_MARGIN,
+    top: stageRect.bottom - HUD_CORNER_MARGIN - height,
+    bottom: stageRect.bottom - HUD_CORNER_MARGIN,
+  };
+  const leftOverlap = overlapArea(joystickRect, lowerLeft);
+  const rightOverlap = overlapArea(joystickRect, lowerRight);
+  stage.classList.toggle("hud-lower-right", rightOverlap < leftOverlap);
+}
+// --- End joystick layout
+
 function maybeClearGoalFromActionStatus() {
   if (!state.activeGoal || !state.navigationAction || !state.navigationAction.data) return;
   const status = state.navigationAction.data.status;
@@ -1375,6 +1715,12 @@ function setTab(tab) {
   document.getElementById("viewSystem").classList.toggle("active", tab === "system");
   document.querySelector(".app").classList.toggle("system-mode", tab === "system");
   setMappingJoystickVisible(tab === "mapping");
+  if (tab === "mapping") {
+    applyJoystickLayout();
+  } else {
+    exitJoystickLayout();
+    updateHudPlacement();
+  }
   const panelName = tab === "system" ? "" : (tab === "mapping" ? "mapping" : "navigation");
   document.querySelectorAll("[data-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.panel === panelName);
@@ -1564,6 +1910,28 @@ function attachEvents() {
   window.addEventListener("pagehide", handlePageHide);
   document.addEventListener("visibilitychange", handleVisibilityChange);
 
+  const joystickMoveHandle = document.getElementById("joystickMoveHandle");
+  if (joystickMoveHandle) {
+    joystickMoveHandle.addEventListener("pointerdown", beginJoystickMove);
+    joystickMoveHandle.addEventListener("pointermove", moveJoystickGesture);
+    joystickMoveHandle.addEventListener("pointerup", finishJoystickGesture);
+    joystickMoveHandle.addEventListener("pointercancel", finishJoystickGesture);
+    joystickMoveHandle.addEventListener("lostpointercapture", finishJoystickGesture);
+  }
+  const joystickResizeHandle = document.getElementById("joystickResizeHandle");
+  if (joystickResizeHandle) {
+    joystickResizeHandle.addEventListener("pointerdown", beginJoystickResize);
+    joystickResizeHandle.addEventListener("pointermove", resizeJoystickGesture);
+    joystickResizeHandle.addEventListener("pointerup", finishJoystickGesture);
+    joystickResizeHandle.addEventListener("pointercancel", finishJoystickGesture);
+    joystickResizeHandle.addEventListener("lostpointercapture", finishJoystickGesture);
+  }
+  const joystickSettings = document.getElementById("joystickSettings");
+  if (joystickSettings) joystickSettings.addEventListener("click", enterJoystickLayout);
+  const joystickDone = document.getElementById("joystickDone");
+  if (joystickDone) joystickDone.addEventListener("click", exitJoystickLayout);
+  window.addEventListener("resize", applyJoystickLayout);
+
   mapCanvas3d.addEventListener("contextmenu", (event) => event.preventDefault());
   mapCanvas3d.addEventListener("wheel", (event) => {
     event.preventDefault();
@@ -1658,6 +2026,7 @@ function start() {
   pollMappingState();
   pollPose();
   refreshMaps();
+  refreshJoystickPreferences();
   setInterval(pollState, 1000);
   setInterval(pollMappingState, 1000);
   setInterval(pollPose, 100);

@@ -5305,7 +5305,11 @@ def test_mapping_joystick_is_a_mapping_only_sibling_overlay():
     assert 'setMappingJoystickVisible(tab === "mapping")' in app_js
     assert ".joystick {" in styles_css
     assert "position: absolute;" in styles_css
-    assert ".stage.mapping-active .hud" in styles_css
+    assert "--joystick-size" in styles_css
+    assert ".stage.hud-lower-right .hud" in styles_css
+    assert 'id="joystickSettings"' in viewport
+    assert 'id="joystickMoveHandle"' in viewport
+    assert 'id="joystickResizeHandle"' in viewport
 
 
 _MAPPING_JOYSTICK_NODE_HARNESS = r"""
@@ -5623,3 +5627,288 @@ def test_mapping_joystick_pointer_lifecycle_and_throttling_execute_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "mapping joystick ok" in completed.stdout
+
+
+def test_mapping_joystick_exposes_adjustable_layout_controls():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    assert 'id="joystickMoveHandle"' in index_html
+    assert 'id="joystickResizeHandle"' in index_html
+    assert 'id="joystickSettings"' in index_html
+    assert 'id="joystickDone"' in index_html
+    assert 'id="joystickSettingsError"' in index_html
+    assert 'aria-label="Joystick settings"' in index_html
+
+    assert "--joystick-size" in styles_css
+    assert ".joystick.layout-mode" in styles_css
+    assert ".stage.hud-lower-right .hud" in styles_css
+    assert "function applyJoystickLayout()" in app_js
+    assert "function clampedJoystickSize(value)" in app_js
+    assert "function updateHudPlacement()" in app_js
+    assert "function enterJoystickLayout()" in app_js
+    assert "function exitJoystickLayout()" in app_js
+    assert 'getJson("/api/ui/preferences")' in app_js
+    assert 'postJson("/api/ui/preferences"' in app_js
+    assert "teleop.layoutMode" in app_js
+
+
+_JOYSTICK_LAYOUT_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const startA = source.indexOf("// --- Mapping joystick");
+const endA = source.indexOf("// --- End mapping joystick");
+const startB = source.indexOf("// --- Joystick layout");
+const endB = source.indexOf("// --- End joystick layout");
+if (startA < 0 || endA < 0 || startB < 0 || endB < 0) {
+  throw new Error("joystick layout block not found");
+}
+const block = source.slice(startA, endA) + "\n" + source.slice(startB, endB);
+
+function makeElement(id) {
+  const classes = new Set();
+  return {
+    id,
+    hidden: false,
+    textContent: "",
+    offsetWidth: 0,
+    offsetHeight: 0,
+    captured: [],
+    attributes: {},
+    style: {
+      left: "0px",
+      top: "0px",
+      values: {},
+      setProperty(name, value) { this.values[name] = value; },
+    },
+    classList: {
+      toggle(name, on) {
+        if (on === undefined) {
+          if (classes.has(name)) classes.delete(name);
+          else classes.add(name);
+        } else if (on) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+      },
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    setPointerCapture(pointerId) { this.captured.push(pointerId); },
+    addEventListener() {},
+    getBoundingClientRect() {
+      const left = Number.parseFloat(this.style.left) || 0;
+      const top = Number.parseFloat(this.style.top) || 0;
+      const width = this.offsetWidth || 0;
+      const height = this.offsetHeight || 0;
+      return { left, top, right: left + width, bottom: top + height, width, height };
+    },
+  };
+}
+
+const elements = {
+  view3d: makeElement("view3d"),
+  mappingJoystick: makeElement("mappingJoystick"),
+  joystickBase: makeElement("joystickBase"),
+  joystickKnob: makeElement("joystickKnob"),
+  joystickStatus: makeElement("joystickStatus"),
+  joystickMoveHandle: makeElement("joystickMoveHandle"),
+  joystickResizeHandle: makeElement("joystickResizeHandle"),
+  joystickSettings: makeElement("joystickSettings"),
+  joystickDone: makeElement("joystickDone"),
+  joystickSettingsError: makeElement("joystickSettingsError"),
+  hud: makeElement("hud"),
+};
+elements.view3d.clientWidth = 400;
+elements.view3d.clientHeight = 300;
+elements.view3d.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
+elements.mappingJoystick.offsetWidth = 100;
+elements.mappingJoystick.offsetHeight = 140;
+elements.joystickBase.offsetWidth = 100;
+elements.joystickBase.offsetHeight = 100;
+elements.hud.offsetWidth = 60;
+elements.hud.offsetHeight = 20;
+
+const stage = makeElement("stage");
+stage.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
+
+global.state = { view: "mapping" };
+global.document = {
+  hidden: false,
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) { return selector === ".stage" ? stage : null; },
+  addEventListener() {},
+};
+global.window = {
+  addEventListener() {},
+  setInterval() { return 1; },
+  clearInterval() {},
+};
+global.viewerSessionId = () => "tab-session";
+
+const teleopPosts = [];
+const uiPosts = [];
+let failUiSave = false;
+global.postJson = async (url, payload) => {
+  if (url === "/api/ui/preferences") {
+    if (failUiSave) throw new Error("network down");
+    uiPosts.push(payload);
+    return { ok: true, joystick: payload };
+  }
+  teleopPosts.push({ url, payload });
+  const active = payload.throttle !== 0 || payload.steering !== 0;
+  return { ok: true, teleop: { active } };
+};
+global.getJson = async () => ({
+  ok: true,
+  joystick: { size: 220, x_ratio: 0.25, y_ratio: 0.5 },
+});
+global.fetchWithTimeout = async () => ({ ok: true });
+
+// Run the two blocks in an isolated function scope so their declarations do
+// not leak into this harness and clash with the names destructured below.
+const joystickApi = new Function(block + `
+return {
+  teleop, joystickLayout, refreshJoystickPreferences, joystickPointerDown,
+  enterJoystickLayout, exitJoystickLayout, beginJoystickMove, moveJoystickGesture,
+  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
+  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
+};`)();
+const {
+  teleop, joystickLayout, refreshJoystickPreferences, joystickPointerDown,
+  enterJoystickLayout, exitJoystickLayout, beginJoystickMove, moveJoystickGesture,
+  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
+  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
+} = joystickApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+function makeEvent(pointerId, clientX, clientY, currentTarget) {
+  return {
+    pointerId,
+    pointerType: "mouse",
+    clientX,
+    clientY,
+    currentTarget: currentTarget || elements.joystickBase,
+    preventDefault() {},
+    stopPropagation() {},
+  };
+}
+
+(async () => {
+  await refreshJoystickPreferences();
+  expect(joystickLayout.size === 220, "preferences size applied");
+  expect(joystickLayout.xRatio === 0.25, "preferences x ratio applied");
+  expect(joystickLayout.yRatio === 0.5, "preferences y ratio applied");
+  expect(
+    elements.mappingJoystick.style.values["--joystick-size"] === "220px",
+    "size css variable applied",
+  );
+
+  await joystickPointerDown(makeEvent(1, 30, 30));
+  expect(teleop.active === true, "drive gesture active before layout mode");
+  const teleopBeforeLayout = teleopPosts.length;
+
+  await enterJoystickLayout();
+  expect(teleop.layoutMode === true, "layout mode disables drive");
+  expect(joystickLayout.mode === true, "layout mode state set");
+  expect(elements.mappingJoystick.classList.contains("layout-mode"), "layout class applied");
+  expect(teleopPosts.length === teleopBeforeLayout + 1, "entering layout posts one stop");
+  expect(teleopPosts[teleopPosts.length - 1].payload.throttle === 0, "layout stop is zero throttle");
+  expect(teleopPosts[teleopPosts.length - 1].payload.steering === 0, "layout stop is zero steering");
+
+  const teleopAfterLayout = teleopPosts.length;
+  await joystickPointerDown(makeEvent(2, 30, 30));
+  expect(teleopPosts.length === teleopAfterLayout, "drive gesture disabled in layout mode");
+  expect(teleop.pointerId === null, "disabled gesture does not capture the pointer");
+
+  const uiBeforeResize = uiPosts.length;
+  beginJoystickResize(makeEvent(3, 0, 0, elements.joystickResizeHandle));
+  resizeJoystickGesture(makeEvent(3, 500, 500, elements.joystickResizeHandle));
+  expect(joystickLayout.size === 260, "resize clamps to max");
+  resizeJoystickGesture(makeEvent(3, -500, -500, elements.joystickResizeHandle));
+  expect(joystickLayout.size === 140, "resize clamps to min");
+  expect(uiPosts.length === uiBeforeResize, "resize preview does not write");
+  await finishJoystickGesture(makeEvent(3, -500, -500, elements.joystickResizeHandle));
+  expect(uiPosts.length === uiBeforeResize + 1, "resize release writes once");
+  expect(uiPosts[uiPosts.length - 1].size === 140, "resize write carries the clamped size");
+
+  const uiBeforeMove = uiPosts.length;
+  beginJoystickMove(makeEvent(4, 0, 0, elements.joystickMoveHandle));
+  moveJoystickGesture(makeEvent(4, -9999, -9999, elements.joystickMoveHandle));
+  expect(
+    Number.parseFloat(elements.mappingJoystick.style.left) === JOYSTICK_VIEWPORT_MARGIN,
+    "move clamps the left edge",
+  );
+  expect(
+    Number.parseFloat(elements.mappingJoystick.style.top) === JOYSTICK_VIEWPORT_MARGIN,
+    "move clamps the top edge",
+  );
+  moveJoystickGesture(makeEvent(4, 9999, 9999, elements.joystickMoveHandle));
+  expect(
+    Number.parseFloat(elements.mappingJoystick.style.left) <= 400 - 100 - JOYSTICK_VIEWPORT_MARGIN,
+    "move clamps the right edge",
+  );
+  expect(
+    Number.parseFloat(elements.mappingJoystick.style.top) <= 300 - 140 - JOYSTICK_VIEWPORT_MARGIN,
+    "move clamps the bottom edge",
+  );
+  expect(uiPosts.length === uiBeforeMove, "move preview does not write");
+  await finishJoystickGesture(makeEvent(4, 9999, 9999, elements.joystickMoveHandle));
+  expect(uiPosts.length === uiBeforeMove + 1, "move release writes once");
+  const savedPosition = uiPosts[uiPosts.length - 1];
+  expect(savedPosition.x_ratio >= 0 && savedPosition.x_ratio <= 1, "move x ratio in range");
+  expect(savedPosition.y_ratio >= 0 && savedPosition.y_ratio <= 1, "move y ratio in range");
+
+  joystickLayout.xRatio = 0;
+  joystickLayout.yRatio = 1;
+  applyJoystickLayout();
+  expect(stage.classList.contains("hud-lower-right"), "HUD avoids the lower-left joystick");
+  joystickLayout.xRatio = 1;
+  joystickLayout.yRatio = 1;
+  applyJoystickLayout();
+  expect(!stage.classList.contains("hud-lower-right"), "HUD returns to the lower-left");
+
+  failUiSave = true;
+  beginJoystickResize(makeEvent(5, 0, 0, elements.joystickResizeHandle));
+  resizeJoystickGesture(makeEvent(5, 20, 20, elements.joystickResizeHandle));
+  await finishJoystickGesture(makeEvent(5, 20, 20, elements.joystickResizeHandle));
+  expect(joystickLayout.mode === true, "failed save keeps layout mode");
+  expect(
+    typeof joystickLayout.saveError === "string" && joystickLayout.saveError.length > 0,
+    "failed save records an error",
+  );
+  expect(elements.joystickSettingsError.hidden === false, "failed save shows the error");
+  failUiSave = false;
+  beginJoystickResize(makeEvent(6, 0, 0, elements.joystickResizeHandle));
+  resizeJoystickGesture(makeEvent(6, 0, 0, elements.joystickResizeHandle));
+  await finishJoystickGesture(makeEvent(6, 0, 0, elements.joystickResizeHandle));
+  expect(joystickLayout.saveError === null, "retry clears the error");
+  expect(elements.joystickSettingsError.hidden === true, "retry hides the error");
+
+  exitJoystickLayout();
+  expect(teleop.layoutMode === false, "exit restores drive control");
+  expect(joystickLayout.mode === false, "exit clears layout mode");
+  expect(!elements.mappingJoystick.classList.contains("layout-mode"), "exit removes the layout class");
+
+  console.log("joystick layout ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_mapping_joystick_layout_mode_persists_and_clamps_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _JOYSTICK_LAYOUT_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "joystick layout ok" in completed.stdout
