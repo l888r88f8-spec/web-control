@@ -2246,7 +2246,7 @@ def test_top_tabs_use_sliding_segmented_selector():
     assert 'id="viewTabs"' in index_html
     assert 'class="tabs sliding-tabs"' in index_html
     assert 'data-active="3d"' in index_html
-    assert 'document.getElementById("viewTabs").dataset.active = tab;' in app_js
+    assert "viewTabs.dataset.active = tab;" in app_js
     assert ".sliding-tabs::before" in styles_css
     assert '.sliding-tabs[data-active="system"] {' in styles_css
     assert "--tabs-index: 1;" in styles_css
