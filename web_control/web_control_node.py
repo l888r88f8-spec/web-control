@@ -973,7 +973,11 @@ class WebControlNode(Node):
 
     def path_callback(self, topic: str, msg: PathMsg) -> None:
         points = [
-            [pose.pose.position.x, pose.pose.position.y]
+            [
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.position.z,
+            ]
             for pose in msg.poses
         ]
         with self.lock:
@@ -986,7 +990,11 @@ class WebControlNode(Node):
 
     def mapping_path_callback(self, msg: PathMsg) -> None:
         points = [
-            [pose.pose.position.x, pose.pose.position.y]
+            [
+                pose.pose.position.x,
+                pose.pose.position.y,
+                pose.pose.position.z,
+            ]
             for pose in msg.poses
         ]
         with self.lock:

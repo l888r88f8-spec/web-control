@@ -12,7 +12,7 @@ import urllib.request
 import yaml
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 from web_control import core, web_control_node
 from web_control.core import (
@@ -4549,3 +4549,96 @@ def test_readme_documents_navigation_pause_and_cancel_service():
     assert "Resume Navigation" in readme
     assert "paused_navigation.json" in readme
     assert "cancel_goal_service" in readme
+
+
+class _PathMessageStub:
+    def __init__(self, points, frame_id="map"):
+        self.header = SimpleNamespace(frame_id=frame_id)
+        self.poses = [
+            SimpleNamespace(
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=x, y=y, z=z)
+                )
+            )
+            for x, y, z in points
+        ]
+
+
+def _path_callback_node():
+    class _PathCallbackNode:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.paths = {"nav": SourceCache("nav", 2.0)}
+            self.mapping_path = SourceCache("mapping_path", 2.0)
+
+        def now_sec(self):
+            return 10.0
+
+    node = _PathCallbackNode()
+    node.path_callback = MethodType(
+        web_control_node.WebControlNode.path_callback, node
+    )
+    node.mapping_path_callback = MethodType(
+        web_control_node.WebControlNode.mapping_path_callback, node
+    )
+    return node
+
+
+def test_path_callbacks_preserve_z():
+    node = _path_callback_node()
+
+    node.path_callback(
+        "nav", _PathMessageStub([(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)])
+    )
+    node.mapping_path_callback(_PathMessageStub([(7.0, 8.0, 9.0)]))
+
+    assert node.paths["nav"].data == {"points": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]}
+    assert node.mapping_path.data == {"points": [[7.0, 8.0, 9.0]]}
+
+
+_PATH_HEIGHT_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+function jsFunctionBody(signature) {
+  const start = source.indexOf(signature);
+  if (start < 0) throw new Error("missing function: " + signature);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = brace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error("unterminated function: " + signature);
+}
+function rosToThree(x, y, z) { return { x, y, z }; }
+eval(jsFunctionBody("function pathPointToThree"));
+const upper = pathPointToThree([1, 2, 3]);
+if (Math.abs(upper.z - 3.08) > 1e-9) throw new Error("3D path height lost");
+const legacy = pathPointToThree([1, 2]);
+if (Math.abs(legacy.z - 0.08) > 1e-9) throw new Error("legacy path fallback wrong");
+console.log("frontend path height ok");
+"""
+
+
+def test_frontend_path_height_uses_ros_z():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js_path = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    app_js = app_js_path.read_text(encoding="utf-8")
+    completed = subprocess.run(
+        ["node", "-e", _PATH_HEIGHT_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js_path)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "frontend path height ok" in completed.stdout
+
+    assert "pathPointToThree(point)" in _js_function_body(app_js, "function updatePaths")
+    assert "pathPointToThree(point)" in _js_function_body(
+        app_js, "function updateMappingPath"
+    )

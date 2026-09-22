@@ -374,13 +374,18 @@ function updateMappingVehicleMarker() {
   mappingVehicleGroup.add(makeArrowMarker(state.mappingOdom.pose, 0x32d74b));
 }
 
+function pathPointToThree(point) {
+  const z = point.length > 2 && Number.isFinite(point[2]) ? point[2] : 0;
+  return rosToThree(point[0], point[1], z + 0.08);
+}
+
 function updatePaths() {
   clearGroup(pathGroup);
   if (!state.showPaths) return;
   if (state.hideCompletedPaths) return;
   Object.entries(state.paths).forEach(([topic, path]) => {
     if (!path || path.length < 2) return;
-    const points = path.map((point) => rosToThree(point[0], point[1], 0.08));
+    const points = path.map((point) => pathPointToThree(point));
     const pathCurve = new THREE.CatmullRomCurve3(points);
     const geometry = new THREE.TubeGeometry(pathCurve, Math.max(2, points.length * 2), 0.16, 8, false);
     const line = new THREE.Mesh(
@@ -395,7 +400,7 @@ function updatePaths() {
 function updateMappingPath() {
   clearGroup(mappingPathGroup);
   if (!state.showMappingPath || !state.mappingPath || state.mappingPath.length < 2) return;
-  const points = state.mappingPath.map((point) => rosToThree(point[0], point[1], 0.08));
+  const points = state.mappingPath.map((point) => pathPointToThree(point));
   const pathCurve = new THREE.CatmullRomCurve3(points);
   const geometry = new THREE.TubeGeometry(pathCurve, Math.max(2, points.length * 2), 0.16, 8, false);
   const line = new THREE.Mesh(
