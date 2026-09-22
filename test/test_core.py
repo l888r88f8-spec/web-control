@@ -622,6 +622,8 @@ def test_navigation_readiness_owns_managed_process_toggles():
     )
     assert "Start Localization" in readiness
     assert "Start Navigation" in readiness
+    assert 'id="localizationProcessToggle"' in readiness
+    assert 'id="navigationProcessToggle"' in readiness
     assert 'data-start-target="localization"' not in terminals
     assert 'data-stop-target="localization"' not in terminals
     assert 'data-start-target="navigation"' not in terminals
@@ -639,7 +641,16 @@ def test_frontend_preserves_managed_endpoints_and_mapping_logs():
     assert "/api/managed/stop" in app_js
     assert 'id="mappingLogState"' in index_html
     assert 'id="mappingLogs"' in index_html
+    assert 'id="localizationLogState"' in index_html
+    assert 'id="localizationLogs"' in index_html
+    assert 'id="navigationLogState"' in index_html
+    assert 'id="navigationLogs"' in index_html
     assert 'updateTerminalLog("mapping", data.logs && data.logs.mapping);' in app_js
+
+    terminal_start = app_js.index("function updateTerminalLog(")
+    terminal_end = app_js.index("function managedProcessRunning(", terminal_start)
+    update_terminal = app_js[terminal_start:terminal_end]
+    assert "updateManagedProcessButton(target);" in update_terminal
 
 
 _MANAGED_PROCESS_NODE_HARNESS = r"""
@@ -695,21 +706,30 @@ const state = {
   managedProcessPending: { localization: null, navigation: null },
 };
 
+let mapSelectionLockCalls = 0;
+let mapSelectionLockSawPending = null;
+function updateMapSelectionLock() {
+  mapSelectionLockCalls += 1;
+  mapSelectionLockSawPending = state.managedProcessPending.navigation;
+}
+
 const startCalls = {};
 const stopCalls = {};
 let resolveNavigationStart = null;
+let navigationStopResult = true;
 
 function startManagedTarget(target) {
   startCalls[target] = (startCalls[target] || 0) + 1;
   if (target === "navigation") {
     return new Promise((resolve) => { resolveNavigationStart = resolve; });
   }
-  return Promise.resolve();
+  return Promise.resolve(true);
 }
 
 function stopManagedTarget(target) {
   stopCalls[target] = (stopCalls[target] || 0) + 1;
-  return Promise.resolve();
+  if (target === "navigation") return Promise.resolve(navigationStopResult);
+  return Promise.resolve(true);
 }
 
 eval(jsFunctionBody("function managedProcessRunning")
@@ -727,24 +747,43 @@ expect(source.includes("[data-stop-target]"), "mapping stop selector missing");
   expect(localizationButton.textContent === "Start Localization", "initial localization label");
   expect(localizationButton.disabled === false, "initial localization enabled");
   expect(localizationButton.getAttribute("aria-pressed") === "false", "initial aria state");
+  expect(localizationButton.getAttribute("aria-busy") === "false", "initial aria-busy");
 
   state.localizationRunning = true;
   updateManagedProcessButton("localization");
   expect(localizationButton.textContent === "Stop Localization", "running localization label");
   expect(localizationButton.classList.contains("stop-log"), "running stop style");
+  state.localizationRunning = false;
 
   const pending = toggleManagedTarget("navigation");
   expect(navigationButton.disabled === true, "pending navigation disabled");
+  expect(navigationButton.textContent === "Starting Navigation...", "pending navigation label");
+  expect(navigationButton.getAttribute("aria-busy") === "true", "pending navigation aria-busy");
   toggleManagedTarget("navigation");
   expect(startCalls.navigation === 1, "duplicate navigation start blocked");
   expect(localizationButton.disabled === false, "localization remains independent");
-  resolveNavigationStart();
+  resolveNavigationStart(true);
   await pending;
+  expect(state.navigationRunning === true, "navigation running after start success");
+  expect(navigationButton.textContent === "Stop Navigation", "navigation stop label after start success");
+  expect(navigationButton.getAttribute("aria-pressed") === "true", "navigation aria-pressed after start success");
+  expect(navigationButton.getAttribute("aria-busy") === "false", "navigation aria-busy cleared after start success");
   expect(navigationButton.disabled === false, "navigation re-enabled after request");
+  expect(mapSelectionLockCalls === 1, "map selection lock resumes on start success");
+  expect(mapSelectionLockSawPending === "start", "map selection lock runs before pending clears");
 
-  state.navigationRunning = true;
   await toggleManagedTarget("navigation");
   expect(stopCalls.navigation === 1, "running navigation stops");
+  expect(state.navigationRunning === false, "navigation stopped after stop success");
+  expect(navigationButton.textContent === "Start Navigation", "navigation start label after stop success");
+  expect(navigationButton.getAttribute("aria-pressed") === "false", "navigation aria-pressed after stop success");
+
+  state.navigationRunning = true;
+  navigationStopResult = false;
+  await toggleManagedTarget("navigation");
+  expect(state.navigationRunning === true, "failed stop retains running state");
+  expect(navigationButton.textContent === "Stop Navigation", "failed stop retains stop label");
+  expect(navigationButton.getAttribute("aria-pressed") === "true", "failed stop retains aria-pressed");
   console.log("managed process toggles ok");
 })().catch((error) => { console.error(error); process.exit(1); });
 """
@@ -763,6 +802,96 @@ def test_frontend_managed_process_toggles_follow_running_and_pending_state():
     )
     assert completed.returncode == 0, completed.stderr
     assert "managed process toggles ok" in completed.stdout
+
+
+_FETCH_TIMEOUT_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+
+function jsFunctionBody(signature) {
+  const start = source.indexOf(signature);
+  if (start < 0) throw new Error("missing function: " + signature);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = brace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error("unterminated function: " + signature);
+}
+
+const FETCH_TIMEOUT_MS = 25;
+let fetchCalls = 0;
+global.fetch = (url, options) => {
+  fetchCalls += 1;
+  return new Promise((resolve, reject) => {
+    const signal = options && options.signal;
+    const fail = () => {
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (signal && signal.aborted) { fail(); return; }
+    if (signal && signal.addEventListener) signal.addEventListener("abort", fail, { once: true });
+  });
+};
+
+eval(jsFunctionBody("async function fetchWithTimeout"));
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+expect(source.includes("AbortController"), "AbortController missing from source");
+expect(source.includes('new Error("Request timed out.")'), "timeout error message missing");
+expect(source.includes("fetchWithTimeout"), "shared timeout helper missing");
+
+(async () => {
+  const started = Date.now();
+  let message = null;
+  try {
+    await fetchWithTimeout("/slow", {});
+  } catch (error) {
+    message = error.message;
+  }
+  expect(message === "Request timed out.", "timeout message was " + message);
+  expect(fetchCalls === 1, "timeout helper issued one fetch");
+  expect(Date.now() - started < 5000, "timeout helper did not resolve promptly");
+  console.log("fetch timeout ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_frontend_fetch_helpers_share_a_finite_timeout():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "const FETCH_TIMEOUT_MS = 15000;" in app_js
+    assert "fetchWithTimeout" in app_js
+
+    get_json_start = app_js.index("async function getJson(")
+    get_json_end = app_js.index("async function postJson(", get_json_start)
+    assert "fetchWithTimeout(" in app_js[get_json_start:get_json_end]
+
+    post_json_start = get_json_end
+    post_json_end = app_js.index("function viewerSessionId(", post_json_start)
+    assert "fetchWithTimeout(" in app_js[post_json_start:post_json_end]
+
+
+def test_frontend_fetch_timeout_rejects_hanging_request():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _FETCH_TIMEOUT_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "fetch timeout ok" in completed.stdout
 
 
 def test_terminal_logs_section_is_above_layers_section():

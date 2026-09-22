@@ -108,14 +108,29 @@ function usageLevel(value) {
   return "low";
 }
 
+const FETCH_TIMEOUT_MS = 15000;
+
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw new Error("Request timed out.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetchWithTimeout(url, { cache: "no-store" });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.json();
 }
 
 async function postJson(url, payload) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -918,11 +933,16 @@ function updateManagedProcessButton(target) {
 async function toggleManagedTarget(target) {
   if (state.managedProcessPending[target]) return;
   const running = managedProcessRunning(target);
+  const nextRunning = !running;
   state.managedProcessPending[target] = running ? "stop" : "start";
   updateManagedProcessButton(target);
   try {
-    if (running) await stopManagedTarget(target);
-    else await startManagedTarget(target);
+    const succeeded = running ? await stopManagedTarget(target) : await startManagedTarget(target);
+    if (succeeded) {
+      if (target === "localization") state.localizationRunning = nextRunning;
+      else state.navigationRunning = nextRunning;
+      updateMapSelectionLock();
+    }
   } finally {
     state.managedProcessPending[target] = null;
     updateManagedProcessButton(target);
@@ -1226,9 +1246,11 @@ async function stopManagedTarget(target) {
       clearNavigationLayers();
     }
     pollState();
-    pollLogs();
+    await pollLogs();
+    return true;
   } catch (error) {
     result.textContent = `Stop failed: ${error.message}`;
+    return false;
   }
 }
 
@@ -1237,11 +1259,13 @@ async function startManagedTarget(target) {
   try {
     const response = await postJson("/api/managed/start", { target });
     result.textContent = `${response.message} @ ${new Date(response.stamp * 1000).toLocaleTimeString()}`;
-    pollLogs();
+    await pollLogs();
+    return true;
   } catch (error) {
     result.textContent = `Start failed: ${error.message}`;
     // Revalidate the selection so a stale/unavailable map becomes visible.
     refreshMaps();
+    return false;
   }
 }
 
