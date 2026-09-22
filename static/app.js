@@ -1756,6 +1756,19 @@ function maybeClearGoalFromActionStatus() {
   }
 }
 
+const GLASS_DROP_FALLBACK_MS = 520;
+
+function markGlassDrop(element) {
+  if (!element) return;
+  element.classList.remove("glass-drop");
+  // One forced reflow restarts the keyframes when the same element is re-marked.
+  void element.offsetWidth;
+  element.classList.add("glass-drop");
+  const clear = () => element.classList.remove("glass-drop");
+  element.addEventListener("animationend", clear, { once: true });
+  window.setTimeout(clear, GLASS_DROP_FALLBACK_MS);
+}
+
 function setMode(mode) {
   const previousMode = state.mode;
   state.mode = mode;
@@ -1774,6 +1787,7 @@ function setMode(mode) {
   document.querySelectorAll(".mode").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === mode);
   });
+  if (previousMode !== mode) markGlassDrop(document.getElementById("modeSegment"));
   updatePublishPoseButton();
   updateTargetMarkers();
 }

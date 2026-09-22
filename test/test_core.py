@@ -1773,6 +1773,219 @@ def test_frontend_uses_ios_inspired_visual_theme():
     assert ".hud" in styles_css
 
 
+def test_glass_tokens_and_mode_classes():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    root = _css_rule_block(styles_css, ":root")
+    for token in (
+        "--scene-bg: #0b0f19;",
+        "--glass-drop-ms: 380ms;",
+        "--glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);",
+        "--layout-transition-ms: 260ms;",
+        "--focus-ring: 2px;",
+        "--touch-target: 44px;",
+    ):
+        assert token in root
+    assert "--ios-spring: cubic-bezier(0.2, 0.85, 0.25, 1.08)" in root
+    assert "--ios-contained-spring: cubic-bezier(0.2, 0.85, 0.25, 1)" in root
+    defs = _css_rule_block(styles_css, ".glass-defs")
+    assert "position: absolute;" in defs
+    assert "width: 0;" in defs
+    assert "height: 0;" in defs
+    assert "overflow: hidden;" in defs
+    assert "pointer-events: none;" in defs
+    assert "display: none;" not in defs
+
+
+def test_glass_baseline_reset_removes_stacked_blur():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    for selector in (
+        ".tabs",
+        ".sliding-tabs::before",
+        ".segmented::before",
+        ".system-card",
+        ".cpu-core-panel",
+        ".hud",
+        ".joystick-base",
+        ".panel",
+        ".sidebar-toggle",
+        ".panel section",
+    ):
+        assert "backdrop-filter" not in _css_rule_block(styles_css, selector), selector
+    assert "filter: drop-shadow" not in styles_css
+    assert "will-change: transform, box-shadow, filter;" not in styles_css
+    assert "transition: transform 430ms var(--ios-spring)" not in styles_css
+    assert "transition: transform 430ms var(--ios-contained-spring)" not in styles_css
+
+
+def test_glass_full_tier_limits_displacement_to_three_decorative_surfaces():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    assert ".glass-full .sliding-tabs::before," in styles_css
+    assert ".glass-full .segmented::before," in styles_css
+    assert ".glass-full .sidebar-toggle-lens {" in styles_css
+    selector_start = styles_css.index(".glass-full .sliding-tabs::before,")
+    selector_end = styles_css.index("{", selector_start)
+    selectors = styles_css[selector_start:selector_end]
+    assert selectors.count(".glass-full") == 3
+    body = styles_css[selector_end : styles_css.index("}", selector_end)]
+    assert "backdrop-filter: url(#liquidDrop) saturate(1.4);" in body
+    assert "-webkit-backdrop-filter: url(#liquidDrop) saturate(1.4);" in body
+    lens = _css_rule_block(styles_css, ".sidebar-toggle-lens")
+    assert "position: absolute;" in lens
+    assert "inset: 0;" in lens
+    assert "border-radius: inherit;" in lens
+    assert "background: var(--glass);" in lens
+    assert "pointer-events: none;" in lens
+
+
+def test_glass_light_tier_is_single_layer():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    anchor = ":where(.glass-full, .glass-light) .panel,"
+    assert anchor in styles_css
+    start = styles_css.index(anchor)
+    end = styles_css.index("{", start)
+    selectors = styles_css[start:end]
+    assert selectors.count(":where(.glass-full, .glass-light)") == 6
+    assert ".panel section" not in selectors
+    body = styles_css[end : styles_css.index("}", end)]
+    assert "backdrop-filter: blur(22px) saturate(1.35);" in body
+    assert "-webkit-backdrop-filter: blur(22px) saturate(1.35);" in body
+
+
+def test_glass_off_tokens_are_opaque():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    block = _css_rule_block(styles_css, ".glass-off")
+    assert "--glass: rgba(255, 255, 255, 0.96);" in block
+    assert "--glass-strong: rgba(255, 255, 255, 0.98);" in block
+    assert "--panel-bg: rgba(255, 255, 255, 0.98);" in block
+    assert "--terminal-bg: rgba(255, 255, 255, 0.98);" in block
+    assert "@media (prefers-color-scheme: dark)" in styles_css
+    assert "--panel-bg: rgba(15, 17, 24, 0.98);" in styles_css
+    assert "--terminal-bg: rgba(5, 8, 12, 0.98);" in styles_css
+
+
+def test_glass_tier_selectors_exclude_webgl_text_and_safety_controls():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    full_start = styles_css.index(".glass-full .sliding-tabs::before,")
+    full_selectors = styles_css[full_start : styles_css.index("{", full_start)]
+    light_start = styles_css.index(":where(.glass-full, .glass-light) .panel,")
+    light_selectors = styles_css[light_start : styles_css.index("{", light_start)]
+    for selector in (
+        ".joystick-knob",
+        ".terminal",
+        ".terminal pre",
+        ".source",
+        "#navigationPrimary",
+        "#navigationClear",
+        "#publishPose",
+        "#localizationProcessToggle",
+        "#navigationProcessToggle",
+        ".start-log",
+        ".stop-log",
+        ".joystick-settings-button",
+        ".joystick-done-button",
+        "#confirmSaveMap",
+        "#cancelSaveMap",
+    ):
+        assert selector not in full_selectors, selector
+        assert selector not in light_selectors, selector
+
+
+def test_glass_focus_and_touch_targets():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    focus = _css_rule_block(styles_css, ":focus-visible")
+    assert "outline: var(--focus-ring) solid var(--ios-blue);" in focus
+    assert "outline-offset: 2px;" in focus
+    coarse_start = styles_css.index("@media (pointer: coarse)")
+    coarse = styles_css[coarse_start : styles_css.index("\n}", coarse_start)]
+    assert "min-height: var(--touch-target);" in coarse
+    assert "width: var(--touch-target);" in coarse
+    for selector in (
+        ".tab,",
+        ".mode,",
+        ".actions button,",
+        ".start-log,",
+        ".stop-log,",
+        ".sidebar-toggle,",
+        ".joystick-settings-button,",
+        ".joystick-done-button,",
+        ".map-picker button,",
+        ".save-map-dialog-actions button",
+    ):
+        assert selector in coarse, selector
+
+
+def test_glass_reduced_motion_and_transparency_fallbacks():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    motion_start = styles_css.index("@media (prefers-reduced-motion: reduce)")
+    motion = styles_css[motion_start : styles_css.index("\n}", motion_start)]
+    assert "--layout-transition-ms: 1ms;" in motion
+    assert "--glass-drop-ms: 1ms;" in motion
+    assert "animation: none;" in motion
+    assert "body::before," in motion
+    assert "body::after" in motion
+    assert ".system-meter-fill" in motion
+    assert "prefers-reduced-transparency" not in styles_css
+    assert ".glass-off {" in styles_css
+
+
+def test_glass_water_drop_motion():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)," in styles_css
+    assert "will-change: transform;" in styles_css
+    assert "will-change: transform, opacity;" in styles_css
+    assert "@keyframes glassDropScale" in styles_css
+    keyframes = styles_css[styles_css.index("@keyframes glassDropScale") :]
+    assert "scale: 0.94;" in keyframes
+    assert "scale: 1.035;" in keyframes
+    animation_start = styles_css.index(".sliding-tabs.glass-drop::before,")
+    assert ".segmented.glass-drop::before" in styles_css[
+        animation_start : styles_css.index("{", animation_start)
+    ]
+    animation_body = styles_css[
+        styles_css.index("{", animation_start) + 1 : styles_css.index("}", animation_start)
+    ]
+    assert "animation: glassDropScale var(--glass-drop-ms) var(--glass-drop-ease);" in animation_body
+    assert "filter" not in animation_body
+    drop_start = styles_css.index(".sliding-tabs::after,")
+    drop_body = styles_css[
+        styles_css.index("{", drop_start) + 1 : styles_css.index("}", drop_start)
+    ]
+    assert "transform: translate3d(calc(var(--tabs-index, var(--mode-index, 0)) * 100%), 0, 0) scale(0.4);" in drop_body
+    assert "opacity: 0;" in drop_body
+    assert "filter" not in drop_body
+    assert ".sliding-tabs.glass-drop::after," in styles_css
+    assert "opacity: 0.9;" in styles_css
+
+
+def test_glass_drop_class_is_timed_and_forced_reflowed():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "function markGlassDrop(element)" in app_js
+    assert "void element.offsetWidth;" in app_js
+    assert 'element.addEventListener("animationend", clear, { once: true });' in app_js
+    assert 'markGlassDrop(document.getElementById("modeSegment"));' in app_js
+    assert "const GLASS_DROP_FALLBACK_MS = 520;" in app_js
+
+
 def test_mode_control_uses_ios_sliding_segmented_selector():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -1840,10 +2053,12 @@ def test_sliding_selectors_use_transform_based_ios_spring_motion():
     ).read_text(encoding="utf-8")
 
     assert "--ios-spring: cubic-bezier(0.2, 0.85, 0.25, 1.08)" in styles_css
-    assert "will-change: transform, box-shadow, filter;" in styles_css
+    assert "--glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);" in styles_css
+    assert "will-change: transform;" in styles_css
+    assert "will-change: transform, box-shadow, filter;" not in styles_css
     assert "transform: translate3d(calc(var(--tabs-index, 0) * 100%), 0, 0)" in styles_css
     assert "transform: translate3d(calc(var(--mode-index, 0) * 100%), 0, 0)" in styles_css
-    assert "transition: transform 430ms var(--ios-spring)" in styles_css
+    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)" in styles_css
     assert '.sliding-tabs[data-active="system"] {' in styles_css
     assert '.segmented[data-active="goal"] {' in styles_css
     assert "transition: left 280ms" not in styles_css
@@ -1862,14 +2077,14 @@ def test_sliding_selectors_use_ios_26_liquid_glass_material():
     assert "--liquid-slider-noise" in styles_css
     assert "data:image/svg+xml" in styles_css
     assert "feTurbulence" in styles_css
-    assert "backdrop-filter: blur(18px) saturate(1.9) brightness(1.08);" in styles_css
-    assert "-webkit-backdrop-filter: blur(18px) saturate(1.9) brightness(1.08);" in styles_css
+    assert "backdrop-filter: url(#liquidDrop) saturate(1.4);" in styles_css
+    assert "-webkit-backdrop-filter: url(#liquidDrop) saturate(1.4);" in styles_css
     assert "var(--liquid-slider-noise)" in styles_css
     assert "background-blend-mode: soft-light" in styles_css
     assert "background-size: 80px 80px" in styles_css
     assert "radial-gradient(circle at 18% 0%, var(--liquid-slider-caustic), transparent 42%)" in styles_css
     assert "inset 0 1px 0 rgba(255, 255, 255, 0.72)" in styles_css
-    assert "filter: drop-shadow(0 10px 24px rgba(10, 132, 255, 0.18));" in styles_css
+    assert "filter: drop-shadow(0 10px 24px rgba(10, 132, 255, 0.18));" not in styles_css
 
 
 def test_top_tab_slider_uses_equal_width_segments():
@@ -1936,8 +2151,9 @@ def test_mode_slider_uses_contained_spring_to_stay_inside_track():
     segmented_before = styles_css[
         styles_css.index(".segmented::before") : styles_css.index(".segmented[data-active=\"initial\"]")
     ]
-    assert "transition: transform 430ms var(--ios-contained-spring)" in segmented_before
+    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)" in segmented_before
     assert "var(--ios-spring)" not in segmented_before
+    assert "var(--ios-contained-spring)" not in segmented_before
 
 
 def test_mode_slider_is_clipped_and_mode_text_is_centered():
@@ -3502,6 +3718,13 @@ def _frontend_sources():
         (static_dir / "app.js").read_text(encoding="utf-8"),
         (static_dir / "styles.css").read_text(encoding="utf-8"),
     )
+
+
+def _css_rule_block(styles_css, selector):
+    """Return one CSS rule body for an exact ``selector {`` match."""
+    start = styles_css.index(f"{selector} {{")
+    end = styles_css.index("}", start)
+    return styles_css[start:end]
 
 
 def _js_function_body(app_js, signature):
