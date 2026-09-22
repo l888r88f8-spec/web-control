@@ -173,11 +173,22 @@ async function heartbeatViewer() {
   }
 }
 
+let lastRenderWidth = 0;
+let lastRenderHeight = 0;
+
 function resizeAll() {
   const rect = mapCanvas3d.getBoundingClientRect();
-  renderer.setSize(Math.max(1, rect.width), Math.max(1, rect.height), false);
-  camera.aspect = Math.max(1, rect.width) / Math.max(1, rect.height);
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  if (width === lastRenderWidth && height === lastRenderHeight) {
+    return false;
+  }
+  lastRenderWidth = width;
+  lastRenderHeight = height;
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
   camera.updateProjectionMatrix();
+  return true;
 }
 
 function updateCamera() {
@@ -1794,31 +1805,41 @@ function observeMapStageResize() {
 // --- End sidebar collapse
 
 // --- Page transition state machine
-const LAYOUT_SETTLE_FALLBACK_MS = 420;
+const LAYOUT_SETTLE_FALLBACK_MS = 520;
 const LAYOUT_TRANSITION_PROPS = new Set(["grid-template-columns", "opacity", "transform"]);
 
 const pageTransition = {
   active: false,
   token: 0,
   pendingFlush: false,
-  fallbackId: null,
+  fallbackTimerId: null,
+  fallbackFrameId: null,
   resizeFrameId: null,
 };
+
+function cancelLayoutFallback() {
+  if (pageTransition.fallbackTimerId !== null) {
+    clearTimeout(pageTransition.fallbackTimerId);
+    pageTransition.fallbackTimerId = null;
+  }
+  if (pageTransition.fallbackFrameId !== null) {
+    cancelAnimationFrame(pageTransition.fallbackFrameId);
+    pageTransition.fallbackFrameId = null;
+  }
+}
 
 function beginLayoutTransition() {
   pageTransition.token += 1;
   const token = pageTransition.token;
   pageTransition.active = true;
   pageTransition.pendingFlush = true;
-  if (pageTransition.fallbackId !== null) {
-    clearTimeout(pageTransition.fallbackId);
-  }
+  cancelLayoutFallback();
   if (glassMotionReduced()) {
-    pageTransition.fallbackId = requestAnimationFrame(
+    pageTransition.fallbackFrameId = requestAnimationFrame(
       () => settleLayoutTransition(token),
     );
   } else {
-    pageTransition.fallbackId = setTimeout(
+    pageTransition.fallbackTimerId = setTimeout(
       () => settleLayoutTransition(token),
       LAYOUT_SETTLE_FALLBACK_MS,
     );
@@ -1828,11 +1849,9 @@ function beginLayoutTransition() {
 
 function settleLayoutTransition(token) {
   if (token !== pageTransition.token) return; // stale request
-  if (pageTransition.fallbackId !== null) {
-    cancelAnimationFrame(pageTransition.fallbackId);
-    clearTimeout(pageTransition.fallbackId);
-    pageTransition.fallbackId = null;
-  }
+  // Cancel only through the API that produced the handle: timeout and frame
+  // ids can numerically collide, so cross-cancelling would hit unrelated work.
+  cancelLayoutFallback();
   pageTransition.active = false;
   if (pageTransition.pendingFlush) {
     pageTransition.pendingFlush = false;

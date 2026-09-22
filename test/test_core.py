@@ -1714,6 +1714,41 @@ def test_frontend_mounts_viewports_and_uses_inert():
     assert 'panel.setAttribute("aria-hidden", String(!isActive));' in app_js
 
 
+def test_frontend_view_motion_css_contract():
+    styles_css = (
+        Path(__file__).resolve().parents[1] / "static" / "styles.css"
+    ).read_text(encoding="utf-8")
+
+    viewport = _css_rule_block(styles_css, ".viewport")
+    assert "transform" in viewport
+    assert "var(--glass-drop-ease)" in viewport
+    assert "filter" not in viewport
+
+    active = _css_rule_block(styles_css, ".viewport.active")
+    assert "translate3d(0, 0, 0) scale(1)" in active
+    assert "var(--glass-drop-ease)" in active
+    assert "filter" not in active
+
+    inactive_3d = _css_rule_block(styles_css, "#view3d:not(.active)")
+    assert "translate3d(-18px, 0, 0)" in inactive_3d
+    assert "scale(0.992)" in inactive_3d
+    assert "filter" not in inactive_3d
+
+    inactive_system = _css_rule_block(styles_css, "#viewSystem:not(.active)")
+    assert "translate3d(24px, 0, 0)" in inactive_system
+    assert "scale(0.985)" in inactive_system
+    assert "filter" not in inactive_system
+
+    root = _css_rule_block(styles_css, ":root")
+    assert "--layout-transition-ms: 380ms;" in root
+
+    panel = _css_rule_block(styles_css, ".panel")
+    assert "transform var(--layout-transition-ms) var(--glass-drop-ease)" in panel
+
+    app = _css_rule_block(styles_css, ".app")
+    assert "grid-template-columns var(--layout-transition-ms) var(--glass-drop-ease)" in app
+
+
 def test_glass_no_filter_on_webgl_canvas():
     styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
         encoding="utf-8"
@@ -1733,7 +1768,7 @@ def test_frontend_layout_transition_state_machine_static():
         encoding="utf-8"
     )
 
-    assert "const LAYOUT_SETTLE_FALLBACK_MS = 420;" in app_js
+    assert "const LAYOUT_SETTLE_FALLBACK_MS = 520;" in app_js
     for name in (
         "beginLayoutTransition",
         "settleLayoutTransition",
@@ -1952,7 +1987,7 @@ def test_glass_tokens_and_mode_classes():
         "--scene-bg: #0b0f19;",
         "--glass-drop-ms: 380ms;",
         "--glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);",
-        "--layout-transition-ms: 260ms;",
+        "--layout-transition-ms: 380ms;",
         "--focus-ring: 2px;",
         "--touch-target: 44px;",
     ):
@@ -4227,6 +4262,167 @@ def test_frontend_layout_transition_state_machine_executes_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "page transition ok" in completed.stdout
+
+
+_LAYOUT_FALLBACK_NAMESPACE_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Page transition state machine");
+const blockEnd = source.indexOf("// --- End page transition state machine");
+if (blockStart < 0 || blockEnd < 0) throw new Error("page transition block not found");
+const block = source.slice(blockStart, blockEnd);
+
+// Separate fake timer and rAF namespaces that assign colliding numeric ids,
+// mirroring how a real browser reuses small integer handles for both APIs.
+const timers = new Map();
+const frames = new Map();
+let nextTimer = 5000;
+let nextFrame = 5000;
+global.setTimeout = (fn) => { const id = nextTimer++; timers.set(id, fn); return id; };
+global.clearTimeout = (id) => { timers.delete(id); };
+global.requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+global.cancelAnimationFrame = (id) => { frames.delete(id); };
+
+let reduceMotion = false;
+global.glassMotionReduced = () => reduceMotion;
+global.resizeAll = () => {};
+global.applyJoystickLayout = () => {};
+global.updateHudPlacement = () => {};
+global.renderer = { render: () => {} };
+global.scene = {};
+global.camera = {};
+global.document = {
+  querySelector() { return null; },
+  getElementById() { return null; },
+};
+
+const transitionApi = new Function(
+  block + `
+return { pageTransition, beginLayoutTransition, settleLayoutTransition };`,
+)();
+const { pageTransition, beginLayoutTransition, settleLayoutTransition } = transitionApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+// A normal (timeout) transition fallback must never cancel an unrelated map rAF
+// whose numeric handle happens to collide with the timeout id.
+const unrelatedMapFrameId = global.requestAnimationFrame(() => {});
+reduceMotion = false;
+const timerToken = beginLayoutTransition();
+expect(typeof pageTransition.fallbackTimerId === "number", "a timer fallback is tracked");
+expect(pageTransition.fallbackFrameId === null, "no frame fallback is tracked mid-timer");
+expect(pageTransition.fallbackTimerId === unrelatedMapFrameId,
+  "the timeout handle collides with the unrelated map frame id");
+settleLayoutTransition(timerToken);
+expect(frames.has(unrelatedMapFrameId),
+  "settling a timeout transition must not cancel the unrelated map rAF");
+expect(timers.size === 0, "the transition timeout is cleared");
+expect(pageTransition.fallbackTimerId === null && pageTransition.fallbackFrameId === null,
+  "fallback bookkeeping resets after settle");
+
+// A reduced-motion settle cancels only its own rAF and leaves unrelated timers
+// and frames untouched even when numeric handles collide.
+reduceMotion = true;
+const survivingMapFrameId = global.requestAnimationFrame(() => {});
+const unrelatedTimerId = global.setTimeout(() => {}, 0);
+const frameToken = beginLayoutTransition();
+const ownFrameId = pageTransition.fallbackFrameId;
+expect(typeof ownFrameId === "number", "a frame fallback is tracked under reduced motion");
+expect(pageTransition.fallbackTimerId === null, "no timer fallback is tracked under reduced motion");
+const collidingTimerId = global.setTimeout(() => {}, 0);
+settleLayoutTransition(frameToken);
+expect(!frames.has(ownFrameId), "the reduced-motion settle cancels its own rAF");
+expect(frames.has(survivingMapFrameId), "an unrelated map rAF survives the reduced-motion settle");
+expect(timers.has(unrelatedTimerId) && timers.has(collidingTimerId),
+  "unrelated timers survive the reduced-motion settle");
+
+console.log("layout fallback namespaces ok");
+"""
+
+
+def test_layout_transition_fallback_namespaces_execute_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _LAYOUT_FALLBACK_NAMESPACE_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "layout fallback namespaces ok" in completed.stdout
+
+
+_RESIZE_CACHE_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const fnStart = source.indexOf("function resizeAll()");
+if (fnStart < 0) throw new Error("resizeAll not found");
+const declStart = source.lastIndexOf("let lastRenderWidth", fnStart);
+let sliceStart = fnStart;
+if (declStart >= 0 && fnStart - declStart < 400) sliceStart = declStart;
+const brace = source.indexOf("{", fnStart);
+let depth = 0;
+let end = -1;
+for (let i = brace; i < source.length; i += 1) {
+  if (source[i] === "{") depth += 1;
+  else if (source[i] === "}") {
+    depth -= 1;
+    if (depth === 0) { end = i + 1; break; }
+  }
+}
+if (end < 0) throw new Error("unterminated resizeAll");
+const block = source.slice(sliceStart, end);
+
+const sizes = [];
+let updateProjectionCalls = 0;
+const renderer = { setSize(width, height) { sizes.push([width, height]); } };
+const camera = { aspect: 0, updateProjectionMatrix() { updateProjectionCalls += 1; } };
+let rect = { width: 800.4, height: 600.6 };
+const mapCanvas3d = { getBoundingClientRect: () => rect };
+
+const api = new Function(
+  "renderer", "camera", "mapCanvas3d",
+  block + "\nreturn { resizeAll };",
+)(renderer, camera, mapCanvas3d);
+const { resizeAll } = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+const firstChanged = resizeAll();
+const secondChanged = resizeAll();
+expect(sizes.length === 1, "two same-size resizes must call renderer.setSize once");
+expect(updateProjectionCalls === 1, "two same-size resizes must update the projection once");
+expect(firstChanged === true, "the first resize reports a changed buffer");
+expect(secondChanged === false, "an identical resize reports no change");
+
+rect = { width: 900.2, height: 600.6 };
+const thirdChanged = resizeAll();
+expect(sizes.length === 2, "a changed size must call renderer.setSize again");
+expect(updateProjectionCalls === 2, "a changed size must update the projection again");
+expect(thirdChanged === true, "a changed size reports a changed buffer");
+expect(sizes[0][0] === 800 && sizes[0][1] === 601, "the drawing buffer uses integer dimensions");
+expect(sizes[1][0] === 900 && sizes[1][1] === 601, "the changed buffer uses integer dimensions");
+
+console.log("resize cache ok");
+"""
+
+
+def test_resize_all_skips_identical_drawing_buffer_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _RESIZE_CACHE_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "resize cache ok" in completed.stdout
 
 
 class _FakeCancelResponse:
@@ -6982,7 +7178,7 @@ def test_sidebar_toggle_is_single_accessible_button():
 
     assert "grid-template-columns: minmax(0, 1fr) var(--panel-width, 360px);" in styles_css
     assert ".app.sidebar-collapsed" in styles_css
-    assert "transition: grid-template-columns var(--layout-transition-ms) ease;" in styles_css
+    assert "grid-template-columns var(--layout-transition-ms) var(--glass-drop-ease)" in styles_css
     assert ".app.sidebar-collapsed .panel" in styles_css
     assert ".app.system-mode .sidebar-toggle" in styles_css
     assert "var(--panel-width, 340px);" in styles_css

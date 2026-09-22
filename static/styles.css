@@ -39,7 +39,7 @@
   --scene-bg: #0b0f19;
   --glass-drop-ms: 380ms;
   --glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);
-  --layout-transition-ms: 260ms;
+  --layout-transition-ms: 380ms;
   --focus-ring: 2px;
   --touch-target: 44px;
 }
@@ -131,7 +131,7 @@ input {
   min-width: 760px;
   width: 100%;
   height: 100%;
-  transition: grid-template-columns var(--layout-transition-ms) ease;
+  transition: grid-template-columns var(--layout-transition-ms) var(--glass-drop-ease);
 }
 
 .app.sidebar-collapsed {
@@ -272,7 +272,9 @@ input {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity var(--layout-transition-ms) ease,
+  transform: translate3d(0, 0, 0) scale(1);
+  transition: opacity var(--layout-transition-ms) var(--glass-drop-ease),
+              transform var(--layout-transition-ms) var(--glass-drop-ease),
               visibility 0s linear var(--layout-transition-ms);
 }
 
@@ -280,7 +282,9 @@ input {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transition: opacity var(--layout-transition-ms) ease,
+  transform: translate3d(0, 0, 0) scale(1);
+  transition: opacity var(--layout-transition-ms) var(--glass-drop-ease),
+              transform var(--layout-transition-ms) var(--glass-drop-ease),
               visibility 0s linear 0s;
 }
 
@@ -289,8 +293,16 @@ input {
   background: var(--scene-bg);
 }
 
+#view3d:not(.active) {
+  transform: translate3d(-18px, 0, 0) scale(0.992);
+}
+
 #viewSystem {
   z-index: 1;
+}
+
+#viewSystem:not(.active) {
+  transform: translate3d(24px, 0, 0) scale(0.985);
 }
 
 #mapCanvas3d {
@@ -725,7 +737,8 @@ canvas {
   background: var(--panel-bg);
   padding: 16px;
   box-shadow: -18px 0 48px rgba(0, 0, 0, 0.3);
-  transition: opacity var(--layout-transition-ms) ease, transform var(--layout-transition-ms) ease;
+  transition: opacity var(--layout-transition-ms) var(--glass-drop-ease),
+              transform var(--layout-transition-ms) var(--glass-drop-ease);
 }
 
 .app.sidebar-collapsed .panel,
@@ -824,7 +837,9 @@ header + section {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity var(--layout-transition-ms) ease,
+  transform: translate3d(10px, 0, 0);
+  transition: opacity var(--layout-transition-ms) var(--glass-drop-ease),
+              transform var(--layout-transition-ms) var(--glass-drop-ease),
               visibility 0s linear var(--layout-transition-ms);
 }
 
@@ -833,7 +848,9 @@ header + section {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transition: opacity var(--layout-transition-ms) ease,
+  transform: translate3d(0, 0, 0);
+  transition: opacity var(--layout-transition-ms) var(--glass-drop-ease),
+              transform var(--layout-transition-ms) var(--glass-drop-ease),
               visibility 0s linear 0s;
 }
 
