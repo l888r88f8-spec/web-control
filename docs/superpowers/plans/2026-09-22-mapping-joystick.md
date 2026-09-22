@@ -565,7 +565,7 @@ def test_teleop_timer_publishes_active_command_then_exactly_one_zero(monkeypatch
     assert node.cmd_vel_publications[0].linear.x == pytest.approx(1.5)
     assert node.cmd_vel_publications[0].angular.z == pytest.approx(0.0)
 
-    clock.now = 0.4
+    clock.now = 0.400001
     node.teleop_timer_callback()
     assert len(node.cmd_vel_publications) == 2
     assert node.cmd_vel_publications[1].linear.x == 0.0
@@ -864,7 +864,18 @@ global.document = {
   querySelector(selector) { return selector === ".stage" ? stage : null; },
   addEventListener() {},
 };
-global.window = { addEventListener() {} };
+const intervalHandlers = new Map();
+let nextIntervalId = 1;
+global.window = {
+  addEventListener() {},
+  setInterval(handler) {
+    const id = nextIntervalId;
+    nextIntervalId += 1;
+    intervalHandlers.set(id, handler);
+    return id;
+  },
+  clearInterval(id) { intervalHandlers.delete(id); },
+};
 
 const beacons = [];
 try {
@@ -933,25 +944,47 @@ expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the u
   expect(baseElement.captured.length === 1, "pointerdown captures the active pointer");
   expect(propagationStops >= 1, "pointerdown stops propagation to the map canvas");
   expect(elements.joystickKnob.style.transform === "translate(-20px, -20px)", "knob follows the pointer");
-
-  fakeNow = 50;
-  await joystickPointerMove(makeEvent(1, 20, 20));
-  expect(posts.length === 1, "pointermove is throttled within 100 ms");
+  expect(intervalHandlers.size === 1, "pointerdown starts one fixed-rate send loop");
 
   fakeNow = 100;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 2, "stationary hold continues sending at 10 Hz");
+
+  fakeNow = 150;
+  await joystickPointerMove(makeEvent(1, 50, 50));
+  expect(posts.length === 3, "returning to center sends one immediate zero");
+  expect(posts[2].payload.throttle === 0, "center transition posts zero throttle");
+
+  fakeNow = 250;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 3, "center hold does not stream zero commands");
+
   await joystickPointerMove(makeEvent(1, 20, 20));
-  expect(posts.length === 2, "pointermove sends again after 100 ms");
+  expect(posts.length === 4, "leaving center sends one immediate active command");
+
+  fakeNow = 300;
+  await joystickPointerMove(makeEvent(1, 10, 10));
+  expect(posts.length === 4, "active pointermove is throttled within 100 ms");
+
+  fakeNow = 350;
+  await Array.from(intervalHandlers.values())[0]();
+  expect(posts.length === 5, "active hold sends again after 100 ms");
+
+  fakeNow = 400;
+  await joystickPointerMove(makeEvent(1, 20, 20));
+  expect(posts.length === 5, "active pointermove shares the send throttle");
 
   const beforeSecondPointer = posts.length;
   await joystickPointerDown(makeEvent(2, 80, 80));
   expect(baseElement.captured.length === 1, "second pointer is not captured");
   expect(posts.length === beforeSecondPointer, "second pointer does not take control");
 
-  fakeNow = 200;
+  fakeNow = 450;
   await joystickPointerUp(makeEvent(1, 20, 20));
   expect(posts[posts.length - 1].payload.throttle === 0, "release sends a zero throttle");
   expect(posts[posts.length - 1].payload.steering === 0, "release sends a zero steering");
   expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "release centers the knob");
+  expect(intervalHandlers.size === 0, "release clears the send loop");
 
   fakeNow = 300;
   await joystickPointerDown(makeEvent(3, -10, 90));
@@ -1063,6 +1096,7 @@ const teleop = {
   throttle: 0,
   steering: 0,
   lastSentAt: -Infinity,
+  sendTimer: null,
 };
 
 function joystickAxes(offsetX, offsetY, radius) {
@@ -1109,6 +1143,20 @@ function resetJoystick() {
   renderJoystickKnob(0, 0);
 }
 
+function startTeleopSendLoop() {
+  if (teleop.sendTimer !== null) return;
+  teleop.sendTimer = window.setInterval(async () => {
+    if (!teleop.active || teleop.throttle === 0) return;
+    await sendTeleopCommand(teleop.throttle, teleop.steering);
+  }, JOYSTICK_SEND_INTERVAL_MS);
+}
+
+function stopTeleopSendLoop() {
+  if (teleop.sendTimer === null) return;
+  window.clearInterval(teleop.sendTimer);
+  teleop.sendTimer = null;
+}
+
 async function sendTeleopCommand(throttle, steering, force = false) {
   const now = Date.now();
   if (!force && now - teleop.lastSentAt < JOYSTICK_SEND_INTERVAL_MS) return false;
@@ -1130,6 +1178,7 @@ async function sendTeleopCommand(throttle, steering, force = false) {
 
 async function stopTeleop(reason) {
   const wasActive = teleop.active || teleop.pointerId !== null;
+  stopTeleopSendLoop();
   resetJoystick();
   teleop.active = false;
   teleop.lastSentAt = -Infinity;
@@ -1161,6 +1210,7 @@ async function joystickPointerDown(event) {
   event.stopPropagation();
   teleop.pointerId = event.pointerId;
   teleop.active = true;
+  startTeleopSendLoop();
   const base = event.currentTarget;
   if (base && typeof base.setPointerCapture === "function") {
     base.setPointerCapture(event.pointerId);
@@ -1177,12 +1227,14 @@ async function joystickPointerMove(event) {
   if (!teleop.active || teleop.pointerId === null || event.pointerId !== teleop.pointerId) return;
   event.preventDefault();
   event.stopPropagation();
+  const wasMoving = teleop.throttle !== 0;
   const offset = joystickOffset(event, event.currentTarget);
   renderJoystickKnob(offset.dx, offset.dy);
   const axes = joystickAxes(offset.dx, offset.dy, offset.radius);
   teleop.throttle = axes.throttle;
   teleop.steering = axes.steering;
-  await sendTeleopCommand(axes.throttle, axes.steering);
+  const isMoving = axes.throttle !== 0;
+  await sendTeleopCommand(axes.throttle, axes.steering, wasMoving !== isMoving);
 }
 
 async function joystickPointerUp(event) {
@@ -1209,6 +1261,7 @@ async function handleVisibilityChange() {
 
 function handlePageHide() {
   if (!teleop.active && teleop.pointerId === null) return;
+  stopTeleopSendLoop();
   resetJoystick();
   teleop.active = false;
   teleop.lastSentAt = -Infinity;
