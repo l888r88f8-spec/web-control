@@ -163,6 +163,43 @@ def test_saved_joystick_preferences_falls_back_per_field():
     ) == {"size": 200.0, "x_ratio": 0.05, "y_ratio": 0.25}
 
 
+@pytest.mark.parametrize("key", ["size", "x_ratio", "y_ratio"])
+def test_validate_joystick_preferences_rejects_overflowing_integer(key):
+    payload = {"size": 180, "x_ratio": 0.5, "y_ratio": 0.5}
+    payload[key] = 10**400
+
+    with pytest.raises(ValueError):
+        validate_joystick_preferences(payload)
+
+
+def test_saved_joystick_preferences_falls_back_for_overflowing_integer():
+    assert saved_joystick_preferences(
+        {"size": 10**400, "x_ratio": 0.25, "y_ratio": 10**400}
+    ) == {"size": 180.0, "x_ratio": 0.25, "y_ratio": 0.75}
+
+
+def test_load_joystick_preferences_recovers_from_overflowing_saved_values(tmp_path):
+    path = tmp_path / "selected_map.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "site_a",
+                "ui": {
+                    "joystick": {"size": 10**400, "x_ratio": 0.4, "y_ratio": 10**400}
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert SelectionStore(path).load_joystick_preferences() == {
+        "size": 180.0,
+        "x_ratio": 0.4,
+        "y_ratio": 0.75,
+    }
+
+
 def test_joystick_write_replaces_file_atomically(tmp_path, monkeypatch):
     path = tmp_path / "web_control" / "selected_map.json"
     store = SelectionStore(path)

@@ -1825,7 +1825,7 @@ def test_mobile_layout_keeps_control_panel_as_side_panel():
 
     assert "min-width: 760px;" in styles_css
     assert "@media (max-width: 900px)" in styles_css
-    assert "grid-template-columns: minmax(420px, 1fr) 340px;" in styles_css
+    assert "grid-template-columns: minmax(420px, 1fr) var(--panel-width, 340px);" in styles_css
     assert "grid-template-rows: 1fr;" in styles_css
     assert "overflow-x: auto;" in styles_css
     mobile_app_block_start = styles_css.index("@media (max-width: 900px)")
@@ -3120,6 +3120,50 @@ def test_ui_preferences_post_rejects_invalid_payload_without_changing_file(
         "x_ratio": 0.2,
         "y_ratio": 0.8,
     }
+
+
+@pytest.mark.parametrize("key", ["size", "x_ratio", "y_ratio"])
+def test_ui_preferences_post_rejects_overflowing_value_with_400(tmp_path, key):
+    node = _selection_node(tmp_path)
+    node.map_selection.save_joystick_preferences(
+        {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
+    )
+    before = node.map_selection.path.read_text(encoding="utf-8")
+    payload = {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
+    payload[key] = 10**400
+
+    status, body = _serve_and_request(node, "/api/ui/preferences", payload, "POST")
+
+    assert status == 400
+    assert body["ok"] is False
+    assert node.map_selection.path.read_text(encoding="utf-8") == before
+    assert node.map_selection.load_joystick_preferences() == {
+        "size": 200,
+        "x_ratio": 0.2,
+        "y_ratio": 0.8,
+    }
+
+
+def test_ui_preferences_get_falls_back_for_overflowing_saved_value(tmp_path):
+    node = _selection_node(tmp_path)
+    node.map_selection.path.parent.mkdir(parents=True, exist_ok=True)
+    node.map_selection.path.write_text(
+        json.dumps(
+            {
+                "name": "site_a",
+                "ui": {
+                    "joystick": {"size": 10**400, "x_ratio": 0.4, "y_ratio": 10**400}
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status, body = _serve_and_request(node, "/api/ui/preferences")
+
+    assert status == 200
+    assert body["joystick"] == {"size": 180, "x_ratio": 0.4, "y_ratio": 0.75}
 
 
 def test_managed_start_command_uses_tiled_map_without_writing_cache(tmp_path):
@@ -5914,6 +5958,304 @@ def test_mapping_joystick_layout_mode_persists_and_clamps_under_node():
     assert "joystick layout ok" in completed.stdout
 
 
+def _run_app_node_harness(harness):
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed
+
+
+_JOYSTICK_NODE_PREAMBLE = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const startA = source.indexOf("// --- Mapping joystick");
+const endA = source.indexOf("// --- End mapping joystick");
+const startB = source.indexOf("// --- Joystick layout");
+const endB = source.indexOf("// --- End joystick layout");
+if (startA < 0 || endA < 0 || startB < 0 || endB < 0) {
+  throw new Error("joystick layout block not found");
+}
+const block = source.slice(startA, endA) + "\n" + source.slice(startB, endB);
+
+function makeElement(id) {
+  const classes = new Set();
+  return {
+    id,
+    hidden: false,
+    textContent: "",
+    offsetWidth: 0,
+    offsetHeight: 0,
+    captured: [],
+    attributes: {},
+    style: {
+      left: "0px",
+      top: "0px",
+      values: {},
+      setProperty(name, value) { this.values[name] = value; },
+    },
+    classList: {
+      toggle(name, on) {
+        if (on === undefined) {
+          if (classes.has(name)) classes.delete(name);
+          else classes.add(name);
+        } else if (on) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+      },
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    setPointerCapture(pointerId) { this.captured.push(pointerId); },
+    addEventListener() {},
+    getBoundingClientRect() {
+      const left = Number.parseFloat(this.style.left) || 0;
+      const top = Number.parseFloat(this.style.top) || 0;
+      const width = this.offsetWidth || 0;
+      const height = this.offsetHeight || 0;
+      return { left, top, right: left + width, bottom: top + height, width, height };
+    },
+  };
+}
+
+const elements = {
+  view3d: makeElement("view3d"),
+  mappingJoystick: makeElement("mappingJoystick"),
+  joystickBase: makeElement("joystickBase"),
+  joystickKnob: makeElement("joystickKnob"),
+  joystickStatus: makeElement("joystickStatus"),
+  joystickMoveHandle: makeElement("joystickMoveHandle"),
+  joystickResizeHandle: makeElement("joystickResizeHandle"),
+  joystickSettings: makeElement("joystickSettings"),
+  joystickDone: makeElement("joystickDone"),
+  joystickSettingsError: makeElement("joystickSettingsError"),
+  hud: makeElement("hud"),
+};
+elements.view3d.clientWidth = 400;
+elements.view3d.clientHeight = 300;
+elements.view3d.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
+elements.mappingJoystick.offsetWidth = 100;
+elements.mappingJoystick.offsetHeight = 140;
+elements.joystickBase.offsetWidth = 100;
+elements.joystickBase.offsetHeight = 100;
+elements.hud.offsetWidth = 60;
+elements.hud.offsetHeight = 20;
+
+const stage = makeElement("stage");
+stage.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
+
+global.state = { view: "mapping" };
+global.document = {
+  hidden: false,
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) { return selector === ".stage" ? stage : null; },
+  addEventListener() {},
+};
+global.window = {
+  addEventListener() {},
+  setInterval() { return 1; },
+  clearInterval() {},
+};
+global.viewerSessionId = () => "tab-session";
+
+const teleopPosts = [];
+const uiPosts = [];
+global.handleUiPost = async (payload) => ({ ok: true, joystick: payload });
+global.handleTeleopPost = async (url, payload) => {
+  teleopPosts.push({ url, payload });
+  return { ok: true, teleop: { active: payload.throttle !== 0 || payload.steering !== 0 } };
+};
+global.postJson = (url, payload) => {
+  if (url === "/api/ui/preferences") return global.handleUiPost(payload);
+  return global.handleTeleopPost(url, payload);
+};
+global.handleGetJson = async () => ({ ok: true, joystick: { size: 220, x_ratio: 0.25, y_ratio: 0.5 } });
+global.getJson = () => global.handleGetJson();
+global.fetchWithTimeout = async () => ({ ok: true });
+
+const joystickApi = new Function(block + `
+return {
+  teleop, joystickLayout, refreshJoystickPreferences, persistJoystickPreferences,
+  enterJoystickLayout, exitJoystickLayout, stopTeleop,
+  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
+  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
+};`)();
+const {
+  teleop, joystickLayout, refreshJoystickPreferences, persistJoystickPreferences,
+  enterJoystickLayout, exitJoystickLayout, stopTeleop,
+  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
+  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
+} = joystickApi;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+function makeEvent(pointerId, clientX, clientY, currentTarget) {
+  return {
+    pointerId,
+    pointerType: "mouse",
+    clientX,
+    clientY,
+    currentTarget: currentTarget || elements.joystickBase,
+    preventDefault() {},
+    stopPropagation() {},
+  };
+}
+
+(async () => {
+"""
+
+
+def _joystick_node_harness(scenario: str) -> str:
+    return (
+        _JOYSTICK_NODE_PREAMBLE
+        + scenario
+        + "\n})().catch((error) => { console.error(error); process.exit(1); });\n"
+    )
+
+
+_JOYSTICK_ENTRY_RACE_SCENARIO = r"""
+teleop.active = true;
+teleop.pointerId = 7;
+let resolveStop = null;
+global.handleTeleopPost = async (url, payload) => {
+  teleopPosts.push({ url, payload });
+  return new Promise((resolve) => {
+    resolveStop = () => resolve({ ok: true, teleop: { active: false } });
+  });
+};
+const entering = enterJoystickLayout();
+expect(teleop.layoutMode === true, "entry sets the guard before awaiting the stop");
+expect(typeof resolveStop === "function", "entry awaits one stop request");
+const stopPost = teleopPosts[teleopPosts.length - 1].payload;
+expect(stopPost.client_id === teleop.clientId, "stop carries the teleop client id");
+expect(Number.isInteger(stopPost.seq) && stopPost.seq > 0, "stop carries a positive seq");
+exitJoystickLayout();
+expect(teleop.layoutMode === false, "exiting during the stop clears the guard");
+resolveStop();
+await entering;
+expect(joystickLayout.mode === false, "stale entry continuation does not restore layout mode");
+expect(
+  !elements.mappingJoystick.classList.contains("layout-mode"),
+  "stale entry continuation does not restore the layout class",
+);
+console.log("joystick entry race ok");
+"""
+
+
+def test_mapping_joystick_layout_entry_race_under_node():
+    completed = _run_app_node_harness(
+        _joystick_node_harness(_JOYSTICK_ENTRY_RACE_SCENARIO)
+    )
+    assert "joystick entry race ok" in completed.stdout
+
+
+_JOYSTICK_IDLE_ENTRY_SCENARIO = r"""
+expect(
+  teleop.active === false && teleop.pointerId === null && teleop.stopRequired === false,
+  "teleop starts idle",
+);
+await enterJoystickLayout();
+expect(teleopPosts.length === 1, "idle layout entry still requests exactly one stop");
+const stop = teleopPosts[0].payload;
+expect(stop.throttle === 0 && stop.steering === 0, "idle layout entry stop is a zero command");
+const postsAfterEntry = teleopPosts.length;
+await stopTeleop("blur");
+expect(teleopPosts.length === postsAfterEntry, "already-stopped ordinary stop stays silent");
+console.log("joystick idle entry ok");
+"""
+
+
+def test_mapping_joystick_idle_layout_entry_requests_zero_stop_under_node():
+    completed = _run_app_node_harness(
+        _joystick_node_harness(_JOYSTICK_IDLE_ENTRY_SCENARIO)
+    )
+    assert "joystick idle entry ok" in completed.stdout
+
+
+_JOYSTICK_OVERHANG_SCENARIO = r"""
+joystickLayout.mode = true;
+joystickLayout.size = 260;
+joystickLayout.xRatio = 1;
+joystickLayout.yRatio = 1;
+applyJoystickLayout();
+const left = Number.parseFloat(elements.mappingJoystick.style.left);
+const top = Number.parseFloat(elements.mappingJoystick.style.top);
+// The CSS resize handle is 0.16 of the base and overhangs its edge by 0.08.
+const overhang = 260 * 0.08;
+expect(
+  left + elements.mappingJoystick.offsetWidth + overhang <= elements.view3d.clientWidth,
+  "resize handle stays inside the right viewport edge",
+);
+expect(
+  top + elements.mappingJoystick.offsetHeight + overhang <= elements.view3d.clientHeight,
+  "resize handle stays inside the bottom viewport edge",
+);
+console.log("joystick resize overhang ok");
+"""
+
+
+def test_mapping_joystick_resize_handle_stays_inside_viewport_under_node():
+    completed = _run_app_node_harness(
+        _joystick_node_harness(_JOYSTICK_OVERHANG_SCENARIO)
+    )
+    assert "joystick resize overhang ok" in completed.stdout
+
+
+_JOYSTICK_REVISION_SCENARIO = r"""
+joystickLayout.mode = true;
+const pendingUi = [];
+global.handleUiPost = (payload) => new Promise((resolve) => {
+  pendingUi.push({ payload, resolve });
+});
+
+joystickLayout.size = 150;
+const firstSave = persistJoystickPreferences();
+joystickLayout.size = 200;
+const secondSave = persistJoystickPreferences();
+expect(pendingUi.length === 2, "two preference saves are in flight");
+pendingUi[1].resolve({ ok: true, joystick: { size: 200, x_ratio: 0.2, y_ratio: 0.5 } });
+await secondSave;
+expect(joystickLayout.size === 200, "newer save result applies");
+expect(joystickLayout.xRatio === 0.2, "newer save ratios apply");
+pendingUi[0].resolve({ ok: true, joystick: { size: 150, x_ratio: 0.1, y_ratio: 0.4 } });
+await firstSave;
+expect(joystickLayout.size === 200, "older save response cannot overwrite a newer save result");
+expect(joystickLayout.xRatio === 0.2, "older save response cannot overwrite newer save ratios");
+
+joystickLayout.size = 160;
+const gestureSave = persistJoystickPreferences();
+const gestureEntry = pendingUi[pendingUi.length - 1];
+beginJoystickResize(makeEvent(9, 0, 0, elements.joystickResizeHandle));
+resizeJoystickGesture(makeEvent(9, 30, 30, elements.joystickResizeHandle));
+const gestureSize = joystickLayout.size;
+expect(gestureSize !== 160, "gesture preview changed the size");
+gestureEntry.resolve({ ok: true, joystick: { size: 140, x_ratio: 0.9, y_ratio: 0.9 } });
+await gestureSave;
+expect(joystickLayout.size === gestureSize, "older save response cannot overwrite a newer in-progress gesture");
+expect(joystickLayout.xRatio === 0.2, "older save response cannot overwrite a newer gesture ratios");
+console.log("joystick preference revision ok");
+"""
+
+
+def test_mapping_joystick_ignores_stale_preference_responses_under_node():
+    completed = _run_app_node_harness(
+        _joystick_node_harness(_JOYSTICK_REVISION_SCENARIO)
+    )
+    assert "joystick preference revision ok" in completed.stdout
+
+
 def test_sidebar_toggle_is_single_accessible_button():
     index_html, app_js, styles_css = _frontend_sources()
 
@@ -5951,6 +6293,7 @@ function makeElement() {
   const classes = new Set();
   return {
     hidden: false,
+    inert: false,
     attributes: {},
     classList: {
       toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
@@ -5964,7 +6307,8 @@ function makeElement() {
 const appElement = makeElement();
 const stageElement = makeElement();
 const toggleElement = makeElement();
-const elements = { sidebarToggle: toggleElement };
+const panelElement = makeElement();
+const elements = { sidebarToggle: toggleElement, controlPanel: panelElement };
 const observers = [];
 global.document = {
   getElementById(id) { return elements[id] || null; },
@@ -5994,17 +6338,20 @@ expect(sidebarState.collapsed === false, "sidebar starts expanded");
 setSidebarCollapsed(false);
 expect(toggleElement.getAttribute("aria-expanded") === "true", "expanded aria state");
 expect(toggleElement.getAttribute("aria-label") === "Collapse sidebar", "expanded label");
+expect(panelElement.inert === false, "expanded panel is interactive");
 
 toggleSidebar();
 expect(sidebarState.collapsed === true, "toggle collapses");
 expect(appElement.classList.contains("sidebar-collapsed"), "collapsed class applied");
 expect(toggleElement.getAttribute("aria-expanded") === "false", "collapsed aria state");
 expect(toggleElement.getAttribute("aria-label") === "Expand sidebar", "collapsed label");
+expect(panelElement.inert === true, "collapsed panel is inert");
 
 toggleSidebar();
 expect(sidebarState.collapsed === false, "toggle expands");
 expect(!appElement.classList.contains("sidebar-collapsed"), "collapsed class removed");
 expect(toggleElement.getAttribute("aria-expanded") === "true", "re-expanded aria state");
+expect(panelElement.inert === false, "re-expanded panel is interactive");
 
 observeMapStageResize();
 expect(observers.length === 1, "one ResizeObserver created");

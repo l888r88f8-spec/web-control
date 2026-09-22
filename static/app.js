@@ -1220,13 +1220,13 @@ async function sendTeleopCommand(throttle, steering, force = false) {
   }
 }
 
-async function stopTeleop(reason) {
+async function stopTeleop(reason, force = false) {
   const wasActive = teleop.active || teleop.pointerId !== null || teleop.stopRequired;
   stopTeleopSendLoop();
   resetJoystick();
   teleop.active = false;
   teleop.lastSentAt = -Infinity;
-  if (!wasActive) {
+  if (!wasActive && !force) {
     setJoystickStatus("idle", "idle");
     return;
   }
@@ -1338,6 +1338,9 @@ const JOYSTICK_DEFAULT_X_RATIO = 0.05;
 const JOYSTICK_DEFAULT_Y_RATIO = 0.75;
 const JOYSTICK_VIEWPORT_MARGIN = 12;
 const HUD_CORNER_MARGIN = 12;
+// The resize handle is positioned at the lower-right of the base and overhangs
+// its edge by this fraction of the base size.
+const JOYSTICK_RESIZE_HANDLE_OVERHANG_RATIO = 0.08;
 
 const joystickLayout = {
   size: JOYSTICK_DEFAULT_SIZE,
@@ -1346,6 +1349,7 @@ const joystickLayout = {
   mode: false,
   gesture: null,
   saveError: null,
+  revision: 0,
 };
 
 function clampNumber(value, minimum, maximum) {
@@ -1359,6 +1363,10 @@ function finiteNumberOr(value, fallback) {
 
 function clampedJoystickSize(value) {
   return clampNumber(value, JOYSTICK_MIN_SIZE, JOYSTICK_MAX_SIZE);
+}
+
+function joystickResizeOverhang() {
+  return joystickLayout.size * JOYSTICK_RESIZE_HANDLE_OVERHANG_RATIO;
 }
 
 function joystickViewport() {
@@ -1375,15 +1383,15 @@ function applyJoystickSize() {
   joystick.style.setProperty("--joystick-size", `${joystickLayout.size}px`);
 }
 
-function joystickBounds(width, height, viewportWidth, viewportHeight) {
+function joystickBounds(width, height, viewportWidth, viewportHeight, overhang = 0) {
   return {
     maxLeft: Math.max(
       JOYSTICK_VIEWPORT_MARGIN,
-      viewportWidth - width - JOYSTICK_VIEWPORT_MARGIN,
+      viewportWidth - width - JOYSTICK_VIEWPORT_MARGIN - overhang,
     ),
     maxTop: Math.max(
       JOYSTICK_VIEWPORT_MARGIN,
-      viewportHeight - height - JOYSTICK_VIEWPORT_MARGIN,
+      viewportHeight - height - JOYSTICK_VIEWPORT_MARGIN - overhang,
     ),
   };
 }
@@ -1401,7 +1409,13 @@ function applyJoystickLayout() {
   }
   const width = joystick.offsetWidth || 0;
   const height = joystick.offsetHeight || 0;
-  const bounds = joystickBounds(width, height, viewportWidth, viewportHeight);
+  const bounds = joystickBounds(
+    width,
+    height,
+    viewportWidth,
+    viewportHeight,
+    joystickResizeOverhang(),
+  );
   const left = clampNumber(
     joystickLayout.xRatio * viewportWidth - width / 2,
     JOYSTICK_VIEWPORT_MARGIN,
@@ -1433,6 +1447,9 @@ function beginJoystickMove(event) {
   const joystick = joystickContainer();
   const viewport = joystickViewport();
   if (!joystick || !viewport) return;
+  // A new gesture invalidates any preference response still in flight so its
+  // saved values cannot overwrite the live preview.
+  joystickLayout.revision += 1;
   const joystickRect = joystick.getBoundingClientRect();
   const viewportRect = viewport.getBoundingClientRect();
   joystickLayout.gesture = {
@@ -1461,7 +1478,13 @@ function moveJoystickGesture(event) {
   if (!joystick || !viewport) return;
   const viewportWidth = viewport.clientWidth || 0;
   const viewportHeight = viewport.clientHeight || 0;
-  const bounds = joystickBounds(gesture.width, gesture.height, viewportWidth, viewportHeight);
+  const bounds = joystickBounds(
+    gesture.width,
+    gesture.height,
+    viewportWidth,
+    viewportHeight,
+    joystickResizeOverhang(),
+  );
   const left = clampNumber(
     gesture.left + (event.clientX - gesture.startX),
     JOYSTICK_VIEWPORT_MARGIN,
@@ -1490,6 +1513,9 @@ function beginJoystickResize(event) {
   if (!joystickLayout.mode || joystickLayout.gesture) return;
   event.preventDefault();
   event.stopPropagation();
+  // A new gesture invalidates any preference response still in flight so its
+  // saved values cannot overwrite the live preview.
+  joystickLayout.revision += 1;
   joystickLayout.gesture = {
     kind: "resize",
     pointerId: event.pointerId,
@@ -1547,7 +1573,10 @@ function setJoystickHandleAttributes() {
 async function enterJoystickLayout() {
   if (joystickLayout.mode) return;
   teleop.layoutMode = true;
-  await stopTeleop("settings");
+  await stopTeleop("settings", true);
+  // A tab change or Done press during the awaited stop clears
+  // teleop.layoutMode; its continuation must not re-enable layout mode.
+  if (!teleop.layoutMode) return;
   joystickLayout.mode = true;
   joystickLayout.saveError = null;
   setJoystickHandleAttributes();
@@ -1566,12 +1595,15 @@ function exitJoystickLayout() {
 }
 
 async function persistJoystickPreferences() {
+  joystickLayout.revision += 1;
+  const revision = joystickLayout.revision;
   try {
     const data = await postJson("/api/ui/preferences", {
       size: joystickLayout.size,
       x_ratio: joystickLayout.xRatio,
       y_ratio: joystickLayout.yRatio,
     });
+    if (revision !== joystickLayout.revision) return false;
     const saved = data && data.joystick ? data.joystick : null;
     if (saved) {
       joystickLayout.size = clampedJoystickSize(
@@ -1593,6 +1625,7 @@ async function persistJoystickPreferences() {
     applyJoystickLayout();
     return true;
   } catch (error) {
+    if (revision !== joystickLayout.revision) return false;
     joystickLayout.saveError = error.message;
     renderJoystickSettingsError();
     applyJoystickLayout();
@@ -1601,8 +1634,10 @@ async function persistJoystickPreferences() {
 }
 
 async function refreshJoystickPreferences() {
+  const revision = joystickLayout.revision;
   try {
     const data = await getJson("/api/ui/preferences");
+    if (revision !== joystickLayout.revision) return;
     const saved = data && data.joystick ? data.joystick : null;
     if (saved) {
       joystickLayout.size = clampedJoystickSize(
@@ -1675,6 +1710,8 @@ function setSidebarCollapsed(collapsed) {
   sidebarState.collapsed = Boolean(collapsed);
   const app = document.querySelector(".app");
   if (app) app.classList.toggle("sidebar-collapsed", sidebarState.collapsed);
+  const panel = document.getElementById("controlPanel");
+  if (panel) panel.inert = sidebarState.collapsed;
   const toggle = document.getElementById("sidebarToggle");
   if (toggle) {
     toggle.setAttribute("aria-expanded", String(!sidebarState.collapsed));

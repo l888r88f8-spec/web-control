@@ -62,7 +62,10 @@ def _finite_number(payload: dict[str, Any], key: str) -> float:
     value = payload[key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} must be a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{key} must be finite") from exc
     if not math.isfinite(number):
         raise ValueError(f"{key} must be finite")
     return number
@@ -90,7 +93,10 @@ def _saved_number(value: Any, minimum: float, maximum: float, default: float) ->
     """Return a finite in-range saved value, else ``default``."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return default
     if not math.isfinite(number) or number < minimum or number > maximum:
         return default
     return number
