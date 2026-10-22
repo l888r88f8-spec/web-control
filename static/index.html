@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DDDMR Web Control</title>
+    <title>Web Control</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -21,19 +21,31 @@
           <canvas id="mapCanvas3d"></canvas>
           <div class="hud" id="hud">3D map ready</div>
           <div id="mappingJoystick" class="joystick" hidden>
-            <button id="joystickMoveHandle" class="joystick-move-handle" type="button" aria-label="Move joystick"></button>
-            <div id="joystickBase" class="joystick-base">
-              <span class="joystick-axis joystick-axis-x"></span>
-              <span class="joystick-axis joystick-axis-y"></span>
-              <div id="joystickKnob" class="joystick-knob"></div>
-              <button id="joystickResizeHandle" class="joystick-resize-handle" type="button" aria-label="Resize joystick"></button>
+            <div id="throttleStick" class="joystick-stick" data-role="throttle">
+              <button id="throttleMoveHandle" class="joystick-move-handle" type="button" aria-label="Move throttle joystick"></button>
+              <div id="throttleBase" class="joystick-base">
+                <span class="joystick-axis joystick-axis-y" aria-hidden="true"></span>
+                <div id="throttleKnob" class="joystick-knob"></div>
+                <button id="throttleResizeHandle" class="joystick-resize-handle" type="button" aria-label="Resize throttle joystick"></button>
+              </div>
             </div>
-            <div class="joystick-settings-controls">
-              <button id="joystickSettings" class="joystick-settings-button" type="button" aria-label="Joystick settings" aria-pressed="false">Settings</button>
-              <button id="joystickDone" class="joystick-done-button" type="button">Done</button>
+            <div id="steeringStick" class="joystick-stick" data-role="steering">
+              <button id="steeringMoveHandle" class="joystick-move-handle" type="button" aria-label="Move steering joystick"></button>
+              <div id="steeringBase" class="joystick-base">
+                <span class="joystick-axis joystick-axis-x" aria-hidden="true"></span>
+                <div id="steeringKnob" class="joystick-knob"></div>
+                <button id="steeringResizeHandle" class="joystick-resize-handle" type="button" aria-label="Resize steering joystick"></button>
+              </div>
+            </div>
+            <div class="joystick-layout-controls">
+              <button id="joystickSettings" class="joystick-settings-button joystick-icon-button" type="button" aria-label="Joystick settings" title="Joystick settings" aria-pressed="false">
+                <svg class="joystick-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.65 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.61.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54a7.3 7.3 0 0 0 1.62-.94l2.39.96c.22.08.48 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
+              </button>
+              <button id="joystickDone" class="joystick-done-button joystick-icon-button" type="button" aria-label="Confirm joystick layout" title="Done">
+                <svg class="joystick-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9.55 17.6 4.4 12.45l1.4-1.4 3.75 3.75 8.65-8.65 1.4 1.4z"/></svg>
+              </button>
             </div>
             <p id="joystickSettingsError" class="joystick-settings-error" role="status" aria-live="polite" hidden></p>
-            <p id="joystickStatus" class="joystick-status" role="status" aria-live="polite">idle</p>
           </div>
         </div>
         <div id="viewSystem" class="viewport system-viewport">
@@ -64,10 +76,106 @@
                 <div class="system-meter"><div id="systemSwapMeter" class="system-meter-fill"></div></div>
               </article>
             </section>
-            <section class="cpu-core-panel">
-              <h2>CPU Cores</h2>
-              <div id="systemCpuCores" class="cpu-core-list"></div>
+            <section class="system-diagnostics-panel" aria-labelledby="diagnosticsTitle">
+              <div class="system-panel-head">
+                <h2 id="diagnosticsTitle">话题与运动</h2>
+                <span id="diagnosticsStatus" class="system-panel-status" role="status" aria-live="polite">waiting</span>
+              </div>
+              <div class="diagnostics-table-wrap">
+                <table class="diagnostics-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">话题</th>
+                      <th scope="col">类型</th>
+                      <th scope="col">发布者</th>
+                      <th scope="col">接收 Hz</th>
+                      <th scope="col">最后数据</th>
+                      <th scope="col">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="diagnosticsTopics">
+                    <tr><td colspan="6" class="diagnostics-empty">等待诊断数据...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="diagnostics-motion" aria-label="Wheel odometry motion state">
+                <div class="diagnostics-motion-main">
+                  <span id="diagnosticsMotionState" class="diagnostics-motion-state">未知</span>
+                  <span id="diagnosticsMotionSource" class="diagnostics-motion-source">来源 --</span>
+                </div>
+                <dl class="diagnostics-motion-metrics">
+                  <div><dt>实测速度</dt><dd id="diagnosticsSpeed">--</dd></div>
+                  <div><dt>累计里程</dt><dd id="diagnosticsDistance">--</dd></div>
+                  <div><dt>本段里程</dt><dd id="diagnosticsSegment">--</dd></div>
+                </dl>
+                <p id="diagnosticsValidity" class="diagnostics-validity">轮速估计：未收到底盘里程计</p>
+                <p id="diagnosticsImu" class="diagnostics-imu">IMU 辅助观察 --</p>
+              </div>
             </section>
+            <section class="system-tf-panel" aria-labelledby="tfTreeTitle">
+              <div class="system-panel-head">
+                <h2 id="tfTreeTitle">TF Tree</h2>
+                <div class="system-panel-actions">
+                  <span id="tfTreeStatus" class="system-panel-status" role="status" aria-live="polite">waiting</span>
+                  <div class="tf-toolbar" role="group" aria-label="TF graph controls">
+                    <button id="tfTreeZoomOut" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+                    <button id="tfTreeZoomIn" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+                    <button id="tfTreeFit" type="button" aria-label="Fit graph to view" title="Fit graph">Fit</button>
+                    <button id="tfTreeRefresh" type="button">Refresh</button>
+                  </div>
+                </div>
+              </div>
+              <div id="tfTree" class="tf-graph" role="application" aria-label="TF frame graph" tabindex="0"></div>
+              <p id="tfSelection" class="tf-selection" role="status" aria-live="polite">Select a frame to inspect its transform.</p>
+              <div id="tfDetached" class="tf-detached" hidden></div>
+            </section>
+            <section class="system-logs-panel" aria-labelledby="savedLogsTitle">
+              <div class="system-panel-head">
+                <h2 id="savedLogsTitle">Saved Logs</h2>
+                <div class="system-panel-actions">
+                  <span id="savedLogStatus" class="system-panel-status" role="status" aria-live="polite">Select a target.</span>
+                  <button id="savedLogRefresh" type="button">Refresh</button>
+                  <button id="savedLogView" type="button">View tail</button>
+                  <a id="savedLogDownload" class="saved-log-download" href="#" download>Download</a>
+                </div>
+              </div>
+              <div class="saved-log-pickers">
+                <label for="savedLogTarget" class="saved-log-field">Target</label>
+                <select id="savedLogTarget">
+                  <option value="chassis">hunter</option>
+                  <option value="imu">IMU</option>
+                  <option value="lidar">Lidar</option>
+                  <option value="localization">Localization</option>
+                  <option value="navigation">Navigation</option>
+                  <option value="mapping">Mapping</option>
+                  <option value="diagnostics">话题与运动日志</option>
+                </select>
+                <label for="savedLogSession" class="saved-log-field">Run</label>
+                <select id="savedLogSession"></select>
+              </div>
+              <pre id="savedLogTail" class="saved-log-tail"></pre>
+            </section>
+            <details class="system-secondary">
+              <summary>Preferences &amp; CPU cores</summary>
+              <div class="system-secondary-body">
+                <section class="system-preference-panel" aria-labelledby="glassStrengthTitle">
+                  <h2 id="glassStrengthTitle">Glass Strength</h2>
+                  <div class="system-preference-row">
+                    <label for="glassStrength" class="system-preference-caption">Strength</label>
+                    <select id="glassStrength" aria-describedby="glassStrengthNote">
+                      <option value="full">Full</option>
+                      <option value="light">Light</option>
+                      <option value="off">Off</option>
+                    </select>
+                  </div>
+                  <p id="glassStrengthNote" class="system-preference-note">Saved in this browser. Full is the default.</p>
+                </section>
+                <section class="cpu-core-panel">
+                  <h2>CPU Cores</h2>
+                  <div id="systemCpuCores" class="cpu-core-list"></div>
+                </section>
+              </div>
+            </details>
           </div>
         </div>
         <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="controlPanel" aria-label="Collapse sidebar">
@@ -78,8 +186,18 @@
 
       <aside id="controlPanel" class="panel">
         <header>
-          <h1>Web Control</h1>
+          <h1>JLU</h1>
           <div class="header-status">
+            <div id="performanceStatus" class="pill performance">
+              <span id="latencyStatus" class="performance-metric latency is-idle" role="status" aria-live="off" aria-label="Backend latency unavailable" title="Browser-to-backend HTTP round-trip time">
+                <span id="latencyValue" class="performance-value">--</span>
+              </span>
+              <span class="performance-separator" aria-hidden="true">·</span>
+              <span id="fpsStatus" class="performance-metric fps is-idle" role="status" aria-live="off" aria-label="Map frame rate unavailable" title="WebGL map render frames per second">
+                <span class="performance-name">FPS</span>
+                <span id="fpsValue" class="performance-value">--</span>
+              </span>
+            </div>
             <div id="viewerCount" class="pill viewers">0 watching</div>
             <div id="serverState" class="pill waiting">waiting</div>
           </div>
@@ -96,16 +214,46 @@
           </div>
         </section>
 
-        <section>
-          <h2>Navigation Readiness</h2>
-          <div class="actions process-controls">
-            <button id="localizationProcessToggle" class="start-log" data-managed-target="localization" type="button" aria-pressed="false">Start Localization</button>
-            <button id="navigationProcessToggle" class="start-log" data-managed-target="navigation" type="button" aria-pressed="false">Start Navigation</button>
+        <section class="compact-card">
+          <h2>Map</h2>
+          <div class="map-picker">
+            <select id="mapSelect" aria-label="Selected map" disabled></select>
+            <button id="refreshMaps" type="button">Refresh</button>
           </div>
-          <div id="navigationReady" class="readiness waiting">waiting for relocalization</div>
+          <div class="map-mode-picker">
+            <label for="mapMode">加载方式</label>
+            <select id="mapMode" aria-label="地图加载方式" disabled>
+              <option value="auto">自动（有分块优先）</option>
+              <option value="tiled">分块</option>
+              <option value="global">全局</option>
+            </select>
+          </div>
+          <button id="autoRelocalizationToggle" class="map-auto-relocalization start-log" type="button" aria-pressed="false" disabled>开启自动重定位</button>
+          <p id="mapWarning" class="map-warning" role="status" hidden></p>
+          <p id="mapStatus" class="result" role="status" aria-live="polite" hidden></p>
+          <p id="mapLockNote" class="map-note" hidden></p>
         </section>
 
-        <section>
+        <section class="startup-card">
+          <h2>Startup</h2>
+          <div class="actions process-controls">
+            <button class="start-log" data-managed-target="chassis" type="button" aria-pressed="false">Start hunter</button>
+            <button class="start-log" data-managed-target="imu" type="button" aria-pressed="false">Start IMU</button>
+            <button class="start-log" data-managed-target="lidar" type="button" aria-pressed="false">Start Lidar</button>
+            <button id="localizationProcessToggle" class="start-log" data-managed-target="localization" type="button" aria-pressed="false">Start Localization</button>
+            <button id="navigationProcessToggle" class="start-log" data-managed-target="navigation" type="button" aria-pressed="false">Start Navigation</button>
+            <button id="navigationTopicLoggingToggle" class="start-log topic-logging-toggle" data-topic-logging-toggle type="button" aria-pressed="false" disabled>开始记录话题</button>
+          </div>
+          <div class="startup-rate-row">
+            <span class="rate-chip" data-diagnostics-chip="imu">IMU --</span>
+            <span class="rate-chip" data-diagnostics-chip="lidar">Lidar --</span>
+          </div>
+          <p id="navigationTopicLoggingState" class="topic-logging-state" data-topic-logging-state role="status" aria-live="polite" hidden></p>
+          <div id="navigationReady" class="readiness waiting">waiting for relocalization</div>
+          <p class="result startup-status" data-managed-status role="status" aria-live="polite" hidden></p>
+        </section>
+
+        <section class="compact-card">
           <h2>Current Pose</h2>
           <dl class="metrics">
             <dt>x</dt><dd id="poseX">--</dd>
@@ -116,7 +264,7 @@
           </dl>
         </section>
 
-        <section>
+        <section class="compact-card">
           <h2>Target Pose</h2>
           <dl class="metrics">
             <dt>x</dt><dd id="goalX">--</dd>
@@ -124,14 +272,14 @@
             <dt>z</dt><dd id="goalZ">--</dd>
             <dt>yaw</dt><dd id="goalYaw">--</dd>
           </dl>
-          <div class="actions">
+          <div class="actions compact-actions">
             <button id="navigationPrimary" type="button" disabled>Pause Navigation</button>
             <button id="navigationClear" type="button" disabled>Clear Goal</button>
           </div>
           <p id="navigationControlState" class="result" role="status" aria-live="polite">Idle</p>
         </section>
 
-        <section>
+        <section class="compact-card">
           <h2>Selection</h2>
           <dl class="metrics">
             <dt>x</dt><dd id="selX">--</dd>
@@ -139,78 +287,150 @@
             <dt>z</dt><dd id="selZ">--</dd>
             <dt>yaw</dt><dd id="selYaw">--</dd>
           </dl>
-          <div class="actions">
+          <div class="actions compact-actions">
             <button id="publishPose" type="button" disabled>Publish Pose</button>
           </div>
           <p id="publishResult" class="result">No command published.</p>
         </section>
 
-        <section>
-          <h2>Map</h2>
-          <div class="map-picker">
-            <select id="mapSelect" aria-label="Selected map" disabled></select>
-            <button id="refreshMaps" type="button">Refresh</button>
+        <section class="collapsible" data-collapsed="true">
+          <div class="collapse-head">
+            <h2>Terminal Logs</h2>
+            <button class="collapse-toggle" type="button" aria-expanded="false">Show</button>
           </div>
-          <div class="map-capabilities">
-            <span id="mapTiledLabel" class="map-tag">Tiled loading: --</span>
-            <span id="mapRelocalizationLabel" class="map-tag">Automatic relocalization: --</span>
-          </div>
-          <p id="mapManualInitialPose" class="map-note" hidden>Manual initial pose required: this map has no sc_db.bin.</p>
-          <p id="mapWarning" class="map-warning" role="status" hidden></p>
-          <p id="mapStatus" class="result" role="status" aria-live="polite">Loading maps...</p>
-          <p id="mapLockNote" class="map-note" hidden></p>
-        </section>
-
-        <section>
-          <h2>Terminal Logs</h2>
+          <div class="collapse-body" hidden>
           <div class="terminal-list">
             <article class="terminal">
               <div class="terminal-header">
-                <span>Localization</span>
-                <span id="localizationLogState" class="pill waiting">disabled</span>
+                <span>hunter</span>
+                <span id="chassisLogState" data-log-state="chassis" class="pill waiting">disabled</span>
               </div>
-              <pre id="localizationLogs"></pre>
+              <pre id="chassisLogs" class="hardware-log" data-log-output="chassis"></pre>
+            </article>
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>IMU</span>
+                <span id="imuLogState" data-log-state="imu" class="pill waiting">disabled</span>
+              </div>
+              <pre id="imuLogs" class="hardware-log" data-log-output="imu"></pre>
+            </article>
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>Lidar</span>
+                <span id="lidarLogState" data-log-state="lidar" class="pill waiting">disabled</span>
+              </div>
+              <pre id="lidarLogs" class="hardware-log" data-log-output="lidar"></pre>
+            </article>
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>Localization</span>
+                <span id="localizationLogState" data-log-state="localization" class="pill waiting">disabled</span>
+              </div>
+              <pre id="localizationLogs" data-log-output="localization"></pre>
             </article>
             <article class="terminal">
               <div class="terminal-header">
                 <span>Navigation</span>
-                <span id="navigationLogState" class="pill waiting">disabled</span>
+                <span id="navigationLogState" data-log-state="navigation" class="pill waiting">disabled</span>
               </div>
-              <pre id="navigationLogs"></pre>
+              <pre id="navigationLogs" data-log-output="navigation"></pre>
             </article>
+          </div>
           </div>
         </section>
 
-        <section>
-          <h2>Layers</h2>
+        <section class="collapsible" data-collapsed="true">
+          <div class="collapse-head">
+            <h2>Layers</h2>
+            <button class="collapse-toggle" type="button" aria-expanded="false">Show</button>
+          </div>
+          <div class="collapse-body" hidden>
+          <label><input type="checkbox" data-layer="global_map" checked> global map</label>
           <label><input type="checkbox" data-layer="local_map" checked> local map</label>
-          <label><input type="checkbox" data-layer="mapcloud" checked> global map</label>
+          <label><input type="checkbox" data-layer="mapcloud" checked> navigation map</label>
           <label><input type="checkbox" data-layer="mapground" checked> ground map</label>
+          <label><input type="checkbox" data-layer="obstacles" checked> obstacles</label>
           <label><input type="checkbox" id="pathLayer" checked> planning paths</label>
           <label><input type="checkbox" id="vehicleLayer" checked> vehicle</label>
+          </div>
         </section>
 
-        <section>
-          <h2>Sources</h2>
+        <section class="collapsible" data-collapsed="true">
+          <div class="collapse-head">
+            <h2>Sources</h2>
+            <button class="collapse-toggle" type="button" aria-expanded="false">Show</button>
+          </div>
+          <div class="collapse-body" hidden>
           <div id="sources" class="sources"></div>
+          </div>
         </section>
         </div>
 
         <div id="mappingSidebar" class="panel-view" data-panel="mapping">
-        <section>
-          <h2>Mapping Logs</h2>
+        <section class="startup-card">
+          <h2>Startup</h2>
+          <div class="actions process-controls">
+            <button class="start-log" data-managed-target="chassis" type="button" aria-pressed="false">Start hunter</button>
+            <button class="start-log" data-managed-target="imu" type="button" aria-pressed="false">Start IMU</button>
+            <button class="start-log" data-managed-target="lidar" type="button" aria-pressed="false">Start Lidar</button>
+            <button id="mappingProcessToggle" class="start-log" data-managed-target="mapping" type="button" aria-pressed="false">Start Mapping</button>
+            <button id="mappingTopicLoggingToggle" class="start-log topic-logging-toggle" data-topic-logging-toggle type="button" aria-pressed="false" disabled>开始记录话题</button>
+          </div>
+          <div class="startup-rate-row">
+            <span class="rate-chip" data-diagnostics-chip="imu">IMU --</span>
+            <span class="rate-chip" data-diagnostics-chip="lidar">Lidar --</span>
+          </div>
+          <p id="mappingTopicLoggingState" class="topic-logging-state" data-topic-logging-state role="status" aria-live="polite" hidden></p>
+          <p class="result startup-status" data-managed-status role="status" aria-live="polite" hidden></p>
+        </section>
+
+        <section class="collapsible" data-collapsed="true">
+          <div class="collapse-head">
+            <h2>Mapping Logs</h2>
+            <button class="collapse-toggle" type="button" aria-expanded="false">Show</button>
+          </div>
+          <div class="collapse-body" hidden>
           <div class="terminal-list">
             <article class="terminal">
               <div class="terminal-header">
                 <span>Mapping</span>
-                <span id="mappingLogState" class="pill waiting">disabled</span>
+                <span id="mappingLogState" data-log-state="mapping" class="pill waiting">disabled</span>
               </div>
-              <div class="terminal-actions">
-                <button class="start-log" data-start-target="mapping" type="button">Start</button>
-                <button class="stop-log" data-stop-target="mapping" type="button">Stop</button>
-              </div>
-              <pre id="mappingLogs"></pre>
+              <pre id="mappingLogs" data-log-output="mapping"></pre>
             </article>
+          </div>
+          </div>
+        </section>
+
+        <section class="collapsible" data-collapsed="true">
+          <div class="collapse-head">
+            <h2>Hardware Logs</h2>
+            <button class="collapse-toggle" type="button" aria-expanded="false">Show</button>
+          </div>
+          <div class="collapse-body" hidden>
+          <div class="terminal-list">
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>hunter</span>
+                <span data-log-state="chassis" class="pill waiting">disabled</span>
+              </div>
+              <pre class="hardware-log" data-log-output="chassis"></pre>
+            </article>
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>IMU</span>
+                <span data-log-state="imu" class="pill waiting">disabled</span>
+              </div>
+              <pre class="hardware-log" data-log-output="imu"></pre>
+            </article>
+            <article class="terminal">
+              <div class="terminal-header">
+                <span>Lidar</span>
+                <span data-log-state="lidar" class="pill waiting">disabled</span>
+              </div>
+              <pre class="hardware-log" data-log-output="lidar"></pre>
+            </article>
+          </div>
           </div>
         </section>
 
@@ -223,6 +443,16 @@
         </section>
 
         <section>
+          <h2>录制数据包</h2>
+          <div class="actions">
+            <button id="openRecordBag" type="button" disabled>开始录制</button>
+            <button id="stopRecording" type="button" disabled>停止录制</button>
+          </div>
+          <p id="recordingStatus" class="result" role="status" aria-live="polite">当前未录制。</p>
+          <p id="recordingOutput" class="recording-path"></p>
+        </section>
+
+        <section class="compact-card">
           <h2>Mapping Pose</h2>
           <dl class="metrics">
             <dt>x</dt><dd id="mappingPoseX">--</dd>
@@ -260,6 +490,38 @@
         <div class="save-map-dialog-actions">
           <button id="cancelSaveMap" type="button">Cancel</button>
           <button id="confirmSaveMap" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="recordBagDialog" aria-labelledby="recordBagTitle">
+      <form id="recordBagForm">
+        <h2 id="recordBagTitle">录制 ROS 数据包</h2>
+        <div class="recording-dialog-head">
+          <span>选择要录制的话题</span>
+          <button id="refreshRecordingTopics" type="button">刷新话题</button>
+        </div>
+        <div id="recordingTopics" class="recording-topics" role="group" aria-label="可录制话题"></div>
+        <p id="recordingTopicsError" class="recording-error" role="alert"></p>
+        <label for="recordingDirectory">保存目录（机器人上的绝对路径）</label>
+        <div class="recording-dir-row">
+          <input id="recordingDirectory" name="directory" type="text" placeholder="/home/robot/bags" autocomplete="off" required>
+          <button id="browseRecordingDirectory" type="button">浏览...</button>
+        </div>
+        <div id="recordingBrowser" class="recording-browser" hidden>
+          <div class="recording-browser-head">
+            <button id="recordingBrowserUp" type="button">上一级</button>
+            <code id="recordingBrowserPath" class="recording-path"></code>
+          </div>
+          <div id="recordingBrowserList" class="recording-browser-list"></div>
+          <button id="recordingBrowserUse" type="button">使用此目录</button>
+        </div>
+        <label for="recordingName">数据包文件夹名称</label>
+        <input id="recordingName" name="name" type="text" placeholder="mapping_20260101_120000" autocomplete="off" required>
+        <p class="save-map-hint">目录必须已存在且可写；ros2 bag 会在该目录下新建此名称的文件夹。可选择挂载磁盘中的目录。</p>
+        <p id="recordingError" class="recording-error" role="alert"></p>
+        <div class="save-map-dialog-actions">
+          <button id="cancelRecordBag" type="button">取消</button>
+          <button id="startRecording" type="submit">开始录制</button>
         </div>
       </form>
     </dialog>

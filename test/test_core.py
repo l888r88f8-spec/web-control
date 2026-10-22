@@ -140,12 +140,14 @@ def test_normalize_layer_name_rejects_unknown_layer():
     from web_control.web_control_node import normalize_layer_name
 
     assert normalize_layer_name("local_map") == "local_map"
+    assert normalize_layer_name("global_map") == "global_map"
+    assert normalize_layer_name("obstacles") == "obstacles"
     try:
-        normalize_layer_name("global_map")
+        normalize_layer_name("fullmap")
     except ValueError as exc:
         assert "unknown layer" in str(exc)
     else:
-        raise AssertionError("navigation global_map layer was accepted")
+        raise AssertionError("removed PCD fullmap layer was accepted")
     try:
         normalize_layer_name("../bad")
     except ValueError as exc:
@@ -161,8 +163,12 @@ def _layer_payload_node():
         def __init__(self):
             self.lock = threading.RLock()
             self.layers = {
-                name: SourceCache(name, stale_timeout_sec=2.0, static_source=True)
-                for name in ("local_map", "mapcloud", "mapground")
+                name: SourceCache(
+                    name,
+                    stale_timeout_sec=2.0,
+                    static_source=name != "obstacles",
+                )
+                for name in ("global_map", "local_map", "mapcloud", "mapground", "obstacles")
             }
 
         def now_sec(self):
@@ -178,7 +184,7 @@ def _layer_payload_node():
 def test_navigation_layer_payload_serves_local_map_cloud():
     node = _layer_payload_node()
     node.layers["local_map"].update(
-        {"points3d": [[1.0, 2.0, 3.0]], "points2d": [[1.0, 2.0]]},
+        {"points3d": [[1.0, 2.0, 3.0]]},
         stamp=10.0,
         frame_id="map",
         count=1,
@@ -192,10 +198,10 @@ def test_navigation_layer_payload_serves_local_map_cloud():
         "points": [[1.0, 2.0, 3.0]],
     }
     with pytest.raises(ValueError, match="unknown layer"):
-        node.layer_payload("global_map", "3d")
+        node.layer_payload("fullmap", "3d")
 
 
-def test_navigation_page_replaces_localization_global_map_with_local_map():
+def test_navigation_page_adds_localization_global_map_and_obstacles():
     package_root = Path(__file__).resolve().parents[1]
     static_dir = package_root / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -207,34 +213,49 @@ def test_navigation_page_replaces_localization_global_map_with_local_map():
         package_root / "web_control" / "web_control_node.py"
     ).read_text(encoding="utf-8")
 
-    # The navigation layer set is localization local_map + navigation clouds.
-    assert web_control_node.LAYER_NAMES == {"local_map", "mapcloud", "mapground"}
+    assert web_control_node.LAYER_NAMES == {
+        "global_map",
+        "local_map",
+        "mapcloud",
+        "mapground",
+        "obstacles",
+    }
 
-    # Navigation sidebar checkbox and JavaScript layer declaration.
-    assert 'data-layer="local_map"' in index_html
+    # Both new navigation layers are enabled by default in the sidebar.
+    assert 'data-layer="global_map" checked> global map' in index_html
+    assert 'data-layer="obstacles" checked> obstacles' in index_html
     assert 'data-layer="local_map" checked> local map' in index_html
-    assert 'data-layer="mapcloud" checked> global map' in index_html
+    assert 'data-layer="mapcloud" checked> navigation map' in index_html
     assert 'data-layer="mapground" checked> ground map' in index_html
-    assert 'data-layer="global_map"' not in index_html
+    assert 'data-layer="fullmap"' not in index_html
     navigation_layers = app_js[
         app_js.index("const LAYERS = {") : app_js.index("const MAPPING_LAYERS = {")
     ]
-    assert "local_map: { color: 0x8ea4b8" in navigation_layers
-    assert "mapcloud: { color: 0x49b59f, points3d: [], enabled: true" in navigation_layers
-    assert "global_map" not in navigation_layers
+    assert "global_map: { color: 0x6f8fb0, points3d: [], enabled: true" in navigation_layers
+    assert "obstacles: { color: 0xff0000, points3d: [], enabled: true" in navigation_layers
+    assert "pointSize: 5" in navigation_layers
+    assert "flatColor: true" in navigation_layers
+    assert "fullmap" not in navigation_layers
 
-    # ROS parameter, cache, subscription, and API default layer.
+    # Direct localization global-map subscription (never the mapping page's
+    # topic) plus the live aggregated obstacle cloud.
     assert (
-        'self.declare_parameter("local_map_topic", "/lio_sam/localization/local_map")'
+        'self.declare_parameter("global_map_topic", "/lio_sam/localization/global_map")'
         in node_source
     )
-    assert '"local_map": SourceCache("local_map"' in node_source
-    assert '"local_map": str(self.get_parameter("local_map_topic").value)' in node_source
+    assert 'self.declare_parameter("obstacle_topic", "/aggregated_pc")' in node_source
+    assert '"global_map": SourceCache("global_map"' in node_source
+    assert '"obstacles": SourceCache("obstacles"' in node_source
+    assert "def obstacle_callback(self, msg: PointCloud2)" in node_source
+    assert 'self.get_parameter("obstacle_topic").value' in node_source
+    assert "FullMapCache" not in node_source
+    assert "full_map" not in node_source
     assert 'layer = query.get("layer", ["local_map"])[0]' in node_source
-    assert 'local_map_topic: "/lio_sam/localization/local_map"' in config_yaml
+    assert 'global_map_topic: "/lio_sam/localization/global_map"' in config_yaml
+    assert 'obstacle_topic: "/aggregated_pc"' in config_yaml
 
 
-def test_navigation_page_no_longer_declares_localization_global_map():
+def test_navigation_global_map_is_direct_localization_topic_not_mapping():
     package_root = Path(__file__).resolve().parents[1]
     node_source = (
         package_root / "web_control" / "web_control_node.py"
@@ -245,12 +266,15 @@ def test_navigation_page_no_longer_declares_localization_global_map():
 
     assert (
         'self.declare_parameter("global_map_topic", "/lio_sam/localization/global_map")'
-        not in node_source
+        in node_source
     )
-    assert (
-        '"global_map": SourceCache("global_map"' not in node_source
-    )
-    assert "    global_map_topic:" not in config_yaml
+    assert '"global_map": SourceCache("global_map"' in node_source
+    assert "    global_map_topic:" in config_yaml
+    # The mapping page keeps its independent live mapping cloud.
+    assert "mapping_global_map_topic" in config_yaml
+    assert 'self.declare_parameter("mapping_global_map_topic", "/lio_sam/mapping/map_global")' in node_source
+    assert "FullMapCache" not in node_source
+    assert "read_pcd" not in node_source
 
 
 def test_mapping_page_keeps_its_global_map_layer_and_topics():
@@ -406,42 +430,353 @@ def test_liquid_glass_helper_exports_provenance_and_static_assets():
     assert "sessionStorage" not in source
 
 
+def test_track_refraction_module_exports_pure_and_lifecycle_api():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    source = (static_dir / "track-refraction.js").read_text(encoding="utf-8")
+
+    for name in (
+        "smoothStep",
+        "roundedRectSDF",
+        "computeTrackDisplacementField",
+        "initTrackRefraction",
+    ):
+        assert f"export function {name}" in source
+    assert "https://github.com/shuding/liquid-glass" in source
+    assert "THIRD_PARTY_NOTICES.md" in source
+    assert "MIT" in source
+    assert "Shu Ding" in source
+    assert 'setAttribute("color-interpolation-filters", "sRGB")' in source
+    assert '"feImage"' in source
+    assert '"feDisplacementMap"' in source
+    assert "liquidTrackFilter" in source
+    assert "ResizeObserver" in source
+    assert "matchMedia" in source
+    assert 'addEventListener("resize"' in source
+    assert "onGlassModeChange" in source
+    assert "localStorage" not in source
+    assert "sessionStorage" not in source
+
+
+def test_liquid_glass_exposes_safe_mode_subscription():
+    source = (
+        Path(__file__).resolve().parents[1] / "static" / "liquid-glass.js"
+    ).read_text(encoding="utf-8")
+
+    assert "export function onGlassModeChange(listener)" in source
+    assert "modeListeners.add(listener)" in source
+    assert "modeListeners.delete(listener)" in source
+    apply_body = _js_function_body(source, "export function applyGlassMode(mode)")
+    assert "notifyGlassMode(resolved);" in apply_body
+    notify_body = _js_function_body(source, "function notifyGlassMode(mode)")
+    assert "try {" in notify_body
+    assert "catch" in notify_body
+
+
+def test_track_refraction_is_wired_after_init_liquid_glass():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'import { initTrackRefraction } from "./track-refraction.js";' in app_js
+    assert "initLiquidGlass({ savedMode: readStoredGlassStrength() });\ninitTrackRefraction();" in app_js
+
+
+def test_third_party_notices_license_and_packaging():
+    root = Path(__file__).resolve().parents[1]
+    notice = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert "shuding/liquid-glass" in notice
+    assert "MIT License" in notice
+    assert "Copyright (c) 2025 Shu Ding" in notice
+    assert "Permission is hereby granted, free of charge" in notice
+    assert "adapt" in notice.lower()
+
+    setup_py = (root / "setup.py").read_text(encoding="utf-8")
+    assert "THIRD_PARTY_NOTICES.md" in setup_py
+    assert "share/{package_name}/static" in setup_py
+    assert "share/{package_name}/static/vendor" in setup_py
+    assert "share/{package_name}/config" in setup_py
+    assert "share/{package_name}/launch" in setup_py
+
+
+def test_glass_full_track_uses_dynamic_filter_and_thumb_is_static():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    track = _css_rule_block(styles_css, ".glass-full .sliding-tabs")
+    assert (
+        "backdrop-filter: url(#liquidTrackFilter) blur(0.25px) contrast(1.2) brightness(1.05) saturate(1.1);"
+        in track
+    )
+    assert (
+        "-webkit-backdrop-filter: url(#liquidTrackFilter) blur(0.25px) contrast(1.2) brightness(1.05) saturate(1.1);"
+        in track
+    )
+    shared = _css_rule_block(styles_css, ":where(.glass-full, .glass-light) .sliding-tabs")
+    assert "background: var(--track-glass-bg);" in shared
+    assert "border-color: var(--track-glass-edge);" in shared
+    assert "0 4px 8px rgba(0, 0, 0, 0.25)" in shared
+    assert "inset 0 -10px 25px rgba(0, 0, 0, 0.15)" in shared
+    assert ".glass-full .sliding-tabs::before" not in styles_css
+
+    static_start = styles_css.index(".glass-full .segmented::before,")
+    static_body = styles_css[
+        styles_css.index("{", static_start) + 1 : styles_css.index("}", static_start)
+    ]
+    assert "backdrop-filter: url(#liquidDrop) saturate(1.4);" in static_body
+    assert "-webkit-backdrop-filter: url(#liquidDrop) saturate(1.4);" in static_body
+    assert ".glass-full .sidebar-toggle-lens {" in styles_css
+
+
+def test_glass_light_track_fallback_and_track_tokens():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    light = _css_rule_block(styles_css, ".glass-light .sliding-tabs")
+    assert "backdrop-filter: blur(22px) saturate(1.4);" in light
+    assert "-webkit-backdrop-filter: blur(22px) saturate(1.4);" in light
+
+    root = _css_rule_block(styles_css, ":root")
+    assert "--track-glass-bg: rgba(255, 255, 255, 0.14);" in root
+    assert "--track-glass-edge: rgba(255, 255, 255, 0.92);" in root
+    assert "--track-glass-label: #f8fafc;" in root
+    assert "--track-system-label: #111827;" in root
+    assert "--track-glass-bg: rgba(8, 12, 20, 0.16);" in styles_css
+    assert "--track-glass-label: #f5f7fb;" in styles_css
+    assert "--track-system-label: #f5f7fb;" in styles_css
+
+    off = _css_rule_block(styles_css, ".glass-off")
+    assert "--track-glass-bg: rgba(255, 255, 255, 0.96);" in off
+    assert "--track-glass-label: #111827;" in off
+    assert "--track-glass-bg: rgba(28, 28, 34, 0.98);" in styles_css
+
+
+def test_glass_system_mode_labels_use_dedicated_token():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    # Map views sit on a dark canvas, so translucent tracks keep the light
+    # --track-glass-label for their inactive labels.
+    map_start = styles_css.index(".glass-full .sliding-tabs .tab:not(.active),")
+    map_rule = styles_css[map_start : styles_css.index("}", map_start)]
+    assert ".glass-light .sliding-tabs .tab:not(.active)" in map_rule
+    assert "color: var(--track-glass-label);" in map_rule
+
+    # System has its own surface, so its inactive labels use the dedicated
+    # scheme-aware --track-system-label token in every glass tier.
+    system_selector = (
+        ":where(.glass-full, .glass-light, .glass-off) .app.system-mode "
+        ".sliding-tabs .tab:not(.active)"
+    )
+    system_rule = _css_rule_block(styles_css, system_selector)
+    assert "color: var(--track-system-label);" in system_rule
+
+
+def test_glass_track_rules_add_no_layout_or_animation_properties():
+    styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    forbidden = (
+        "width:",
+        "height:",
+        "padding",
+        "margin",
+        "grid",
+        "position:",
+        "top:",
+        "left:",
+        "right:",
+        "bottom:",
+        "inset:",
+        "display:",
+        "flex",
+        "gap:",
+        "font-size",
+        "transform:",
+        "transition:",
+        "animation:",
+        "will-change:",
+    )
+    for selector in (
+        ":where(.glass-full, .glass-light) .sliding-tabs",
+        ".glass-full .sliding-tabs",
+        ".glass-light .sliding-tabs",
+        ".glass-off .sliding-tabs",
+        (
+            ":where(.glass-full, .glass-light, .glass-off) .app.system-mode "
+            ".sliding-tabs .tab:not(.active)"
+        ),
+    ):
+        block = _css_rule_block(styles_css, selector)
+        for prop in forbidden:
+            assert prop not in block, (selector, prop)
+
+
 def test_liquid_glass_wiring_in_app():
     app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
         encoding="utf-8"
     )
-    assert 'import { initLiquidGlass, glassMotionReduced } from "./liquid-glass.js";' in app_js
-    assert "initLiquidGlass();" in app_js
+    assert (
+        'import { initLiquidGlass, glassMotionReduced, glassMode, onGlassModeChange, '
+        'setGlassMode } from "./liquid-glass.js";' in app_js
+    )
+    assert "initLiquidGlass({ savedMode: readStoredGlassStrength() });" in app_js
 
 
-_LIQUID_GLASS_CAPABILITY_NODE_HARNESS = r"""
+def test_system_view_exposes_manual_glass_strength_selector():
+    index_html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="viewSystem"' in index_html
+    select_start = index_html.index('id="glassStrength"')
+    select_body = index_html[select_start : index_html.index("</select>", select_start)]
+    assert 'for="glassStrength"' in index_html
+    assert "Glass Strength" in index_html
+    for value, label in (("full", "Full"), ("light", "Light"), ("off", "Off")):
+        assert f'value="{value}"' in select_body, value
+        assert f">{label}<" in select_body, label
+    # Only the three documented strengths are offered.
+    assert select_body.count("<option") == 3
+    # The selector lives inside the System view, not the sidebar.
+    assert index_html.index('id="viewSystem"') < select_start
+
+
+def test_liquid_glass_helper_has_no_capability_heuristics():
+    source = (
+        Path(__file__).resolve().parents[1] / "static" / "liquid-glass.js"
+    ).read_text(encoding="utf-8")
+    for forbidden in (
+        "isChromiumEngine",
+        "saveDataEnabled",
+        "supportsDisplacement",
+        "userAgentData",
+        "navigator.userAgent",
+        "navigator.connection",
+        "CSS.supports",
+        "prefers-reduced-transparency",
+        "prefersReducedTransparency",
+        "transparencyQuery",
+    ):
+        assert forbidden not in source, forbidden
+    detect_body = _js_function_body(source, "export function detectGlassMode()")
+    assert 'return "full";' in detect_body
+    assert 'return "light";' not in detect_body
+    assert 'return "off";' not in detect_body
+    # Only explicit signals decide the strength.
+    assert "manualOverride" in detect_body
+    assert "queryOverride" in detect_body
+    assert "savedMode" in detect_body
+
+
+def test_app_persists_glass_strength_locally_not_server_side():
+    app_js = (Path(__file__).resolve().parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'const GLASS_STRENGTH_KEY = "web_control_glass_strength";' in app_js
+    assert "window.localStorage.getItem(GLASS_STRENGTH_KEY)" in app_js
+    assert "window.localStorage.setItem(GLASS_STRENGTH_KEY, mode)" in app_js
+    block = app_js[
+        app_js.index("// --- Glass strength preference") : app_js.index(
+            "// --- End glass strength preference"
+        )
+    ]
+    assert "/api/" not in block
+
+
+_GLASS_STRENGTH_PREFERENCE_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const blockStart = source.indexOf("// --- Glass strength preference");
+const blockEnd = source.indexOf("// --- End glass strength preference");
+if (blockStart < 0 || blockEnd < 0) throw new Error("glass strength block not found");
+const block = source.slice(blockStart, blockEnd);
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+const store = new Map();
+global.localStorage = {
+  getItem(key) { return store.has(key) ? store.get(key) : null; },
+  setItem(key, value) { store.set(key, String(value)); },
+  removeItem(key) { store.delete(key); },
+};
+const select = {
+  value: "full",
+  listeners: {},
+  addEventListener(type, listener) { this.listeners[type] = listener; },
+};
+global.document = {
+  getElementById(id) { return id === "glassStrength" ? select : null; },
+};
+global.window = global;
+let applied = null;
+global.setGlassMode = (mode) => { applied = mode; return mode; };
+global.glassMode = () => (applied === null ? "full" : applied);
+
+const api = new Function(block + `
+return {
+  readStoredGlassStrength,
+  storeGlassStrength,
+  updateGlassStrengthControl,
+  applyGlassStrength,
+  attachGlassStrengthControl,
+};`)();
+
+expect(api.readStoredGlassStrength() === null, "no saved value reads null");
+store.set("web_control_glass_strength", "banana");
+expect(api.readStoredGlassStrength() === null, "invalid saved value is ignored");
+store.set("web_control_glass_strength", "light");
+expect(api.readStoredGlassStrength() === "light", "valid saved value is read");
+api.storeGlassStrength("banana");
+expect(store.get("web_control_glass_strength") === "light", "invalid values are never stored");
+expect(api.applyGlassStrength("off") === "off", "applyGlassStrength returns the applied mode");
+expect(applied === "off", "applyGlassStrength applies the mode");
+expect(store.get("web_control_glass_strength") === "off", "applyGlassStrength persists the mode");
+expect(select.value === "off", "applyGlassStrength mirrors the selector");
+api.attachGlassStrengthControl();
+expect(typeof select.listeners.change === "function", "attach wires the change handler");
+select.listeners.change({ target: { value: "full" } });
+expect(applied === "full", "change applies the selector value");
+expect(store.get("web_control_glass_strength") === "full", "change persists the selector value");
+
+const denied = { getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); } };
+global.localStorage = denied;
+expect(api.readStoredGlassStrength() === null, "denied storage reads null");
+api.storeGlassStrength("light");
+console.log("glass strength preference ok");
+"""
+
+
+def test_glass_strength_preference_persists_in_browser_storage():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _GLASS_STRENGTH_PREFERENCE_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "glass strength preference ok" in completed.stdout
+
+
+_LIQUID_GLASS_MODE_SELECTION_NODE_HARNESS = r"""
 const { pathToFileURL } = require("url");
 const path = process.env.LIQUID_GLASS;
 
-function stub({
-  search = "",
-  userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
-  brands = [{ brand: "Chromium", version: "120" }],
-  saveData = false,
-  reducedTransparency = false,
-  reducedMotion = false,
-  supports = true,
-} = {}) {
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    value: {
-      userAgent,
-      userAgentData: { brands },
-      connection: { saveData, addEventListener() {} },
-    },
-  });
+let mediaQueries = [];
+
+function stub({ search = "", reducedMotion = false } = {}) {
+  mediaQueries = [];
   globalThis.location = { search };
   globalThis.window = globalThis;
-  globalThis.CSS = { supports: () => supports };
-  globalThis.matchMedia = (query) => ({
-    matches: /prefers-reduced-transparency/.test(query) ? reducedTransparency : reducedMotion,
-    addEventListener() {},
-  });
+  globalThis.matchMedia = (query) => {
+    mediaQueries.push(query);
+    return {
+      matches: /prefers-reduced-motion/.test(query) ? reducedMotion : false,
+      addEventListener() {},
+    };
+  };
   globalThis.document = {
     documentElement: {
       lastMode: null,
@@ -459,40 +794,54 @@ async function load(caseName) {
 function expect(condition, message) { if (!condition) throw new Error(message); }
 
 (async () => {
-  // Chromium with CSS.supports and no restrictions is full mode.
+  // With no explicit signal, Full is the deterministic default.
   stub();
-  let mod = await load("chromium");
-  expect(mod.detectGlassMode() === "full", "chromium full mode");
+  let mod = await load("default");
+  expect(mod.detectGlassMode() === "full", "no explicit choice defaults to full");
 
-  // Firefox is light even when CSS.supports is optimistic.
-  stub({ userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0", brands: [] });
-  mod = await load("firefox");
-  expect(mod.detectGlassMode() === "light", "firefox light mode");
+  // An invalid saved value falls through to the same Full default.
+  stub();
+  mod = await load("invalid-saved");
+  mod.initLiquidGlass({ savedMode: "banana" });
+  expect(mod.detectGlassMode() === "full", "invalid saved mode falls through to full");
 
-  // Save-data downgrades a capable engine.
-  stub({ saveData: true });
-  mod = await load("save-data");
-  expect(mod.detectGlassMode() === "light", "save-data light mode");
+  // prefers-reduced-motion only changes animation timing. It never changes the
+  // strength, and the helper must not consult prefers-reduced-transparency.
+  stub({ reducedMotion: true });
+  mod = await load("reduced-motion");
+  mod.initLiquidGlass();
+  expect(mod.detectGlassMode() === "full", "reduced motion does not change the strength");
+  expect(mod.glassMode() === "full", "reduced motion keeps the applied mode full");
+  expect(
+    mediaQueries.every((query) => !/transparency/i.test(query)),
+    "no transparency media query is consulted",
+  );
 
-  // Reduced transparency disables glass entirely.
-  stub({ reducedTransparency: true });
-  mod = await load("reduced-transparency");
-  expect(mod.detectGlassMode() === "off", "reduced transparency off mode");
+  // A valid saved choice is used when there is no override.
+  stub();
+  mod = await load("saved-mode");
+  mod.initLiquidGlass({ savedMode: "light" });
+  expect(mod.detectGlassMode() === "light", "saved mode is used");
 
-  // The query override wins over every automatic rule.
-  stub({ search: "?glass=off", reducedTransparency: true, saveData: true });
-  mod = await load("override-off");
-  expect(mod.detectGlassMode() === "off", "query override wins");
-  stub({ search: "?glass=full", reducedTransparency: true });
-  mod = await load("override-full");
-  expect(mod.detectGlassMode() === "full", "query override can force full");
+  // The query override stays explicit and outranks the saved choice.
+  stub({ search: "?glass=off" });
+  mod = await load("query-over-saved");
+  mod.initLiquidGlass({ savedMode: "full" });
+  expect(mod.detectGlassMode() === "off", "query override wins over the saved choice");
 
-  // The programmatic override wins over a conflicting query value.
+  // The programmatic override wins over a conflicting query value and a saved
+  // choice.
   stub({ search: "?glass=off" });
   mod = await load("override-programmatic");
-  mod.initLiquidGlass();
+  mod.initLiquidGlass({ savedMode: "light" });
   globalThis.__webControlSetGlassMode("full");
   expect(mod.detectGlassMode() === "full", "programmatic override wins over the query");
+
+  // setGlassMode is the deterministic programmatic entry point.
+  stub();
+  mod = await load("set-mode");
+  expect(mod.setGlassMode("light") === "light", "setGlassMode returns the applied mode");
+  expect(mod.glassMode() === "light", "setGlassMode applies the mode");
 
   // applyGlassMode records and mirrors the applied mode.
   stub();
@@ -501,7 +850,7 @@ function expect(condition, message) { if (!condition) throw new Error(message); 
   expect(mod.glassMode() === "off", "applyGlassMode stores the applied mode");
   expect(globalThis.document.documentElement.lastMode === "off", "data-glass-mode mirrors the mode");
 
-  console.log("liquid glass capabilities ok");
+  console.log("liquid glass mode selection ok");
 })().catch((error) => {
   console.error(error);
   process.exit(1);
@@ -509,19 +858,525 @@ function expect(condition, message) { if (!condition) throw new Error(message); 
 """
 
 
-def test_liquid_glass_capability_detection_under_node():
+def test_liquid_glass_mode_precedence_under_node():
     if shutil.which("node") is None:
         pytest.skip("node is not installed")
     liquid_glass = Path(__file__).resolve().parents[1] / "static" / "liquid-glass.js"
     completed = subprocess.run(
-        ["node", "-e", _LIQUID_GLASS_CAPABILITY_NODE_HARNESS],
+        ["node", "-e", _LIQUID_GLASS_MODE_SELECTION_NODE_HARNESS],
         capture_output=True,
         text=True,
         timeout=30,
         env={**os.environ, "LIQUID_GLASS": str(liquid_glass)},
     )
     assert completed.returncode == 0, completed.stderr
-    assert "liquid glass capabilities ok" in completed.stdout
+    assert "liquid glass mode selection ok" in completed.stdout
+
+
+_GLASS_MODE_SUBSCRIPTION_NODE_HARNESS = r"""
+const { pathToFileURL } = require("url");
+const path = process.env.LIQUID_GLASS;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+const classes = new Set();
+globalThis.document = {
+  documentElement: {
+    classList: {
+      toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute() {},
+  },
+  querySelector() { return null; },
+};
+globalThis.window = globalThis;
+globalThis.navigator = { connection: {}, userAgent: "", userAgentData: { brands: [] } };
+globalThis.CSS = { supports: () => true };
+globalThis.matchMedia = () => ({ matches: false, addEventListener() {} });
+
+(async () => {
+  const mod = await import(pathToFileURL(path).href + "?subscribe");
+  const seen = [];
+  const unsubscribeBad = mod.onGlassModeChange(() => { throw new Error("boom"); });
+  const unsubscribeGood = mod.onGlassModeChange((mode) => seen.push(mode));
+  mod.applyGlassMode("light");
+  expect(mod.glassMode() === "light", "mode applied despite a throwing listener");
+  expect(classes.has("glass-light"), "root class applied despite a throwing listener");
+  expect(seen.length === 1 && seen[0] === "light", "later listeners still run");
+  const unsubscribeNoop = mod.onGlassModeChange(null);
+  expect(typeof unsubscribeNoop === "function", "non-function listeners are ignored safely");
+  unsubscribeNoop();
+  unsubscribeBad();
+  unsubscribeGood();
+  mod.applyGlassMode("off");
+  expect(mod.glassMode() === "off", "mode still switches after unsubscribe");
+  expect(seen.length === 1, "unsubscribed listeners are not called");
+  console.log("glass mode subscription ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+
+def test_glass_mode_subscription_ignores_listener_errors_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    liquid_glass = Path(__file__).resolve().parents[1] / "static" / "liquid-glass.js"
+    completed = subprocess.run(
+        ["node", "-e", _GLASS_MODE_SUBSCRIPTION_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "LIQUID_GLASS": str(liquid_glass)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "glass mode subscription ok" in completed.stdout
+
+
+_TRACK_REFRACTION_FIELD_NODE_HARNESS = r"""
+const { pathToFileURL } = require("url");
+const path = process.env.TRACK_REFRACTION;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function close(a, b, eps, message) {
+  if (Math.abs(a - b) > eps) throw new Error(message + ": " + a + " vs " + b);
+}
+
+(async () => {
+  const mod = await import(pathToFileURL(path).href + "?field");
+
+  expect(mod.smoothStep(0, 1, 0.5) === 0.5, "smoothStep midpoint");
+  expect(mod.smoothStep(0, 1, -2) === 0, "smoothStep clamps low");
+  expect(mod.smoothStep(0, 1, 3) === 1, "smoothStep clamps high");
+  expect(mod.smoothStep(5, 1, 3) === 0.5, "smoothStep descending midpoint");
+
+  close(mod.roundedRectSDF(0, 0, 10, 6, 5), -6, 1e-9, "center distance");
+  close(mod.roundedRectSDF(10, 0, 10, 6, 5), 0, 1e-9, "right edge");
+  close(mod.roundedRectSDF(11, 0, 10, 6, 5), 1, 1e-9, "outside right");
+  close(mod.roundedRectSDF(-10, 0, 10, 6, 5), 0, 1e-9, "left edge");
+  close(mod.roundedRectSDF(0, 6, 10, 6, 5), 0, 1e-9, "top edge");
+  close(
+    mod.roundedRectSDF(4, 3, 10, 6, 5),
+    mod.roundedRectSDF(-4, 3, 10, 6, 5),
+    1e-9,
+    "x symmetry",
+  );
+  expect(mod.roundedRectSDF(0, 0, 10, 6, 5) < 0, "inside is negative");
+  expect(mod.roundedRectSDF(30, 30, 10, 6, 5) > 0, "outside is positive");
+
+  const first = mod.computeTrackDisplacementField({ width: 320, height: 48, dpr: 2 });
+  const second = mod.computeTrackDisplacementField({ width: 320, height: 48, dpr: 2 });
+  expect(first.width === 640 && first.height === 96, "device dimensions honor DPR");
+  expect(first.data.length === 640 * 96 * 4, "RGBA length");
+  for (let i = 0; i < first.data.length; i += 1) {
+    if (first.data[i] !== second.data[i]) throw new Error("field is not deterministic");
+  }
+
+  const centerIndex = ((first.height >> 1) * first.width + (first.width >> 1)) * 4;
+  expect(first.data[centerIndex] === 128, "center R neutral");
+  expect(first.data[centerIndex + 1] === 128, "center G neutral");
+  expect(first.data[centerIndex + 2] === 0, "center B zero");
+  expect(first.data[centerIndex + 3] === 255, "center alpha");
+
+  const leftMidIndex = (first.height >> 1) * first.width * 4;
+  expect(first.data[leftMidIndex] !== 128, "left rim mid-edge displaced horizontally");
+
+  // Sample the field by CSS coordinate. Pixel centers sit at
+  // x = (px + 0.5) / dpr - halfWidth, so invert that to find the index.
+  function sampleChannel(field, cssWidth, cssHeight, cssDpr, cssX, cssY) {
+    const halfW = cssWidth / 2;
+    const halfH = cssHeight / 2;
+    const px = Math.max(0, Math.min(field.width - 1, Math.round((cssX + halfW) * cssDpr - 0.5)));
+    const py = Math.max(0, Math.min(field.height - 1, Math.round((cssY + halfH) * cssDpr - 0.5)));
+    const i = (py * field.width + px) * 4;
+    return { r: field.data[i], g: field.data[i + 1], px, py };
+  }
+
+  // A wide pill's straight top edge far from the rounded caps must refract
+  // straight inward: the horizontal channel stays neutral and only G moves.
+  // Center-radial displacement leaks a large horizontal component here.
+  const topEdge = sampleChannel(first, 320, 48, 2, 60, -23.25);
+  expect(topEdge.r === 128, "top edge far from caps keeps R neutral");
+  expect(topEdge.g > 200, "top edge far from caps drives G inward");
+
+  // The rounded right cap must refract horizontally inward: R moves and G
+  // stays approximately neutral.
+  const rightCap = sampleChannel(first, 320, 48, 2, 158, 0);
+  expect(rightCap.r < 80, "right cap drives R inward");
+  expect(Math.abs(rightCap.g - 128) <= 8, "right cap keeps G approximately neutral");
+
+  let rimDisplaced = false;
+  let alphaOk = true;
+  let outsideNeutral = true;
+  let displacementBounded = true;
+  const strength = Math.max(2, 48 * 0.12);
+  for (let py = 0; py < first.height; py += 1) {
+    const cssY = (py + 0.5) / 2 - 24;
+    for (let px = 0; px < first.width; px += 1) {
+      const i = (py * first.width + px) * 4;
+      if (first.data[i] !== 128 || first.data[i + 1] !== 128) rimDisplaced = true;
+      if (first.data[i + 3] !== 255 || first.data[i + 2] !== 0) alphaOk = false;
+      const cssX = (px + 0.5) / 2 - 160;
+      if (mod.roundedRectSDF(cssX, cssY, 160, 24, 24) > 0) {
+        if (first.data[i] !== 128 || first.data[i + 1] !== 128) outsideNeutral = false;
+      }
+      const dx = (first.data[i] / 255 - 0.5) * first.scale;
+      const dy = (first.data[i + 1] / 255 - 0.5) * first.scale;
+      if (Math.abs(dx) > strength + 0.05 || Math.abs(dy) > strength + 0.05) {
+        displacementBounded = false;
+      }
+    }
+  }
+  expect(rimDisplaced, "rim is displaced");
+  expect(alphaOk, "every pixel is opaque with B=0");
+  // CSS border-radius clips the corner outside the pill, so keep every outside
+  // pixel neutral rather than cementing displacement that is never visible.
+  expect(outsideNeutral, "every pixel outside the pill stays neutral");
+  expect(first.data[0] === 128, "corner outside the pill stays R neutral");
+  expect(first.data[1] === 128, "corner outside the pill stays G neutral");
+  expect(displacementBounded, "decoded displacement stays bounded by strength");
+
+  const dpr1 = mod.computeTrackDisplacementField({ width: 320, height: 48, dpr: 1 });
+  const dpr2 = mod.computeTrackDisplacementField({ width: 320, height: 48, dpr: 2 });
+  expect(dpr1.width === 320 && dpr2.width === 640, "DPR doubles device width");
+  close(dpr1.scale, dpr2.scale, 1e-9, "scale is DPR independent (CSS pixels)");
+  expect(dpr1.scale > 0, "scale is positive");
+
+  const tiny = mod.computeTrackDisplacementField({ width: 0, height: 0, dpr: 0 });
+  expect(tiny.width === 1 && tiny.height === 1, "degenerate size clamps to one device pixel");
+  expect(Number.isFinite(tiny.scale), "degenerate scale is finite");
+
+  console.log("track refraction field ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+
+def test_track_refraction_field_math_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    module = Path(__file__).resolve().parents[1] / "static" / "track-refraction.js"
+    completed = subprocess.run(
+        ["node", "-e", _TRACK_REFRACTION_FIELD_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "TRACK_REFRACTION": str(module)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "track refraction field ok" in completed.stdout
+
+
+_TRACK_REFRACTION_LIFECYCLE_NODE_HARNESS = r"""
+const { pathToFileURL } = require("url");
+const path = process.env.TRACK_REFRACTION;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+function makeElement(tag) {
+  const element = {
+    tag,
+    tagName: tag.toUpperCase(),
+    localName: tag,
+    children: [],
+    parentNode: null,
+    attributes: {},
+    style: {},
+    id: "",
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === "id") this.id = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name)
+        ? this.attributes[name]
+        : null;
+    },
+    setAttributeNS(_ns, name, value) { this.attributes[name] = String(value); },
+    appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+    append(...nodes) { nodes.forEach((node) => this.appendChild(node)); },
+    remove() {
+      if (!this.parentNode) return;
+      const index = this.parentNode.children.indexOf(this);
+      if (index >= 0) this.parentNode.children.splice(index, 1);
+      this.parentNode = null;
+    },
+    querySelector(selector) {
+      const id = selector.startsWith("#") ? selector.slice(1) : null;
+      if (!id) return null;
+      for (const child of this.children) {
+        if (child.id === id) return child;
+        const nested = child.querySelector ? child.querySelector(selector) : null;
+        if (nested) return nested;
+      }
+      return null;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  return element;
+}
+
+function makeCanvas() {
+  const canvas = makeElement("canvas");
+  canvas.width = 0;
+  canvas.height = 0;
+  canvas.puts = 0;
+  canvas.dataUrls = 0;
+  canvas.context = { putImageData(image) { canvas.puts += 1; canvas.lastImage = image; } };
+  canvas.getContext = () => canvas.context;
+  canvas.toDataURL = () => {
+    canvas.dataUrls += 1;
+    return "data:image/png;base64,canvas-" + canvas.width + "x" + canvas.height + "-" + canvas.dataUrls;
+  };
+  return canvas;
+}
+
+function makeDocument(track) {
+  const defs = makeElement("defs");
+  const document = {
+    defs,
+    created: [],
+    getElementById(id) { return id === "viewTabs" ? track : null; },
+    querySelector(selector) { return selector === "#liquidGlassDefs defs" ? defs : null; },
+    createElementNS(_ns, tag) { const el = makeElement(tag); document.created.push(el); return el; },
+    createElement(tag) { const el = tag === "canvas" ? makeCanvas() : makeElement(tag); document.created.push(el); return el; },
+  };
+  return document;
+}
+
+function makeTrack(width, height) {
+  const track = makeElement("div");
+  track.cssWidth = width;
+  track.cssHeight = height;
+  track.getBoundingClientRect = () => ({ width: track.cssWidth, height: track.cssHeight });
+  return track;
+}
+
+const observerInstances = [];
+class FakeResizeObserver {
+  constructor(callback) { this.callback = callback; this.targets = []; this.disconnects = 0; observerInstances.push(this); }
+  observe(target) { this.targets.push(target); }
+  disconnect() { this.disconnects += 1; }
+  trigger() { this.callback([], this); }
+}
+
+const frames = new Map();
+let nextFrame = 1;
+function requestAnimationFrame(cb) { const id = nextFrame++; frames.set(id, cb); return id; }
+function cancelAnimationFrame(id) { frames.delete(id); }
+function runFrames() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((cb) => cb());
+}
+
+function makeWindow() {
+  const listeners = new Map();
+  return {
+    listeners,
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (listeners.has(type)) listeners.get(type).delete(handler);
+    },
+    dispatch(type) {
+      if (listeners.has(type)) Array.from(listeners.get(type)).forEach((handler) => handler({ type }));
+    },
+  };
+}
+
+function makeMatchMedia() {
+  const medias = [];
+  function matchMedia(query) {
+    const media = {
+      query,
+      listeners: new Set(),
+      addEventListener(type, handler) { media.listeners.add(handler); },
+      removeEventListener(type, handler) { media.listeners.delete(handler); },
+    };
+    medias.push(media);
+    return media;
+  }
+  matchMedia.medias = medias;
+  return matchMedia;
+}
+
+function makeModeChannel(initialMode) {
+  let mode = initialMode;
+  const listeners = new Set();
+  return {
+    getMode: () => mode,
+    subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    listenerCount: () => listeners.size,
+    set(nextMode) { mode = nextMode; Array.from(listeners).forEach((listener) => listener(nextMode)); },
+  };
+}
+
+(async () => {
+  const mod = await import(pathToFileURL(path).href + "?lifecycle");
+  const track = makeTrack(320, 48);
+  const document = makeDocument(track);
+  const window = makeWindow();
+  const matchMedia = makeMatchMedia();
+  const channel = makeModeChannel("full");
+  let dpr = 1;
+  const options = {
+    document,
+    track,
+    defs: document.defs,
+    ResizeObserver: FakeResizeObserver,
+    requestAnimationFrame,
+    cancelAnimationFrame,
+    window,
+    matchMedia,
+    getDevicePixelRatio: () => dpr,
+    getGlassMode: channel.getMode,
+    onGlassModeChange: channel.subscribe,
+  };
+
+  // Pre-seed the defs with an incomplete filter using the same id. init must
+  // remove it and install exactly one complete filter, so the DOM never holds
+  // duplicate #liquidTrackFilter nodes.
+  const staleFilter = document.createElementNS("http://www.w3.org/2000/svg", "filter");
+  staleFilter.setAttribute("id", "liquidTrackFilter");
+  document.defs.appendChild(staleFilter);
+  expect(
+    document.defs.children.filter((child) => child.id === "liquidTrackFilter").length === 1,
+    "incomplete filter pre-seeded",
+  );
+
+  const controller = mod.initTrackRefraction(options);
+  expect(controller, "init returns a controller");
+  const filter = document.defs.querySelector("#liquidTrackFilter");
+  expect(filter !== null, "full install injects the filter");
+  expect(
+    document.defs.children.filter((child) => child.id === "liquidTrackFilter").length === 1,
+    "incomplete filter is replaced, not duplicated",
+  );
+  expect(filter.children.some((child) => child.tag === "feImage"), "replacement filter has feImage");
+  expect(
+    filter.children.some((child) => child.tag === "feDisplacementMap"),
+    "replacement filter has feDisplacementMap",
+  );
+  expect(filter.getAttribute("color-interpolation-filters") === "sRGB", "hyphenated color-interpolation-filters");
+  expect(filter.getAttribute("filterUnits") === "userSpaceOnUse", "userSpaceOnUse filter units");
+  expect(observerInstances.length === 1, "one ResizeObserver is created");
+  expect(observerInstances[0].targets.length === 1, "the observer watches the track");
+  expect(frames.size === 1, "install schedules one render frame");
+
+  controller.render();
+  controller.render();
+  expect(frames.size === 1, "render requests coalesce");
+
+  runFrames();
+  const feImage = filter.children.find((child) => child.tag === "feImage");
+  const displacement = filter.children.find((child) => child.tag === "feDisplacementMap");
+  expect(feImage !== null && displacement !== null, "filter primitives exist");
+  const canvas = document.created.find((el) => el.tag === "canvas");
+  expect(canvas.width === 320 && canvas.height === 48, "canvas uses DPR 1 device size");
+  expect(canvas.puts === 1, "the map is uploaded once");
+  const firstHref = feImage.getAttribute("href");
+  expect(typeof firstHref === "string" && firstHref.startsWith("data:image/png;base64,"), "feImage href is a data URL");
+  expect(Number(displacement.getAttribute("scale")) > 0, "displacement scale is positive");
+  expect(feImage.getAttribute("width") === "320", "feImage width is the CSS track width");
+  expect(feImage.getAttribute("height") === "48", "feImage height is the CSS track height");
+  expect(canvas.dataUrls === 1, "one data URL per render");
+
+  controller.render();
+  runFrames();
+  expect(canvas.puts === 1, "unchanged size dedupes the upload");
+  expect(canvas.dataUrls === 1, "unchanged size dedupes the data URL");
+
+  track.cssWidth = 400;
+  observerInstances[0].trigger();
+  expect(frames.size === 1, "observer resize schedules one frame");
+  runFrames();
+  expect(canvas.width === 400, "resize rebuilds the canvas width");
+  expect(canvas.puts === 2, "resize re-uploads the map");
+  expect(canvas.dataUrls === 2, "resize rebuilds the data URL");
+  expect(feImage.getAttribute("width") === "400", "resize updates the filter region");
+
+  dpr = 2;
+  window.dispatch("resize");
+  runFrames();
+  expect(canvas.width === 800, "DPR change rebuilds the canvas at device pixels");
+
+  channel.set("light");
+  expect(document.defs.querySelector("#liquidTrackFilter") === null, "light mode removes the filter");
+  expect(observerInstances[0].disconnects === 1, "light mode disconnects the observer");
+  expect(window.listeners.get("resize").size === 0, "light mode removes the window listener");
+
+  controller.render();
+  expect(frames.size === 0, "light mode never schedules a frame");
+
+  channel.set("full");
+  expect(document.defs.querySelector("#liquidTrackFilter") !== null, "re-enable reinstalls the filter");
+  expect(observerInstances.length === 2, "re-enable creates a fresh observer");
+  const putsBeforeReenable = canvas.puts;
+  controller.render();
+  runFrames();
+  expect(canvas.puts === putsBeforeReenable + 1, "re-enable rebuilds the map");
+
+  const again = mod.initTrackRefraction(options);
+  expect(again === controller, "repeated init returns the same controller");
+  expect(
+    document.defs.children.filter((child) => child.id === "liquidTrackFilter").length === 1,
+    "no duplicate filter",
+  );
+
+  controller.render();
+  const captured = Array.from(frames.values());
+  frames.clear();
+  channel.set("off");
+  const putsBeforeStale = canvas.puts;
+  captured.forEach((cb) => cb());
+  expect(canvas.puts === putsBeforeStale, "a stale callback cannot render after removal");
+
+  channel.set("full");
+  const putsBeforeDestroy = canvas.puts;
+  controller.render();
+  runFrames();
+  expect(channel.listenerCount() >= 1, "controller is subscribed");
+  const activeObserver = observerInstances[observerInstances.length - 1];
+  controller.destroy();
+  controller.destroy();
+  expect(document.defs.querySelector("#liquidTrackFilter") === null, "destroy removes the filter");
+  expect(channel.listenerCount() === 0, "destroy unsubscribes");
+  expect(activeObserver.disconnects === 1, "destroy disconnects the active observer once");
+  expect(window.listeners.get("resize").size === 0, "destroy removes the window listener");
+  expect(matchMedia.medias[matchMedia.medias.length - 1].listeners.size === 0, "destroy removes the DPR watcher");
+  controller.render();
+  runFrames();
+  expect(canvas.puts === putsBeforeDestroy + 1, "destroyed controller never renders again");
+
+  console.log("track refraction lifecycle ok");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+
+def test_track_refraction_lifecycle_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    module = Path(__file__).resolve().parents[1] / "static" / "track-refraction.js"
+    completed = subprocess.run(
+        ["node", "-e", _TRACK_REFRACTION_LIFECYCLE_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "TRACK_REFRACTION": str(module)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "track refraction lifecycle ok" in completed.stdout
 
 
 def test_frontend_exposes_mapping_tab_and_mapping_sidebar():
@@ -562,8 +1417,10 @@ def test_frontend_polls_mapping_3d_sources_only_for_mapping_tab():
     assert "const mappingVehicleGroup = new THREE.Group();" in app_js
     assert 'getJson(`/api/mapping/map3d?layer=${encodeURIComponent(name)}`)' in app_js
     assert 'getJson("/api/mapping/path")' in app_js
-    assert 'if (state.view !== "mapping") return;' in app_js
-    assert "setInterval(() => pollMapping3d(false), 5000)" in app_js
+    assert 'view === "mapping"' in app_js
+    assert "mappingLayers: 1000" in app_js
+    assert "setInterval(() => refreshController.tick(), REFRESH_RATES_MS.schedulerTick)" in app_js
+    assert "setInterval(() => pollMapping3d(false), 5000)" not in app_js
 
 
 def test_web_control_subscribes_mapping_topics_and_exposes_mapping_api():
@@ -609,7 +1466,7 @@ def test_frontend_polls_lightweight_pose_endpoint_for_realtime_vehicle_markers()
         Path(__file__).resolve().parents[1] / "static" / "app.js"
     ).read_text(encoding="utf-8")
 
-    assert 'getJson("/api/pose")' in app_js
+    assert 'timedGetJson("/api/pose")' in app_js
     assert "function pollPose()" in app_js
     assert "function updateLivePose(data)" in app_js
     assert "function updateNavigationPose(odom)" in app_js
@@ -732,18 +1589,22 @@ def test_goal_arrival_clears_goal_marker_and_paths_until_new_goal():
     ).read_text(encoding="utf-8")
     clear_start = app_js.index("function maybeClearGoalFromActionStatus()")
     clear_block = app_js[clear_start : app_js.index("function setMode", clear_start)]
-    poll_start = app_js.index("async function pollPaths")
-    poll_block = app_js[poll_start : app_js.index("function updateStatus", poll_start)]
+    scheduler_start = app_js.index("// --- Data refresh scheduler")
+    scheduler_block = app_js[
+        scheduler_start : app_js.index("// --- End data refresh scheduler", scheduler_start)
+    ]
     publish_start = app_js.index("async function publishPose()")
     publish_block = app_js[publish_start : app_js.index("async function stopManagedTarget", publish_start)]
 
     assert "hideCompletedPaths: false" in app_js
     assert "state.activeGoal = null;" in clear_block
     assert "state.lastGoal = null;" in clear_block
+    assert "refreshController.invalidatePaths();" in clear_block
     assert "state.paths = {};" in clear_block
     assert "state.hideCompletedPaths = true;" in clear_block
     assert "updatePaths();" in clear_block
-    assert "if (state.hideCompletedPaths) return;" in poll_block
+    assert "pathsVisible: () => state.showPaths && !state.hideCompletedPaths" in app_js
+    assert "refreshController.invalidatePaths();" in publish_block
     assert "state.hideCompletedPaths = false;" in publish_block
 
 
@@ -760,11 +1621,11 @@ def test_3d_paths_use_tube_geometry_for_thicker_visible_tracks():
     assert "new THREE.LineBasicMaterial" not in update_block
 
 
-def test_navigation_readiness_owns_managed_process_toggles():
+def test_startup_card_owns_navigation_managed_process_toggles():
     static_dir = Path(__file__).resolve().parents[1] / "static"
     index_html = (static_dir / "index.html").read_text(encoding="utf-8")
 
-    readiness_start = index_html.index("<h2>Navigation Readiness</h2>")
+    readiness_start = index_html.index("<h2>Startup</h2>")
     readiness_end = index_html.index("</section>", readiness_start)
     readiness = index_html[readiness_start:readiness_end]
     terminal_start = index_html.index("<h2>Terminal Logs</h2>")
@@ -785,8 +1646,94 @@ def test_navigation_readiness_owns_managed_process_toggles():
     assert 'data-stop-target="localization"' not in terminals
     assert 'data-start-target="navigation"' not in terminals
     assert 'data-stop-target="navigation"' not in terminals
-    assert 'data-start-target="mapping"' in index_html
-    assert 'data-stop-target="mapping"' in index_html
+    assert 'id="mappingProcessToggle"' in index_html
+    assert 'data-managed-target="mapping"' in index_html
+    assert 'data-start-target="mapping"' not in index_html
+    assert 'data-stop-target="mapping"' not in index_html
+
+
+def test_navigation_page_puts_map_above_one_startup_card():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    navigation = index_html[
+        index_html.index('id="navigationSidebar"') : index_html.index(
+            'id="mappingSidebar"'
+        )
+    ]
+    # All startup controls share one card below the Map selector.
+    assert navigation.index("<h2>Map</h2>") < navigation.index(
+        "<h2>Startup</h2>"
+    )
+    assert navigation.count('<section class="startup-card">') == 1
+    card = navigation.split('<section class="startup-card">', 1)[1].split(
+        "</section>", 1
+    )[0]
+    positions = []
+    for target in ("chassis", "imu", "lidar", "localization", "navigation"):
+        marker = f'data-managed-target="{target}"'
+        assert marker in card, target
+        positions.append(card.index(marker))
+    assert positions == sorted(positions)
+    assert 'id="navigationReady"' in card
+    assert "data-step=" not in navigation
+
+
+def test_mapping_page_shares_hardware_buttons_in_one_startup_card():
+    static_dir = Path(__file__).resolve().parents[1] / "static"
+    index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    mapping = index_html[index_html.index('id="mappingSidebar"') :]
+    assert mapping.count('<section class="startup-card">') == 1
+    card = mapping.split('<section class="startup-card">', 1)[1].split(
+        "</section>", 1
+    )[0]
+    positions = []
+    for target in ("chassis", "imu", "lidar", "mapping"):
+        marker = f'data-managed-target="{target}"'
+        assert marker in card, target
+        positions.append(card.index(marker))
+
+    assert positions == sorted(positions)
+    assert card.count('data-managed-target="mapping"') == 1
+    assert 'id="mappingProcessToggle"' in card
+    assert 'data-start-target="mapping"' not in card
+    assert 'data-stop-target="mapping"' not in card
+    assert "data-step=" not in mapping
+
+    # Hardware controls are shared by both pages: one backend target, mounted
+    # once per page, with the same state surface and log output on each.
+    for target in ("chassis", "imu", "lidar"):
+        assert index_html.count(f'data-managed-target="{target}"') == 2, target
+        assert index_html.count(f'data-log-output="{target}"') == 2, target
+    assert index_html.count("data-managed-status") == 2
+
+
+def test_pose_and_map_cards_use_compact_layout():
+    index_html, app_js, styles_css = _frontend_sources()
+    metrics = _css_rule_block(styles_css, ".metrics")
+    # Coordinates sit two pairs per row with a tighter type scale.
+    assert "grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);" in metrics
+    assert "gap: 3px 10px;" in metrics
+    assert "font-size: 12.5px;" in metrics
+
+    assert "grid-template-columns: auto minmax(0, 1fr);" in styles_css[
+        styles_css.index("@media (max-width: 520px)") :
+    ]
+
+    picker_button = _css_rule_block(styles_css, ".map-picker button")
+    assert "min-height: 30px;" in picker_button
+    assert "padding: 0 10px;" in picker_button
+
+    result = _css_rule_block(styles_css, ".result")
+    assert "min-height: 18px;" in result
+    assert "font-size: 12.5px;" in result
+
+    # The named cards opt into the compact treatment.
+    for heading in ("Map", "Current Pose", "Target Pose"):
+        section = index_html[: index_html.index(f"<h2>{heading}</h2>")]
+        opening = section[section.rindex("<section") :]
+        assert "compact-card" in opening, heading
 
 
 def test_frontend_preserves_managed_endpoints_and_mapping_logs():
@@ -849,19 +1796,56 @@ function makeElement() {
 
 const localizationButton = makeElement();
 const navigationButton = makeElement();
+const chassisNavButton = makeElement();
+const chassisMapButton = makeElement();
+const imuNavButton = makeElement();
+const imuMapButton = makeElement();
+const lidarNavButton = makeElement();
+const lidarMapButton = makeElement();
+const mappingButton = makeElement();
 const elements = {
   localizationProcessToggle: localizationButton,
   navigationProcessToggle: navigationButton,
+  mappingProcessToggle: mappingButton,
+};
+const managedButtons = {
+  chassis: [chassisNavButton, chassisMapButton],
+  imu: [imuNavButton, imuMapButton],
+  lidar: [lidarNavButton, lidarMapButton],
+  localization: [localizationButton],
+  navigation: [navigationButton],
+  mapping: [mappingButton],
 };
 global.document = {
   getElementById(id) { return elements[id] || null; },
+  querySelectorAll(selector) {
+    const match = /\[data-managed-target="([^"]+)"\]/.exec(selector);
+    if (!match) return [];
+    return managedButtons[match[1]] || [];
+  },
 };
 
 const state = {
   localizationRunning: false,
   navigationRunning: false,
-  managedProcessPending: { localization: null, navigation: null },
+  chassisRunning: false,
+  imuRunning: false,
+  lidarRunning: false,
+  mappingRunning: false,
+  managedProcessPending: {
+    chassis: null,
+    imu: null,
+    lidar: null,
+    localization: null,
+    navigation: null,
+    mapping: null,
+  },
 };
+
+function clearNavigationSceneState() {}
+function clearNavigationLayers() {}
+function invalidateNavigationMapCaches() {}
+function clearMapSceneState() {}
 
 let mapSelectionLockCalls = 0;
 let mapSelectionLockSawPending = null;
@@ -874,11 +1858,16 @@ const startCalls = {};
 const stopCalls = {};
 let resolveNavigationStart = null;
 let navigationStopResult = true;
+let resolveMappingStart = null;
+let resolveMappingStop = null;
 
 function startManagedTarget(target) {
   startCalls[target] = (startCalls[target] || 0) + 1;
   if (target === "navigation") {
     return new Promise((resolve) => { resolveNavigationStart = resolve; });
+  }
+  if (target === "mapping") {
+    return new Promise((resolve) => { resolveMappingStart = resolve; });
   }
   return Promise.resolve(true);
 }
@@ -886,18 +1875,24 @@ function startManagedTarget(target) {
 function stopManagedTarget(target) {
   stopCalls[target] = (stopCalls[target] || 0) + 1;
   if (target === "navigation") return Promise.resolve(navigationStopResult);
+  if (target === "mapping") {
+    return new Promise((resolve) => { resolveMappingStop = resolve; });
+  }
   return Promise.resolve(true);
 }
 
-eval(jsFunctionBody("function managedProcessRunning")
+eval(source.match(/const MANAGED_PROCESS_LABELS = \{[\s\S]*?\};/)[0]
+  + "\n" + jsFunctionBody("function setManagedProcessRunning")
+  + "\n" + jsFunctionBody("function managedProcessRunning")
+  + "\n" + jsFunctionBody("function managedProcessButtons")
   + "\n" + jsFunctionBody("function updateManagedProcessButton")
   + "\n" + jsFunctionBody("async function toggleManagedTarget"));
 
 function expect(condition, message) { if (!condition) throw new Error(message); }
 
 expect(source.includes("[data-managed-target]"), "toggle event selector missing");
-expect(source.includes("[data-start-target]"), "mapping start selector missing");
-expect(source.includes("[data-stop-target]"), "mapping stop selector missing");
+expect(!source.includes("[data-start-target]"), "legacy mapping start selector still bound");
+expect(!source.includes("[data-stop-target]"), "legacy mapping stop selector still bound");
 
 (async () => {
   updateManagedProcessButton("localization");
@@ -941,6 +1936,112 @@ expect(source.includes("[data-stop-target]"), "mapping stop selector missing");
   expect(state.navigationRunning === true, "failed stop retains running state");
   expect(navigationButton.textContent === "Stop Navigation", "failed stop retains stop label");
   expect(navigationButton.getAttribute("aria-pressed") === "true", "failed stop retains aria-pressed");
+
+  // Hardware toggles are mounted on both pages and share one backend process:
+  // one click must drive the single shared start while both buttons follow.
+  updateManagedProcessButton("chassis");
+  expect(chassisNavButton.textContent === "Start hunter", "navigation chassis start label");
+  expect(chassisMapButton.textContent === "Start hunter", "mapping chassis start label");
+  const chassisPending = toggleManagedTarget("chassis");
+  expect(chassisNavButton.disabled === true, "navigation chassis disabled while pending");
+  expect(chassisMapButton.disabled === true, "mapping chassis disabled while pending");
+  expect(startCalls.chassis === 1, "shared chassis start posted once");
+  await chassisPending;
+  expect(state.chassisRunning === true, "chassis running after shared start");
+  expect(chassisNavButton.textContent === "Stop hunter", "navigation chassis stop label");
+  expect(chassisMapButton.textContent === "Stop hunter", "mapping chassis stop label");
+  expect(chassisNavButton.getAttribute("aria-pressed") === "true", "navigation chassis aria-pressed");
+  expect(chassisMapButton.getAttribute("aria-pressed") === "true", "mapping chassis aria-pressed");
+
+  // Mapping is a single managed toggle: the same button drives start and stop,
+  // and its style follows the requested action while a request is in flight,
+  // not just the running flag returned by the log poll.
+  updateManagedProcessButton("mapping");
+  expect(mappingButton.textContent === "Start Mapping", "initial mapping start label");
+  expect(mappingButton.classList.contains("start-log"), "initial mapping start style");
+  expect(!mappingButton.classList.contains("stop-log"), "initial mapping not stop style");
+  expect(mappingButton.getAttribute("aria-pressed") === "false", "initial mapping aria-pressed");
+  expect(mappingButton.getAttribute("aria-busy") === "false", "initial mapping aria-busy");
+
+  const mappingPending = toggleManagedTarget("mapping");
+  expect(mappingButton.disabled === true, "pending mapping disabled");
+  expect(mappingButton.textContent === "Starting Mapping...", "pending mapping label");
+  expect(mappingButton.classList.contains("start-log"), "pending start keeps start style");
+  expect(!mappingButton.classList.contains("stop-log"), "pending start not stop style");
+  expect(mappingButton.getAttribute("aria-busy") === "true", "pending mapping aria-busy");
+  toggleManagedTarget("mapping");
+  expect(startCalls.mapping === 1, "duplicate mapping start blocked");
+  // Color follows the running state even while the start request is pending.
+  state.mappingRunning = true;
+  updateManagedProcessButton("mapping");
+  expect(mappingButton.textContent === "Starting Mapping...", "pending start label survives poll");
+  expect(!mappingButton.classList.contains("start-log"), "running mapping leaves start style while pending");
+  expect(mappingButton.classList.contains("stop-log"), "running mapping is red while start is pending");
+  resolveMappingStart(true);
+  await mappingPending;
+  expect(state.mappingRunning === true, "mapping running after start success");
+  expect(mappingButton.textContent === "Stop Mapping", "mapping stop label after start");
+  expect(mappingButton.classList.contains("stop-log"), "mapping stop style after start");
+  expect(mappingButton.getAttribute("aria-pressed") === "true", "mapping aria-pressed after start");
+  expect(mappingButton.disabled === false, "mapping re-enabled after start");
+
+  const mappingStopPending = toggleManagedTarget("mapping");
+  expect(mappingButton.textContent === "Stopping Mapping...", "pending stop label");
+  expect(mappingButton.classList.contains("stop-log"), "pending stop keeps stop style");
+  expect(!mappingButton.classList.contains("start-log"), "pending stop not start style");
+  toggleManagedTarget("mapping");
+  expect(stopCalls.mapping === 1, "duplicate mapping stop blocked");
+  // Once polling confirms stopped, the pending request does not keep it red.
+  state.mappingRunning = false;
+  updateManagedProcessButton("mapping");
+  expect(mappingButton.textContent === "Stopping Mapping...", "pending stop label survives poll");
+  expect(!mappingButton.classList.contains("stop-log"), "stopped mapping is not red while stop is pending");
+  expect(mappingButton.classList.contains("start-log"), "stopped mapping returns to start style while pending");
+  resolveMappingStop(true);
+  await mappingStopPending;
+  expect(state.mappingRunning === false, "mapping stopped after stop success");
+  expect(mappingButton.textContent === "Start Mapping", "mapping returns to start after poll");
+  expect(mappingButton.classList.contains("start-log"), "mapping start style after stop");
+  expect(mappingButton.getAttribute("aria-pressed") === "false", "mapping aria-pressed after stop");
+  expect(mappingButton.disabled === false, "mapping re-enabled after stop");
+
+  // Failed stop keeps the running/stop state; failed start stays on start.
+  state.mappingRunning = true;
+  updateManagedProcessButton("mapping");
+  const failedStop = toggleManagedTarget("mapping");
+  resolveMappingStop(false);
+  await failedStop;
+  expect(state.mappingRunning === true, "failed stop keeps mapping running");
+  expect(mappingButton.textContent === "Stop Mapping", "failed stop keeps stop label");
+  expect(mappingButton.classList.contains("stop-log"), "failed stop keeps stop style");
+  expect(mappingButton.getAttribute("aria-pressed") === "true", "failed stop keeps aria-pressed");
+
+  state.mappingRunning = false;
+  updateManagedProcessButton("mapping");
+  const failedStart = toggleManagedTarget("mapping");
+  resolveMappingStart(false);
+  await failedStart;
+  expect(state.mappingRunning === false, "failed start keeps mapping stopped");
+  expect(mappingButton.textContent === "Start Mapping", "failed start keeps start label");
+  expect(mappingButton.classList.contains("start-log"), "failed start keeps start style");
+  expect(mappingButton.getAttribute("aria-pressed") === "false", "failed start keeps aria-pressed");
+
+  // All six managed targets share one class contract: stop-log while running,
+  // start-log otherwise, on every mounted button.
+  for (const [target, targetButtons] of Object.entries(managedButtons)) {
+    setManagedProcessRunning(target, true);
+    updateManagedProcessButton(target);
+    for (const button of targetButtons) {
+      expect(button.classList.contains("stop-log"), target + " running is stop-log");
+      expect(!button.classList.contains("start-log"), target + " running not start-log");
+    }
+    setManagedProcessRunning(target, false);
+    updateManagedProcessButton(target);
+    for (const button of targetButtons) {
+      expect(button.classList.contains("start-log"), target + " idle is start-log");
+      expect(!button.classList.contains("stop-log"), target + " idle not stop-log");
+    }
+  }
   console.log("managed process toggles ok");
 })().catch((error) => { console.error(error); process.exit(1); });
 """
@@ -1206,6 +2307,15 @@ def _managed_launch_node(**overrides):
     class _LaunchNodeStub:
         def __init__(self):
             self.parameters = {
+                "chassis_launch_package": "hunter_base",
+                "chassis_launch_file": "hunter_base.launch.py",
+                "chassis_launch_args": "",
+                "imu_launch_package": "fdilink_ahrs",
+                "imu_launch_file": "ahrs_driver.launch.py",
+                "imu_launch_args": "",
+                "lidar_launch_package": "hesai_ros_driver",
+                "lidar_launch_file": "start.py",
+                "lidar_launch_args": "",
                 "localization_launch_package": "lio_sam_hesai",
                 "localization_launch_file": "localization_with_nonground.launch.py",
                 "localization_launch_args": "",
@@ -1219,9 +2329,17 @@ def _managed_launch_node(**overrides):
             self.parameters.update(overrides)
             self.managed_logs = {
                 target: TerminalLogBuffer(target, max_lines=5)
-                for target in ("localization", "navigation", "mapping")
+                for target in (
+                    "chassis",
+                    "imu",
+                    "lidar",
+                    "localization",
+                    "navigation",
+                    "mapping",
+                )
             }
             self.managed_processes = {}
+            self.lock = threading.RLock()
             self.logger = _LoggerStub()
             self.configure_managed_processes = MethodType(
                 web_control_node.WebControlNode.configure_managed_processes, self
@@ -1229,12 +2347,21 @@ def _managed_launch_node(**overrides):
             self.handle_managed_exit = MethodType(
                 web_control_node.WebControlNode.handle_managed_exit, self
             )
+            self.managed_start_command = MethodType(
+                web_control_node.WebControlNode.managed_start_command, self
+            )
+            self.start_managed_target = MethodType(
+                web_control_node.WebControlNode.start_managed_target, self
+            )
 
         def get_parameter(self, name):
             return _ParameterStub(self.parameters[name])
 
         def get_logger(self):
             return self.logger
+
+        def now_sec(self):
+            return 10.0
 
     node = _LaunchNodeStub()
     node.configure_managed_processes()
@@ -1248,6 +2375,9 @@ def test_managed_launch_commands_add_no_implicit_use_sim():
     }
 
     assert commands == {
+        "chassis": ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        "imu": ["ros2", "launch", "fdilink_ahrs", "ahrs_driver.launch.py"],
+        "lidar": ["ros2", "launch", "hesai_ros_driver", "start.py"],
         "localization": [
             "ros2",
             "launch",
@@ -1262,6 +2392,14 @@ def test_managed_launch_commands_add_no_implicit_use_sim():
         ],
         "mapping": ["ros2", "launch", "lio_sam_hesai", "mapping.launch.py"],
     }
+    assert list(commands) == [
+        "chassis",
+        "imu",
+        "lidar",
+        "localization",
+        "navigation",
+        "mapping",
+    ]
     assert not any(
         "use_sim" in argument
         for command in commands.values()
@@ -1426,6 +2564,701 @@ def test_managed_launch_stop_signals_descendant_processes(monkeypatch):
 
     assert group_calls == [(456, signal.SIGINT)]
     assert pid_calls == [(777, signal.SIGINT), (888, signal.SIGINT)]
+
+
+def test_managed_launch_stale_reader_does_not_clobber_new_round(monkeypatch):
+    from web_control.web_control_node import ManagedLaunchProcess
+
+    class _FakeReaderProcess:
+        def __init__(self, pid, gate=None, lines=()):
+            self.pid = pid
+            self.returncode = 0
+            self._gate = gate
+            self._lines = list(lines)
+
+        @property
+        def stdout(self):
+            return iter(self._lines)
+
+        def wait(self, timeout=None):
+            if self._gate is not None:
+                self._gate.wait(timeout=5)
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    exits = []
+    logs = TerminalLogBuffer("localization", max_lines=5)
+    process = ManagedLaunchProcess(
+        "localization",
+        ["ros2", "launch", "lio_sam_hesai", "x.launch.py"],
+        logs,
+        _LoggerStub(),
+        on_exit=exits.append,
+    )
+
+    old_gate = threading.Event()
+    old_process = _FakeReaderProcess(111, gate=old_gate, lines=["old line\n"])
+    process.generation = 1
+    old_reader = threading.Thread(
+        target=process._read_output, args=(old_process, 1), daemon=True
+    )
+    old_reader.start()
+
+    # A fresh launch takes over while the old reader is still draining stdout.
+    process.generation = 2
+    logs.set_process_state(enabled=True, running=True, returncode=None)
+
+    old_gate.set()
+    old_reader.join(timeout=5)
+
+    assert not old_reader.is_alive()
+    # The stale reader must not flip the new round to stopped, nor fire the
+    # exit callback that would clear a running target's runtime state.
+    assert logs.snapshot()["running"] is True
+    assert exits == []
+
+    # The current round still settles normally.
+    process._read_output(_FakeReaderProcess(222), 2)
+    assert logs.snapshot()["running"] is False
+    assert exits == ["localization"]
+
+
+class _FakePreflightProcess:
+    """Stand-in for a prerequisite Popen that never spawns a real command."""
+
+    pid = 4242
+
+    def __init__(self, argv, returncode=0, output="", gate=None, stderr=""):
+        self.argv = [str(item) for item in argv]
+        self.args = self.argv
+        self.returncode = returncode
+        self.output = output
+        self.stderr = stderr
+        self._gate = gate
+        self._finished = gate is None
+        self.signals = []
+        self.killed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def communicate(self, input=None, timeout=None):
+        if self._gate is not None:
+            self._gate.wait(timeout=5)
+        self._finished = True
+        return self.output, self.stderr
+
+    def poll(self):
+        return self.returncode if self._finished else None
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+    def kill(self):
+        self.killed = True
+
+
+class _PreflightSpawnRecorder:
+    """subprocess.Popen replacement recording the chassis prerequisite order."""
+
+    def __init__(
+        self,
+        returncodes=None,
+        outputs=None,
+        gate=None,
+        popen_gate=None,
+        errors=None,
+    ):
+        self.returncodes = returncodes or {}
+        self.outputs = outputs or {}
+        # ``gate`` keeps the spawned command running inside ``communicate``;
+        # ``popen_gate`` freezes the spawn call itself so a test can drive the
+        # cancelled-check/Popen/registration window deterministically.
+        self.gate = gate
+        self.popen_gate = popen_gate
+        self.errors = errors or {}
+        self.calls = []
+        self.first_spawn = threading.Event()
+
+    def __call__(self, argv, **kwargs):
+        argv = tuple(str(item) for item in argv)
+        self.calls.append(argv)
+        self.first_spawn.set()
+        if argv in self.errors:
+            raise self.errors[argv]
+        if self.popen_gate is not None:
+            self.popen_gate.wait(timeout=5)
+        return _FakePreflightProcess(
+            argv,
+            returncode=self.returncodes.get(argv, 0),
+            output=self.outputs.get(argv, ""),
+            gate=self.gate,
+        )
+
+
+def _chassis_sequence(monkeypatch, recorders, launched, exits=None):
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        ManagedSequenceLaunchProcess,
+    )
+
+    monkeypatch.setattr(web_control_node.subprocess, "Popen", recorders)
+    monkeypatch.setattr(
+        web_control_node.ManagedLaunchProcess,
+        "_start_locked",
+        lambda self: launched.append(list(self.command)),
+    )
+    logs = TerminalLogBuffer("chassis", max_lines=50)
+    process = ManagedSequenceLaunchProcess(
+        "chassis",
+        [list(step) for step in CHASSIS_CAN_PREFLIGHT_COMMANDS],
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        logs,
+        _LoggerStub(),
+        on_exit=exits.append if exits is not None else None,
+    )
+    return process, logs
+
+
+def _can0_verification_json(
+    *,
+    flags=("NOARP", "ECHO", "UP", "LOWER_UP"),
+    link_type="can",
+    info_kind="can",
+    bitrate=500000,
+):
+    """Build the JSON shape of ``ip -j -details link show can0``."""
+    info_data = {"state": "ERROR-ACTIVE" if "UP" in flags else "STOPPED"}
+    if bitrate is not None:
+        info_data["bitrate"] = bitrate
+    return json.dumps(
+        [
+            {
+                "ifindex": 6,
+                "ifname": "can0",
+                "flags": list(flags),
+                "mtu": 16,
+                "operstate": "UP" if "UP" in flags else "DOWN",
+                "link_type": link_type,
+                "linkinfo": {
+                    "info_kind": info_kind,
+                    "info_data": info_data,
+                },
+            }
+        ]
+    )
+
+
+def test_chassis_preflight_commands_are_non_interactive_and_ordered():
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        CHASSIS_CAN_VERIFY_COMMAND,
+    )
+
+    assert CHASSIS_CAN_VERIFY_COMMAND == (
+        "ip",
+        "-j",
+        "-details",
+        "link",
+        "show",
+        "can0",
+    )
+    assert "sudo" not in CHASSIS_CAN_VERIFY_COMMAND
+    assert CHASSIS_CAN_PREFLIGHT_COMMANDS == (
+        ("sudo", "-n", "modprobe", "can"),
+        (
+            "sudo",
+            "-n",
+            "ip",
+            "link",
+            "set",
+            "can0",
+            "up",
+            "type",
+            "can",
+            "bitrate",
+            "500000",
+        ),
+    )
+
+
+def test_chassis_sequence_runs_preflight_in_order_then_launches(monkeypatch):
+    from web_control.web_control_node import CHASSIS_CAN_PREFLIGHT_COMMANDS
+
+    launched = []
+    recorder = _PreflightSpawnRecorder()
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls == [tuple(step) for step in CHASSIS_CAN_PREFLIGHT_COMMANDS]
+    assert launched == [["ros2", "launch", "hunter_base", "hunter_base.launch.py"]]
+    assert logs.snapshot()["running"] is True
+    assert logs.snapshot()["returncode"] is None
+
+
+def test_chassis_sequence_aborts_before_ros_launch_on_first_preflight_failure(
+    monkeypatch,
+):
+    from web_control.web_control_node import CHASSIS_CAN_PREFLIGHT_COMMANDS
+
+    first = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[0])
+    launched = []
+    exits = []
+    recorder = _PreflightSpawnRecorder(
+        returncodes={first: 1},
+        outputs={first: "sudo: a password is required"},
+    )
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched, exits)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls == [first]
+    assert launched == []
+    snapshot = logs.snapshot()
+    assert snapshot["running"] is False
+    assert snapshot["returncode"] == 1
+    assert any("not starting chassis" in line for line in snapshot["lines"])
+    assert any("password is required" in line for line in snapshot["lines"])
+    assert exits == ["chassis"]
+
+
+def test_chassis_sequence_aborts_before_ros_launch_on_second_preflight_failure(
+    monkeypatch,
+):
+    from web_control.web_control_node import CHASSIS_CAN_PREFLIGHT_COMMANDS
+
+    first, second = (
+        tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[0]),
+        tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[1]),
+    )
+    launched = []
+    recorder = _PreflightSpawnRecorder(returncodes={second: 2})
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls == [first, second]
+    assert launched == []
+    assert logs.snapshot()["returncode"] == 2
+
+
+def test_chassis_sequence_start_stop_start_reuses_interface_left_up(monkeypatch):
+    """A stopped chassis leaves can0 up; a verified restart must not abort."""
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        CHASSIS_CAN_VERIFY_COMMAND,
+    )
+
+    can_up = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[1])
+    verify = tuple(CHASSIS_CAN_VERIFY_COMMAND)
+    interface_up = False
+
+    class _InterfaceStateRecorder:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, argv, **_kwargs):
+            nonlocal interface_up
+            argv = tuple(str(item) for item in argv)
+            self.calls.append(argv)
+            if argv == verify:
+                return _FakePreflightProcess(
+                    argv, output=_can0_verification_json()
+                )
+            if argv != can_up:
+                return _FakePreflightProcess(argv)
+            if interface_up:
+                # Real ``ip`` returns this when can0 is already administratively
+                # up; the previous managed stop intentionally left it up.
+                return _FakePreflightProcess(
+                    argv,
+                    returncode=2,
+                    output="RTNETLINK answers: Device or resource busy\n",
+                )
+            interface_up = True
+            return _FakePreflightProcess(argv)
+
+    launched = []
+    recorder = _InterfaceStateRecorder()
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+    process.stop()
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls.count(can_up) == 2
+    assert recorder.calls.count(verify) == 1
+    assert launched == [
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+    ]
+    assert logs.snapshot()["running"] is True
+    assert any("verified UP/CAN/500000" in line for line in logs.snapshot()["lines"])
+
+
+@pytest.mark.parametrize(
+    "verification_output",
+    [
+        pytest.param(
+            _can0_verification_json(bitrate=250000), id="wrong-bitrate"
+        ),
+        pytest.param(
+            _can0_verification_json(flags=("NOARP", "ECHO")), id="interface-down"
+        ),
+        pytest.param(
+            _can0_verification_json(link_type="ether", info_kind="ether"),
+            id="wrong-type",
+        ),
+        pytest.param(_can0_verification_json(bitrate=None), id="missing-bitrate"),
+        pytest.param("not-json", id="invalid-json"),
+    ],
+)
+def test_chassis_sequence_ebusy_verification_failure_aborts(
+    monkeypatch, verification_output
+):
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        CHASSIS_CAN_VERIFY_COMMAND,
+    )
+
+    first = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[0])
+    second = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[1])
+    verify = tuple(CHASSIS_CAN_VERIFY_COMMAND)
+    launched = []
+    recorder = _PreflightSpawnRecorder(
+        returncodes={second: 2},
+        outputs={
+            second: "RTNETLINK answers: Device or resource busy\n",
+            verify: verification_output,
+        },
+    )
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls == [first, second, verify]
+    assert launched == []
+    snapshot = logs.snapshot()
+    assert snapshot["running"] is False
+    assert snapshot["returncode"] == 2
+    lines = snapshot["lines"]
+    assert any("not starting chassis" in line for line in lines)
+    assert any("EBUSY is not enough" in line for line in lines)
+
+
+def test_chassis_sequence_ebusy_verification_command_unavailable_aborts(
+    monkeypatch,
+):
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        CHASSIS_CAN_VERIFY_COMMAND,
+    )
+
+    first = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[0])
+    second = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[1])
+    verify = tuple(CHASSIS_CAN_VERIFY_COMMAND)
+    launched = []
+    recorder = _PreflightSpawnRecorder(
+        returncodes={second: 2},
+        outputs={second: "RTNETLINK answers: Device or resource busy\n"},
+        errors={verify: FileNotFoundError("ip")},
+    )
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert recorder.calls == [first, second, verify]
+    assert launched == []
+    assert logs.snapshot()["returncode"] == 2
+    assert any(
+        "read-only ip query is unavailable" in line
+        for line in logs.snapshot()["lines"]
+    )
+
+
+def test_chassis_sequence_reports_missing_preflight_command(monkeypatch):
+    launched = []
+
+    def raise_missing(argv, **kwargs):
+        raise FileNotFoundError("sudo")
+
+    monkeypatch.setattr(web_control_node.subprocess, "Popen", raise_missing)
+    monkeypatch.setattr(
+        web_control_node.ManagedLaunchProcess,
+        "_start_locked",
+        lambda self: launched.append(list(self.command)),
+    )
+    logs = TerminalLogBuffer("chassis", max_lines=50)
+    process = web_control_node.ManagedSequenceLaunchProcess(
+        "chassis",
+        [list(step) for step in web_control_node.CHASSIS_CAN_PREFLIGHT_COMMANDS],
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        logs,
+        _LoggerStub(),
+    )
+
+    process.start()
+    process.sequence_thread.join(timeout=5)
+
+    assert launched == []
+    assert logs.snapshot()["returncode"] == 127
+
+
+def test_chassis_sequence_repeated_start_does_not_duplicate(monkeypatch):
+    gate = threading.Event()
+    launched = []
+    recorder = _PreflightSpawnRecorder(gate=gate)
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched)
+
+    process.start()
+    assert process.is_running() is True
+    # Wait until the first prerequisite has actually been spawned before
+    # issuing the duplicate starts; otherwise the assertion below races the
+    # sequence thread's first scheduling.
+    assert recorder.first_spawn.wait(timeout=5)
+    process.start()
+    process.start()
+
+    # While the first prerequisite is still in flight only one sequence exists.
+    assert len(recorder.calls) == 1
+    gate.set()
+    process.sequence_thread.join(timeout=5)
+    # Exactly the two prerequisites ran, in order, with no duplicate sequence.
+    assert recorder.calls == [
+        ("sudo", "-n", "modprobe", "can"),
+        (
+            "sudo",
+            "-n",
+            "ip",
+            "link",
+            "set",
+            "can0",
+            "up",
+            "type",
+            "can",
+            "bitrate",
+            "500000",
+        ),
+    ]
+    assert launched == [["ros2", "launch", "hunter_base", "hunter_base.launch.py"]]
+
+
+def test_chassis_sequence_stop_cancels_inflight_preflight(monkeypatch):
+    gate = threading.Event()
+    launched = []
+    exits = []
+    recorder = _PreflightSpawnRecorder(gate=gate)
+    process, logs = _chassis_sequence(monkeypatch, recorder, launched, exits)
+    killpg_calls = []
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        # Release the fake prerequisite once its group is signalled, mirroring
+        # a real command observing SIGINT.
+        gate.set()
+
+    monkeypatch.setattr(web_control_node.os, "killpg", fake_killpg)
+    monkeypatch.setattr(web_control_node.os, "getpgid", lambda pid: 5000)
+
+    process.start()
+    assert recorder.first_spawn.wait(timeout=5)
+    process.stop()
+    process.sequence_thread.join(timeout=5)
+
+    # The whole prerequisite process group is signalled, not just the leader,
+    # and the sequence state is reset before stop returns.
+    assert killpg_calls == [(5000, signal.SIGINT)]
+    assert launched == []
+    assert logs.snapshot()["running"] is False
+    assert process.sequence_active is False
+    assert process.is_running() is False
+    assert exits == ["chassis"]
+    assert not process.sequence_thread.is_alive()
+
+
+def test_chassis_sequence_stop_closes_the_spawn_registration_window(monkeypatch):
+    popen_gate = threading.Event()
+    popen_entered = threading.Event()
+    comm_gate = threading.Event()
+    launched = []
+    exits = []
+    calls = []
+
+    class SlowSpawnRecorder:
+        def __call__(self, argv, **kwargs):
+            argv = tuple(str(item) for item in argv)
+            calls.append(argv)
+            popen_entered.set()
+            popen_gate.wait(timeout=5)
+            return _FakePreflightProcess(argv, gate=comm_gate)
+
+    process, logs = _chassis_sequence(
+        monkeypatch, SlowSpawnRecorder(), launched, exits
+    )
+    killpg_calls = []
+
+    def fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        # Release the running prerequisite once its group is signalled.
+        comm_gate.set()
+
+    monkeypatch.setattr(web_control_node.os, "getpgid", lambda pid: 6000)
+    monkeypatch.setattr(web_control_node.os, "killpg", fake_killpg)
+
+    process.start()
+    assert popen_entered.wait(timeout=5)
+
+    stopper = threading.Thread(target=process.stop)
+    stopper.start()
+    # stop must wait out the spawn window instead of returning early while a
+    # just-forked prerequisite is not yet registered for shutdown.
+    stopper.join(timeout=0.3)
+    assert stopper.is_alive()
+
+    popen_gate.set()
+    stopper.join(timeout=5)
+    assert not stopper.is_alive()
+
+    # The registered command was group-signalled, the sequence never advanced to
+    # the second step, and nothing was left running after stop returned.
+    assert calls == [("sudo", "-n", "modprobe", "can")]
+    assert killpg_calls == [(6000, signal.SIGINT)]
+    assert launched == []
+    assert logs.snapshot()["running"] is False
+    assert process.sequence_active is False
+    assert process.prerequisite_process is None
+    assert exits == ["chassis"]
+
+
+def test_chassis_sequence_stop_closes_cancelled_session_when_new_round_starts(
+    monkeypatch, tmp_path
+):
+    from web_control.log_store import ManagedLogStore
+    from web_control.web_control_node import ManagedSequenceLaunchProcess
+
+    store = ManagedLogStore(tmp_path / "logs")
+    logs = TerminalLogBuffer("chassis", max_lines=50)
+    exits = []
+    process = ManagedSequenceLaunchProcess(
+        "chassis",
+        [["sudo", "-n", "modprobe", "can"]],
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        logs,
+        _LoggerStub(),
+        on_exit=exits.append,
+        log_store=store,
+    )
+
+    new_sessions = []
+
+    def start_new_round_while_settling(prerequisite, done, pgid):
+        # A second HTTP round wins the race after ``stop`` released the lock but
+        # before it settles: it opens its own session and claims the runtime.
+        with process.lock:
+            process._begin_session_locked()
+            new_sessions.append(process.session)
+            process.sequence_generation += 1
+            process.sequence_active = True
+            process.sequence_cancelled = False
+            process.log_buffer.set_process_state(
+                enabled=True, running=True, returncode=None
+            )
+
+    monkeypatch.setattr(
+        process, "_terminate_prerequisite", start_new_round_while_settling
+    )
+
+    with process.lock:
+        process._begin_session_locked()
+        old_session = process.session
+        process.sequence_active = True
+        process.sequence_generation += 1
+        process.prerequisite_done = threading.Event()
+        process.log_buffer.set_process_state(
+            enabled=True, running=True, returncode=None
+        )
+
+    process.stop()
+
+    new_session = new_sessions[0]
+    assert old_session is not new_session
+    # The cancelled round's file handle must always be released...
+    assert old_session.closed is True
+    assert process.session is new_session
+    # ...while the newer round's session and running state stay untouched.
+    assert new_session.closed is False
+    assert logs.snapshot()["running"] is True
+    assert exits == []
+    active = {
+        row["session"]: row["active"] for row in store.list_sessions("chassis")
+    }
+    assert active[old_session.session_id] is False
+    assert active[new_session.session_id] is True
+
+
+def test_managed_node_configures_hardware_targets_in_startup_order(monkeypatch):
+    node = _managed_launch_node()
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        ManagedSequenceLaunchProcess,
+    )
+
+    assert list(node.managed_logs) == [
+        "chassis",
+        "imu",
+        "lidar",
+        "localization",
+        "navigation",
+        "mapping",
+    ]
+    assert list(node.managed_processes) == [
+        "chassis",
+        "imu",
+        "lidar",
+        "localization",
+        "navigation",
+        "mapping",
+    ]
+    chassis = node.managed_processes["chassis"]
+    assert isinstance(chassis, ManagedSequenceLaunchProcess)
+    assert chassis.prerequisites == [
+        list(step) for step in CHASSIS_CAN_PREFLIGHT_COMMANDS
+    ]
+    assert chassis.command == ["ros2", "launch", "hunter_base", "hunter_base.launch.py"]
+
+    launched = []
+    recorder = _PreflightSpawnRecorder()
+    monkeypatch.setattr(web_control_node.subprocess, "Popen", recorder)
+    monkeypatch.setattr(
+        web_control_node.ManagedLaunchProcess,
+        "_start_locked",
+        lambda self: launched.append(list(self.command)),
+    )
+    response = node.start_managed_target("chassis")
+    chassis.sequence_thread.join(timeout=5)
+
+    assert response["ok"] is True
+    assert [tuple(step) for step in recorder.calls] == [
+        tuple(step) for step in CHASSIS_CAN_PREFLIGHT_COMMANDS
+    ]
+    assert launched == [["ros2", "launch", "hunter_base", "hunter_base.launch.py"]]
 
 
 def test_web_control_shutdown_uses_destroy_node_for_managed_launch_cleanup():
@@ -1721,12 +3554,14 @@ def test_frontend_view_motion_css_contract():
 
     viewport = _css_rule_block(styles_css, ".viewport")
     assert "transform" in viewport
-    assert "var(--glass-drop-ease)" in viewport
+    assert "var(--layout-ease)" in viewport
+    assert "var(--fade-ms)" in viewport
     assert "filter" not in viewport
 
     active = _css_rule_block(styles_css, ".viewport.active")
     assert "translate3d(0, 0, 0) scale(1)" in active
-    assert "var(--glass-drop-ease)" in active
+    assert "var(--layout-ease)" in active
+    assert "var(--fade-ms)" in active
     assert "filter" not in active
 
     inactive_3d = _css_rule_block(styles_css, "#view3d:not(.active)")
@@ -1740,13 +3575,17 @@ def test_frontend_view_motion_css_contract():
     assert "filter" not in inactive_system
 
     root = _css_rule_block(styles_css, ":root")
-    assert "--layout-transition-ms: 380ms;" in root
+    assert "--layout-slide-ms: 650ms;" in root
+    assert "--fade-ms: 480ms;" in root
+    assert "--thumb-ms: 560ms;" in root
+    assert "--layout-ease: cubic-bezier(0.4, 0, 0.2, 1);" in root
 
     panel = _css_rule_block(styles_css, ".panel")
-    assert "transform var(--layout-transition-ms) var(--glass-drop-ease)" in panel
+    assert "transform var(--fade-ms) var(--layout-ease)" in panel
+    assert "opacity var(--fade-ms) var(--layout-ease)" in panel
 
     app = _css_rule_block(styles_css, ".app")
-    assert "grid-template-columns var(--layout-transition-ms) var(--glass-drop-ease)" in app
+    assert "grid-template-columns var(--layout-slide-ms) var(--layout-ease)" in app
 
 
 def test_glass_no_filter_on_webgl_canvas():
@@ -1768,7 +3607,7 @@ def test_frontend_layout_transition_state_machine_static():
         encoding="utf-8"
     )
 
-    assert "const LAYOUT_SETTLE_FALLBACK_MS = 420;" in app_js
+    assert "const LAYOUT_SETTLE_FALLBACK_MS = 780;" in app_js
     for name in (
         "beginLayoutTransition",
         "settleLayoutTransition",
@@ -1781,11 +3620,66 @@ def test_frontend_layout_transition_state_machine_static():
     assert 'window.addEventListener("resize", noteLayoutResize);' in app_js
     assert 'window.addEventListener("resize", resizeAll);' not in app_js
     assert 'window.addEventListener("resize", applyJoystickLayout);' not in app_js
-    for property_name in ("grid-template-columns", "opacity", "transform"):
-        assert property_name in app_js
+
+    # Settlement is geometry-aware: a transition only trusts the app's own grid
+    # event when it recorded a grid geometry change.
+    assert "expectsGrid" in app_js
+    assert "options.gridChanged" in app_js
+    assert "beginLayoutTransition({ gridChanged: true })" in app_js
+    assert "beginLayoutTransition({ gridChanged: sidebarChanged })" in app_js
+
+    begin_block = app_js[
+        app_js.index("function beginLayoutTransition(") : app_js.index(
+            "function settleLayoutTransition("
+        )
+    ]
+    # expectsGrid is sticky: a pure begin during an in-flight grid run keeps
+    # the grid expectation until settleLayoutTransition clears it.
+    assert "const existingGridInFlight" in begin_block
+    assert "pageTransition.active && pageTransition.expectsGrid" in begin_block
+    assert "existingGridInFlight || Boolean(options.gridChanged)" in begin_block
+
+    settle_body = _js_function_body(app_js, "function settleLayoutTransition(token)")
+    assert "pageTransition.expectsGrid = false;" in settle_body
+
+    handler = _js_function_body(app_js, "function handleLayoutTransitionEnd(event)")
+    assert 'event.propertyName !== "grid-template-columns"' in handler
+    assert "event.pseudoElement" in handler
+    assert "pageTransition.expectsGrid" in handler
+    assert "pageTransition.token" in handler
+    assert 'document.querySelector(".app")' in handler
+    # Opacity/transform (viewport, panel, thumb) must never settle the layout.
+    handler_code = "\n".join(line.split("//", 1)[0] for line in handler.splitlines())
+    assert "opacity" not in handler_code
+    assert "transform" not in handler_code
+
+    attach = _js_function_body(app_js, "function attachLayoutTransitionListener()")
+    assert 'appEl.addEventListener("transitionend", handleLayoutTransitionEnd);' in attach
+    assert "view3d" not in attach
+    assert "viewTabs" not in attach
+
+    flush_body = _js_function_body(app_js, "function doDeferredLayoutFlush()")
+    assert "flushPendingMappingJoystickReveal();" in flush_body
+
     assert app_js.count("renderer.setSize(") == 1
     resize_body = _js_function_body(app_js, "function resizeAll()")
     assert "renderer.setSize(" in resize_body
+
+    # The live viewport sync is gated, delegates to the cached resizeAll, and
+    # runs before the camera update and draw in the same frame.
+    render_body = _js_function_body(app_js, "function render()")
+    assert render_body.index("syncMapViewportDuringGridTransition();") < render_body.index(
+        "updateCamera();"
+    ) < render_body.index("renderer.render(scene, camera);")
+    sync_body = _js_function_body(
+        app_js, "function syncMapViewportDuringGridTransition()"
+    )
+    assert "pageTransition.active" in sync_body
+    assert "pageTransition.expectsGrid" in sync_body
+    assert "mapViewActive()" in sync_body
+    assert "glassMotionReduced()" in sync_body
+    assert "resizeAll();" in sync_body
+    assert "renderer.setSize(" not in sync_body
     assert "resizeAll();" not in app_js[
         app_js.index("function setTab(tab)") : app_js.index("function selectedPosePayload")
     ]
@@ -1806,6 +3700,9 @@ def test_frontend_white_flash_fix_present():
     render_body = _js_function_body(app_js, "function render()")
     assert "mapViewActive()" in render_body
     assert "requestAnimationFrame(render)" in render_body
+    assert render_body.index("syncMapViewportDuringGridTransition();") < render_body.index(
+        "updateCamera();"
+    ) < render_body.index("renderer.render(scene, camera);")
     assert "cancelAnimationFrame(mapRenderFrame);" in render_body
     assert "function mapViewActive()" in app_js
     assert "function ensureMapRenderLoop()" in app_js
@@ -1829,14 +3726,30 @@ def test_frontend_safety_invariants_in_set_tab():
         app_js.index("function setTab(tab)") : app_js.index("function selectedPosePayload")
     ]
 
-    assert 'setMappingJoystickVisible(tab === "mapping");' in set_tab_block
-    assert "exitJoystickLayout();" in set_tab_block
-    assert set_tab_block.index("setMappingJoystickVisible") < set_tab_block.index(
-        "beginLayoutTransition();"
+    # Safety first: the hide path (which stops teleop) runs before the layout
+    # transition is armed, while the show path waits until the sidebar geometry
+    # is known and the transition is armed so a deferred reveal can be recorded.
+    hide_index = set_tab_block.index("setMappingJoystickVisible(false);")
+    sidebar_index = set_tab_block.index("const sidebarChanged = applyEffectiveSidebar();")
+    begin_index = set_tab_block.index(
+        "beginLayoutTransition({ gridChanged: sidebarChanged });"
     )
+    show_index = set_tab_block.index(
+        "setMappingJoystickVisible(true, { deferReveal: deferJoystickReveal });"
+    )
+    assert hide_index < sidebar_index
+    assert sidebar_index < begin_index < show_index
+    # A re-entrant Mapping click must treat an in-flight grid-expecting
+    # transition as deferring, not just a sidebar change detected this click.
+    assert (
+        "const deferJoystickReveal =\n"
+        "    sidebarChanged || (pageTransition.active && pageTransition.expectsGrid);"
+        in set_tab_block
+    )
+    assert "exitJoystickLayout();" in set_tab_block
     assert "resizeAll();" not in set_tab_block
     assert "markGlassDrop(viewTabs);" in set_tab_block
-    assert "if (applyEffectiveSidebar()) beginLayoutTransition();" in app_js
+    assert "if (applyEffectiveSidebar()) beginLayoutTransition({ gridChanged: true });" in app_js
     assert "function applyEffectiveSidebar()" in app_js
 
     sidebar_block = app_js[
@@ -1987,7 +3900,12 @@ def test_glass_tokens_and_mode_classes():
         "--scene-bg: #0b0f19;",
         "--glass-drop-ms: 380ms;",
         "--glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);",
-        "--layout-transition-ms: 380ms;",
+        "--layout-slide-ms: 650ms;",
+        "--fade-ms: 480ms;",
+        "--thumb-ms: 560ms;",
+        "--joystick-reveal-ms: 420ms;",
+        "--joystick-hide-ms: 220ms;",
+        "--layout-ease: cubic-bezier(0.4, 0, 0.2, 1);",
         "--focus-ring: 2px;",
         "--touch-target: 44px;",
     ):
@@ -2026,20 +3944,31 @@ def test_glass_baseline_reset_removes_stacked_blur():
     assert "transition: transform 430ms var(--ios-contained-spring)" not in styles_css
 
 
-def test_glass_full_tier_limits_displacement_to_three_decorative_surfaces():
+def test_glass_full_tier_limits_displacement_to_track_and_two_static_lenses():
     styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
         encoding="utf-8"
     )
-    assert ".glass-full .sliding-tabs::before," in styles_css
+    assert ".glass-full .sliding-tabs {" in styles_css
     assert ".glass-full .segmented::before," in styles_css
     assert ".glass-full .sidebar-toggle-lens {" in styles_css
-    selector_start = styles_css.index(".glass-full .sliding-tabs::before,")
-    selector_end = styles_css.index("{", selector_start)
-    selectors = styles_css[selector_start:selector_end]
-    assert selectors.count(".glass-full") == 3
-    body = styles_css[selector_end : styles_css.index("}", selector_end)]
-    assert "backdrop-filter: url(#liquidDrop) saturate(1.4);" in body
-    assert "-webkit-backdrop-filter: url(#liquidDrop) saturate(1.4);" in body
+    assert ".glass-full .sliding-tabs::before" not in styles_css
+
+    dynamic_start = styles_css.index(".glass-full .sliding-tabs {")
+    dynamic_body = styles_css[
+        styles_css.index("{", dynamic_start) + 1 : styles_css.index("}", dynamic_start)
+    ]
+    assert "url(#liquidTrackFilter)" in dynamic_body
+    assert "url(#liquidDrop)" not in dynamic_body
+
+    static_start = styles_css.index(".glass-full .segmented::before,")
+    static_selectors = styles_css[static_start : styles_css.index("{", static_start)]
+    assert static_selectors.count(".glass-full") == 2
+    static_body = styles_css[
+        styles_css.index("{", static_start) + 1 : styles_css.index("}", static_start)
+    ]
+    assert "backdrop-filter: url(#liquidDrop) saturate(1.4);" in static_body
+    assert "-webkit-backdrop-filter: url(#liquidDrop) saturate(1.4);" in static_body
+
     lens = _css_rule_block(styles_css, ".sidebar-toggle-lens")
     assert "position: absolute;" in lens
     assert "inset: 0;" in lens
@@ -2082,10 +4011,14 @@ def test_glass_tier_selectors_exclude_webgl_text_and_safety_controls():
     styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
         encoding="utf-8"
     )
-    full_start = styles_css.index(".glass-full .sliding-tabs::before,")
+    full_start = styles_css.index(".glass-full .sliding-tabs {")
     full_selectors = styles_css[full_start : styles_css.index("{", full_start)]
-    light_start = styles_css.index(":where(.glass-full, .glass-light) .panel,")
+    static_start = styles_css.index(".glass-full .segmented::before,")
+    full_selectors += styles_css[static_start : styles_css.index("{", static_start)]
+    light_start = styles_css.index(".glass-light .sliding-tabs {")
     light_selectors = styles_css[light_start : styles_css.index("{", light_start)]
+    where_start = styles_css.index(":where(.glass-full, .glass-light) .panel,")
+    light_selectors += styles_css[where_start : styles_css.index("{", where_start)]
     for selector in (
         ".joystick-knob",
         ".terminal",
@@ -2133,14 +4066,19 @@ def test_glass_focus_and_touch_targets():
         assert selector in coarse, selector
 
 
-def test_glass_reduced_motion_and_transparency_fallbacks():
+def test_glass_reduced_motion_fallback():
     styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
         encoding="utf-8"
     )
     motion_start = styles_css.index("@media (prefers-reduced-motion: reduce)")
     motion = styles_css[motion_start : styles_css.index("\n}", motion_start)]
-    assert "--layout-transition-ms: 1ms;" in motion
+    assert "--layout-slide-ms: 1ms;" in motion
+    assert "--fade-ms: 1ms;" in motion
+    assert "--thumb-ms: 1ms;" in motion
+    assert "--joystick-reveal-ms: 1ms;" in motion
+    assert "--joystick-hide-ms: 1ms;" in motion
     assert "--glass-drop-ms: 1ms;" in motion
+    assert ".joystick {" in motion
     assert "animation: none;" in motion
     assert "body::before," in motion
     assert "body::after" in motion
@@ -2153,9 +4091,8 @@ def test_glass_water_drop_motion():
     styles_css = (Path(__file__).resolve().parents[1] / "static" / "styles.css").read_text(
         encoding="utf-8"
     )
-    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)," in styles_css
+    assert "transition: transform var(--thumb-ms) var(--glass-drop-ease)," in styles_css
     assert "will-change: transform;" in styles_css
-    assert "will-change: transform, opacity;" in styles_css
     assert "@keyframes glassDropScale" in styles_css
     keyframes = styles_css[styles_css.index("@keyframes glassDropScale") :]
     assert "scale: 0.94;" in keyframes
@@ -2169,15 +4106,10 @@ def test_glass_water_drop_motion():
     ]
     assert "animation: glassDropScale var(--glass-drop-ms) var(--glass-drop-ease);" in animation_body
     assert "filter" not in animation_body
-    drop_start = styles_css.index(".sliding-tabs::after,")
-    drop_body = styles_css[
-        styles_css.index("{", drop_start) + 1 : styles_css.index("}", drop_start)
-    ]
-    assert "transform: translate3d(calc(var(--tabs-index, var(--mode-index, 0)) * 100%), 0, 0) scale(0.4);" in drop_body
-    assert "opacity: 0;" in drop_body
-    assert "filter" not in drop_body
-    assert ".sliding-tabs.glass-drop::after," in styles_css
-    assert "opacity: 0.9;" in styles_css
+    # The orphan caustic dot is gone; the drop is carried by the capsule itself.
+    assert ".sliding-tabs::after" not in styles_css
+    assert ".segmented::after" not in styles_css
+    assert ".sliding-tabs.glass-drop::after" not in styles_css
 
 
 def test_glass_drop_class_is_timed_and_forced_reflowed():
@@ -2290,9 +4222,9 @@ def test_mode_control_uses_ios_sliding_segmented_selector():
     assert 'data-active="view"' in index_html
     assert 'document.getElementById("modeSegment").dataset.active = mode;' in app_js
     assert ".segmented::before" in styles_css
-    assert '.segmented[data-active="initial"] {' in styles_css
-    assert '.segmented[data-active="goal"] {' in styles_css
-    assert "--mode-index: 2;" in styles_css
+    assert "transform: translate3d(var(--thumb-x, 4px), 0, 0);" in styles_css
+    assert "width: var(--thumb-w, calc((100% - 8px) / 3));" in styles_css
+    assert "modeSegmentControl.sync(" in app_js
 
 
 def test_frontend_uses_immersive_glass_light_environment():
@@ -2339,8 +4271,9 @@ def test_top_tabs_use_sliding_segmented_selector():
     assert 'data-active="3d"' in index_html
     assert "viewTabs.dataset.active = tab;" in app_js
     assert ".sliding-tabs::before" in styles_css
-    assert '.sliding-tabs[data-active="system"] {' in styles_css
-    assert "--tabs-index: 1;" in styles_css
+    assert "transform: translate3d(var(--thumb-x, 4px), 0, 0);" in styles_css
+    assert "width: var(--thumb-w, calc((100% - 8px) / 3));" in styles_css
+    assert "viewTabsControl.sync(" in app_js
 
 
 def test_sliding_selectors_use_transform_based_ios_spring_motion():
@@ -2352,11 +4285,13 @@ def test_sliding_selectors_use_transform_based_ios_spring_motion():
     assert "--glass-drop-ease: cubic-bezier(0.18, 1.32, 0.32, 1);" in styles_css
     assert "will-change: transform;" in styles_css
     assert "will-change: transform, box-shadow, filter;" not in styles_css
-    assert "transform: translate3d(calc(var(--tabs-index, 0) * 100%), 0, 0)" in styles_css
-    assert "transform: translate3d(calc(var(--mode-index, 0) * 100%), 0, 0)" in styles_css
-    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)" in styles_css
-    assert '.sliding-tabs[data-active="system"] {' in styles_css
-    assert '.segmented[data-active="goal"] {' in styles_css
+    # The capsule moves to measured pixel offsets; percent-of-self translation
+    # is what let its own border accumulate past the right edge.
+    assert "transform: translate3d(var(--thumb-x, 4px), 0, 0)" in styles_css
+    assert "transform: translate3d(calc(var(--tabs-index, 0) * 100%), 0, 0)" not in styles_css
+    assert "transform: translate3d(calc(var(--mode-index, 0) * 100%), 0, 0)" not in styles_css
+    assert "transition: transform var(--thumb-ms) var(--glass-drop-ease)" in styles_css
+    assert ".segmented::before" in styles_css
     assert "transition: left 280ms" not in styles_css
     assert "transform: translateX(100%)" not in styles_css
     assert "transform: translateX(200%)" not in styles_css
@@ -2444,10 +4379,8 @@ def test_mode_slider_uses_contained_spring_to_stay_inside_track():
     ).read_text(encoding="utf-8")
 
     assert "--ios-contained-spring: cubic-bezier(0.2, 0.85, 0.25, 1);" in styles_css
-    segmented_before = styles_css[
-        styles_css.index(".segmented::before") : styles_css.index(".segmented[data-active=\"initial\"]")
-    ]
-    assert "transition: transform var(--glass-drop-ms) var(--glass-drop-ease)" in segmented_before
+    segmented_before = _css_rule_block(styles_css, ".segmented::before")
+    assert "transition: transform var(--thumb-ms) var(--glass-drop-ease)" in segmented_before
     assert "var(--ios-spring)" not in segmented_before
     assert "var(--ios-contained-spring)" not in segmented_before
 
@@ -2500,6 +4433,24 @@ def test_mobile_layout_keeps_control_panel_as_side_panel():
     mobile_app_block_end = styles_css.index(".panel", mobile_app_block_start)
     assert "grid-template-columns: 1fr;" not in styles_css[mobile_app_block_start:mobile_app_block_end]
     assert "grid-template-rows: 52vh 48vh;" not in styles_css
+
+
+def test_app_clips_collapsed_sidebar_horizontal_overflow():
+    _, _, styles_css = _frontend_sources()
+
+    app = _css_rule_block(styles_css, ".app")
+    assert "overflow-x: hidden;" in app
+    assert "overflow-x: clip;" in app
+    # The hidden declaration is the fallback and must precede the preferred clip.
+    assert app.index("overflow-x: hidden;") < app.index("overflow-x: clip;")
+
+    # The intentional sub-760px horizontal panning contract stays on the root.
+    root = _css_rule_block(styles_css, "html,\nbody")
+    assert "overflow-x: auto;" in root
+
+    # Panel vertical scrolling remains internal to the panel.
+    panel = _css_rule_block(styles_css, ".panel")
+    assert "overflow-y: auto;" in panel
 
 
 class _LoggerStub:
@@ -3451,13 +5402,28 @@ class _RecordingManagedProcess:
     def __init__(self, command, running=False):
         self.command = list(command)
         self.started = 0
+        self.stopped = 0
         self._running = running
+        self.log_buffer = None
 
     def is_running(self):
         return self._running
 
     def start(self):
         self.started += 1
+        self._running = True
+        if self.log_buffer is not None:
+            self.log_buffer.set_process_state(
+                enabled=True, running=True, returncode=None
+            )
+
+    def stop(self):
+        self.stopped += 1
+        self._running = False
+        if self.log_buffer is not None:
+            self.log_buffer.set_process_state(
+                enabled=True, running=False, returncode=None
+            )
 
 
 def _selection_node(tmp_path, selection=None, running=(), **overrides):
@@ -3487,11 +5453,34 @@ def _selection_node(tmp_path, selection=None, running=(), **overrides):
     node.map_root = root
     node.map_catalog = MapCatalog(root)
     node.map_selection = SelectionStore(tmp_path / "config" / "selected_map.json")
+    node.layers = {
+        name: SourceCache(name, 2.0, static_source=name != "obstacles")
+        for name in ("global_map", "local_map", "mapcloud", "mapground", "obstacles")
+    }
     node.managed_logs = {
         target: TerminalLogBuffer(target, max_lines=5)
-        for target in ("localization", "navigation", "mapping")
+        for target in (
+            "chassis",
+            "imu",
+            "lidar",
+            "localization",
+            "navigation",
+            "mapping",
+        )
     }
     node.managed_processes = {
+        "chassis": _RecordingManagedProcess(
+            ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+            running="chassis" in running,
+        ),
+        "imu": _RecordingManagedProcess(
+            ["ros2", "launch", "fdilink_ahrs", "ahrs_driver.launch.py"],
+            running="imu" in running,
+        ),
+        "lidar": _RecordingManagedProcess(
+            ["ros2", "launch", "hesai_ros_driver", "start.py"],
+            running="lidar" in running,
+        ),
         "localization": _RecordingManagedProcess(
             [
                 "ros2",
@@ -3517,6 +5506,8 @@ def _selection_node(tmp_path, selection=None, running=(), **overrides):
     }
     if selection is not None:
         node.map_selection.save(selection)
+    for target, process in node.managed_processes.items():
+        process.log_buffer = node.managed_logs[target]
     from web_control.navigation_control import NavigationControl
     from web_control.navigation_store import NavigationStore
 
@@ -3530,6 +5521,8 @@ def _selection_node(tmp_path, selection=None, running=(), **overrides):
         "require_valid_selection",
         "managed_start_command",
         "start_managed_target",
+        "stop_managed_target",
+        "terminal_logs_payload",
         "ui_preferences_payload",
         "save_ui_preferences",
     ):
@@ -3598,6 +5591,14 @@ def test_maps_handler_reports_missing_root_and_no_selection(tmp_path):
         "valid": False,
         "entry": None,
         "message": "no map selected",
+        "mode": "auto",
+        "effective_mode": None,
+        "mode_valid": False,
+        "mode_message": "no map selected",
+        "auto_relocalization": True,
+        "auto_relocalization_available": False,
+        "effective_auto_relocalization": False,
+        "auto_relocalization_message": "no map selected",
     }
 
 
@@ -3706,26 +5707,39 @@ def test_maps_handler_select_allowed_while_only_mapping_runs(tmp_path):
     assert node.map_selection.load() == "site_b"
 
 
-def test_ui_preferences_get_returns_defaults_and_saved_values(tmp_path):
+_VALID_TWO_STICK = {
+    "throttle": {"size": 200, "x": 20, "y": 320},
+    "steering": {"size": 200, "x": 520, "y": 320},
+}
+
+
+def _two_stick_defaults() -> dict:
+    return {
+        "throttle": {"size": 180, "x": None, "y": None},
+        "steering": {"size": 180, "x": None, "y": None},
+    }
+
+
+def test_ui_preferences_get_returns_two_stick_defaults_and_saved_values(tmp_path):
     node = _selection_node(tmp_path)
 
     status, body = _serve_and_request(node, "/api/ui/preferences")
 
     assert status == 200
     assert body["ok"] is True
-    assert body["joystick"] == {"size": 180, "x_ratio": 0.05, "y_ratio": 0.75}
+    # A null offset means "browser role default" (throttle lower-left, steering
+    # lower-right); saved offsets are stable viewport pixels.
+    assert body["joystick"] == _two_stick_defaults()
 
-    node.map_selection.save_joystick_preferences(
-        {"size": 230, "x_ratio": 0.2, "y_ratio": 0.6}
-    )
+    node.map_selection.save_joystick_preferences(_VALID_TWO_STICK)
 
     status, body = _serve_and_request(node, "/api/ui/preferences")
 
     assert status == 200
-    assert body["joystick"] == {"size": 230, "x_ratio": 0.2, "y_ratio": 0.6}
+    assert body["joystick"] == _VALID_TWO_STICK
 
 
-def test_ui_preferences_post_persists_complete_object_and_preserves_selection(tmp_path):
+def test_ui_preferences_post_persists_two_sticks_and_preserves_selection(tmp_path):
     _make_map_dir(tmp_path / "map", "site_a")
     node = _selection_node(tmp_path, selection="site_a")
     node.map_selection.path.write_text(
@@ -3734,23 +5748,17 @@ def test_ui_preferences_post_persists_complete_object_and_preserves_selection(tm
     )
 
     status, body = _serve_and_request(
-        node,
-        "/api/ui/preferences",
-        {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65},
-        "POST",
+        node, "/api/ui/preferences", _VALID_TWO_STICK, "POST"
     )
 
     assert status == 200
     assert body["ok"] is True
-    assert body["joystick"] == {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65}
+    assert body["joystick"] == _VALID_TWO_STICK
     assert node.map_selection.load() == "site_a"
     payload = json.loads(node.map_selection.path.read_text(encoding="utf-8"))
     assert payload == {
         "name": "site_a",
-        "ui": {
-            "theme": "dark",
-            "joystick": {"size": 210, "x_ratio": 0.15, "y_ratio": 0.65},
-        },
+        "ui": {"theme": "dark", "joystick": _VALID_TWO_STICK},
         "extra": 1,
     }
 
@@ -3760,22 +5768,49 @@ def test_ui_preferences_post_persists_complete_object_and_preserves_selection(tm
     [
         [],
         {},
-        {"size": 139, "x_ratio": 0.5, "y_ratio": 0.5},
-        {"size": 261, "x_ratio": 0.5, "y_ratio": 0.5},
-        {"size": "210", "x_ratio": 0.5, "y_ratio": 0.5},
-        {"size": float("nan"), "x_ratio": 0.5, "y_ratio": 0.5},
-        {"size": 210, "x_ratio": -0.01, "y_ratio": 0.5},
-        {"size": 210, "x_ratio": 0.5, "y_ratio": 1.01},
-        {"size": 210, "x_ratio": 0.5},
+        {"throttle": {"size": 200, "x": 20, "y": 320}},
+        {"throttle": [], "steering": {"size": 200, "x": 20, "y": 320}},
+        {
+            "throttle": {"size": 139, "x": 20, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": 261, "x": 20, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": "200", "x": 20, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": float("nan"), "x": 20, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": 200, "x": -1, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": 200, "x": 20, "y": -0.5},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": 200, "x": 20},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
+        {
+            "throttle": {"size": 200, "x": 20, "y": 320},
+            "steering": {"size": 200, "x": "20", "y": 320},
+        },
+        {
+            "throttle": {"size": 200, "x": True, "y": 320},
+            "steering": {"size": 200, "x": 20, "y": 320},
+        },
     ],
 )
-def test_ui_preferences_post_rejects_invalid_payload_without_changing_file(
-    tmp_path, payload
-):
+def test_ui_preferences_post_rejects_invalid_two_stick_payload(tmp_path, payload):
     node = _selection_node(tmp_path)
-    node.map_selection.save_joystick_preferences(
-        {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
-    )
+    node.map_selection.save_joystick_preferences(_VALID_TWO_STICK)
     before = node.map_selection.path.read_text(encoding="utf-8")
 
     status, body = _serve_and_request(node, "/api/ui/preferences", payload, "POST")
@@ -3783,36 +5818,36 @@ def test_ui_preferences_post_rejects_invalid_payload_without_changing_file(
     assert status == 400
     assert body["ok"] is False
     assert node.map_selection.path.read_text(encoding="utf-8") == before
-    assert node.map_selection.load_joystick_preferences() == {
-        "size": 200,
-        "x_ratio": 0.2,
-        "y_ratio": 0.8,
-    }
+    assert node.map_selection.load_joystick_preferences() == _VALID_TWO_STICK
 
 
-@pytest.mark.parametrize("key", ["size", "x_ratio", "y_ratio"])
-def test_ui_preferences_post_rejects_overflowing_value_with_400(tmp_path, key):
+@pytest.mark.parametrize(
+    "role,key",
+    [
+        ("throttle", "size"),
+        ("throttle", "x"),
+        ("throttle", "y"),
+        ("steering", "size"),
+        ("steering", "x"),
+        ("steering", "y"),
+    ],
+)
+def test_ui_preferences_post_rejects_overflowing_two_stick_value(tmp_path, role, key):
     node = _selection_node(tmp_path)
-    node.map_selection.save_joystick_preferences(
-        {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
-    )
+    node.map_selection.save_joystick_preferences(_VALID_TWO_STICK)
     before = node.map_selection.path.read_text(encoding="utf-8")
-    payload = {"size": 200, "x_ratio": 0.2, "y_ratio": 0.8}
-    payload[key] = 10**400
+    payload = json.loads(json.dumps(_VALID_TWO_STICK))
+    payload[role][key] = 10**400
 
     status, body = _serve_and_request(node, "/api/ui/preferences", payload, "POST")
 
     assert status == 400
     assert body["ok"] is False
     assert node.map_selection.path.read_text(encoding="utf-8") == before
-    assert node.map_selection.load_joystick_preferences() == {
-        "size": 200,
-        "x_ratio": 0.2,
-        "y_ratio": 0.8,
-    }
+    assert node.map_selection.load_joystick_preferences() == _VALID_TWO_STICK
 
 
-def test_ui_preferences_get_falls_back_for_overflowing_saved_value(tmp_path):
+def test_ui_preferences_get_repairs_invalid_two_stick_values_independently(tmp_path):
     node = _selection_node(tmp_path)
     node.map_selection.path.parent.mkdir(parents=True, exist_ok=True)
     node.map_selection.path.write_text(
@@ -3820,7 +5855,10 @@ def test_ui_preferences_get_falls_back_for_overflowing_saved_value(tmp_path):
             {
                 "name": "site_a",
                 "ui": {
-                    "joystick": {"size": 10**400, "x_ratio": 0.4, "y_ratio": 10**400}
+                    "joystick": {
+                        "throttle": {"size": 10**400, "x": -3, "y": 320},
+                        "steering": {"size": 250, "x": 10**400, "y": "nope"},
+                    }
                 },
             }
         )
@@ -3831,7 +5869,54 @@ def test_ui_preferences_get_falls_back_for_overflowing_saved_value(tmp_path):
     status, body = _serve_and_request(node, "/api/ui/preferences")
 
     assert status == 200
-    assert body["joystick"] == {"size": 180, "x_ratio": 0.4, "y_ratio": 0.75}
+    assert body["joystick"] == {
+        "throttle": {"size": 180, "x": None, "y": 320},
+        "steering": {"size": 250, "x": None, "y": None},
+    }
+
+
+def test_ui_preferences_get_migrates_legacy_single_joystick(tmp_path):
+    node = _selection_node(tmp_path)
+    node.map_selection.path.parent.mkdir(parents=True, exist_ok=True)
+    node.map_selection.path.write_text(
+        json.dumps(
+            {
+                "name": "site_a",
+                "ui": {"joystick": {"size": 210, "x_ratio": 0.2, "y_ratio": 0.6}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status, body = _serve_and_request(node, "/api/ui/preferences")
+
+    assert status == 200
+    assert node.map_selection.load() == "site_a"
+    assert body["joystick"] == {
+        "throttle": {"size": 210, "x": None, "y": None},
+        "steering": {"size": 210, "x": None, "y": None},
+    }
+
+
+def test_ui_preferences_get_migrates_legacy_invalid_size_to_defaults(tmp_path):
+    node = _selection_node(tmp_path)
+    node.map_selection.path.parent.mkdir(parents=True, exist_ok=True)
+    node.map_selection.path.write_text(
+        json.dumps(
+            {
+                "name": "site_a",
+                "ui": {"joystick": {"size": 10**400, "x_ratio": 0.2, "y_ratio": 0.6}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status, body = _serve_and_request(node, "/api/ui/preferences")
+
+    assert status == 200
+    assert body["joystick"] == _two_stick_defaults()
 
 
 def test_managed_start_command_uses_tiled_map_without_writing_cache(tmp_path):
@@ -3861,7 +5946,9 @@ def test_managed_start_command_uses_tiled_map_without_writing_cache(tmp_path):
         f"map_path:={tiled_dir.resolve()}"
     ]
     assert not any(a.startswith("params_file:=") for a in localization)
-    assert not any(a.startswith("auto_relocalization:=") for a in localization)
+    assert [a for a in localization if a.startswith("auto_relocalization:=")] == [
+        "auto_relocalization:=true"
+    ]
     # The selected map is passed straight to the launch; the old generated
     # relocalization parameter cache is neither created nor referenced.
     assert not (tmp_path / ".cache").exists()
@@ -4006,6 +6093,67 @@ def test_localization_and_navigation_starts_use_the_same_selected_candidate(tmp_
     assert node.managed_processes["navigation"].started == 1
 
 
+def test_managed_hardware_targets_are_reachable_over_the_real_api(tmp_path):
+    node = _selection_node(tmp_path)
+    server, thread = _serve_fake_web_node(node)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def request(path, payload=None, method="GET"):
+        return _json_request(f"{base}{path}", payload, method)
+
+    try:
+        # Log/state whitelist: both pages read the same three hardware targets.
+        status, body = request("/api/logs")
+        assert status == 200
+        for target in ("chassis", "imu", "lidar"):
+            assert target in body["logs"]
+            assert body["logs"][target]["running"] is False
+
+        # Each hardware target starts through the real POST route.
+        for target in ("chassis", "imu", "lidar"):
+            status, body = request(
+                "/api/managed/start", {"target": target}, "POST"
+            )
+            assert status == 200, (target, body)
+            assert body["ok"] is True
+            assert node.managed_processes[target].started == 1
+
+        # The running flag the browser polls travels back through /api/logs.
+        status, body = request("/api/logs")
+        assert status == 200
+        for target in ("chassis", "imu", "lidar"):
+            assert body["logs"][target]["running"] is True
+
+        # The stop route reaches the same shared backend object.
+        status, body = request(
+            "/api/managed/stop", {"target": "imu"}, "POST"
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert node.managed_processes["imu"].stopped == 1
+        status, body = request("/api/logs")
+        assert body["logs"]["imu"]["running"] is False
+        assert body["logs"]["chassis"]["running"] is True
+
+        # Unknown targets are rejected before any process is touched.
+        status, body = request(
+            "/api/managed/start", {"target": "reactor"}, "POST"
+        )
+        assert status == 400
+        assert body["ok"] is False
+        assert "unknown managed target" in body["message"]
+        status, body = request(
+            "/api/managed/stop", {"target": "reactor"}, "POST"
+        )
+        assert status == 400
+        for target in ("chassis", "imu", "lidar"):
+            assert node.managed_processes[target].started == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def _frontend_sources():
     """Return ``(index_html, app_js, styles_css)`` for browser-facing tests."""
     static_dir = Path(__file__).resolve().parents[1] / "static"
@@ -4060,8 +6208,7 @@ function makeElement() {
 }
 const elements = {};
 for (const id of [
-  "mapSelect", "mapTiledLabel", "mapRelocalizationLabel", "mapManualInitialPose",
-  "mapWarning", "mapStatus", "mapLockNote",
+  "mapSelect", "mapMode", "mapWarning", "mapStatus", "mapLockNote",
 ]) {
   elements[id] = makeElement();
 }
@@ -4097,7 +6244,7 @@ function expect(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-// A valid tiled map with sc_db.bin renders both capability labels.
+// A valid tiled map keeps the selector usable without a persistent status line.
 state.mapCatalog = {
   map_root: "~/map",
   maps: [{ name: "site_a", tiled: true, has_scan_context: true, warning: null }],
@@ -4111,11 +6258,9 @@ state.mapCatalog = {
 updateMapPanel();
 expect(elements.mapSelect.value === "site_a", "selected map is not reflected in the selector");
 expect(!elements.mapSelect.disabled, "selector should be enabled for a valid selection");
-expect(/tiled loading: available/i.test(elements.mapTiledLabel.textContent), "tiled label missing");
-expect(/automatic relocalization: available/i.test(elements.mapRelocalizationLabel.textContent), "relocalization label missing");
-expect(elements.mapManualInitialPose.hidden, "manual initial pose note should be hidden");
+expect(elements.mapStatus.hidden && elements.mapStatus.textContent === "", "normal map status should be hidden");
 
-// A global map without sc_db.bin asks for a manual initial pose and warns.
+// A global map without sc_db.bin still surfaces its actionable tile warning.
 const warning = "tiled manifest is invalid: bad schema";
 state.mapCatalog.maps = [{ name: "site_b", tiled: false, has_scan_context: false, warning }];
 state.mapCatalog.selection = {
@@ -4125,9 +6270,9 @@ state.mapCatalog.selection = {
   message: null,
 };
 updateMapPanel();
-expect(!elements.mapManualInitialPose.hidden, "manual initial pose note should be shown");
 expect(!elements.mapWarning.hidden, "tile warning should be visible");
 expect(/tile warning/i.test(elements.mapWarning.textContent), "tile warning was not surfaced");
+expect(elements.mapStatus.hidden, "a non-actionable map status should stay hidden");
 
 // A saved but deleted selection stays visible as unavailable.
 state.mapCatalog.maps = [];
@@ -4205,6 +6350,7 @@ let renderCalls = 0;
 global.resizeAll = () => { resizeCalls += 1; };
 global.applyJoystickLayout = () => { layoutCalls += 1; };
 global.updateHudPlacement = () => { hudCalls += 1; };
+global.flushPendingMappingJoystickReveal = () => {};
 global.renderer = { render: () => { renderCalls += 1; } };
 global.scene = {};
 global.camera = {};
@@ -4277,22 +6423,79 @@ expect(pageTransition.active === false, "controller returns to stable");
 settleLayoutTransition(firstToken);
 expect(resizeCalls === 1, "a stale token never flushes");
 
-// A tracked transitionend settles; untracked properties and targets are ignored.
+// Only the app's own grid event may settle a geometry-aware transition.
 resetCounters();
-beginLayoutTransition();
-appEl.dispatch("transitionend", { propertyName: "color", target: viewSystemEl });
-appEl.dispatch("transitionend", { propertyName: "opacity", target: makeElement() });
-expect(resizeCalls === 0, "untracked events are ignored");
-appEl.dispatch("transitionend", { propertyName: "opacity", target: viewSystemEl });
-expect(resizeCalls === 1, "a tracked transitionend settles");
-expect(renderCalls === 1, "a tracked transitionend performs the settle render");
+beginLayoutTransition({ gridChanged: true });
+appEl.dispatch("transitionend", { propertyName: "color", target: appEl });
+appEl.dispatch("transitionend", { propertyName: "opacity", target: appEl });
+appEl.dispatch("transitionend", { propertyName: "transform", target: appEl });
+expect(resizeCalls === 0, "opacity/transform never settle a transition");
+expect(pageTransition.active === true, "the transition stays pending after ignored events");
+flushTimers();
+expect(resizeCalls === 1, "the fallback settles after ignored opacity/transform events");
 
-// A stale event for an old token does not flush.
+// Pseudo-element grid events are ignored.
 resetCounters();
-beginLayoutTransition();
-const liveToken = beginLayoutTransition();
+beginLayoutTransition({ gridChanged: true });
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl, pseudoElement: "::before" });
+expect(resizeCalls === 0, "pseudo-element grid events never settle");
+flushTimers();
+expect(resizeCalls === 1, "the fallback settles after a pseudo-element event");
+
+// A grid event from a non-.app target is ignored.
+resetCounters();
+beginLayoutTransition({ gridChanged: true });
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: viewSystemEl });
+expect(resizeCalls === 0, "grid events from non-app targets never settle");
+flushTimers();
+expect(resizeCalls === 1, "the fallback settles after a non-app grid event");
+
+// The app's own grid event settles only a transition that expects the grid.
+resetCounters();
+beginLayoutTransition({ gridChanged: true });
 appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
-expect(resizeCalls === 1, "the newest token settles");
+expect(resizeCalls === 1, "the app grid event settles a geometry transition");
+expect(renderCalls === 1, "a settled grid event performs the settle render");
+expect(pageTransition.active === false, "the geometry transition is stable after settling");
+
+// A pure view transition ignores a stale grid event and uses the fallback.
+resetCounters();
+beginLayoutTransition({ gridChanged: false });
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
+expect(resizeCalls === 0, "a pure view transition never settles on a grid event");
+expect(pageTransition.active === true, "the pure view transition stays pending");
+flushTimers();
+expect(resizeCalls === 1, "the pure view transition settles on the fallback");
+
+// A pure begin while a grid run is still in flight must not clear the grid
+// expectation: the grid is physically moving, so the app's own grid event still
+// settles the combined run instead of being treated as stale.
+resetCounters();
+const gridRunToken = beginLayoutTransition({ gridChanged: true });
+const pureOverlayToken = beginLayoutTransition({ gridChanged: false });
+expect(pureOverlayToken === gridRunToken + 1, "the pure begin takes the newest token");
+expect(pageTransition.expectsGrid === true, "an in-flight grid run keeps expectsGrid sticky");
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
+expect(resizeCalls === 1, "the app grid event settles the combined in-flight run");
+expect(pageTransition.active === false, "the combined run is stable after the grid event");
+
+// Once settled, a later pure transition is genuinely grid-free: it must ignore
+// the (now stale) grid event and settle on the fallback timer.
+resetCounters();
+beginLayoutTransition({ gridChanged: false });
+expect(pageTransition.expectsGrid === false, "a fresh pure transition does not expect the grid");
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
+expect(resizeCalls === 0, "a fresh pure transition ignores the app grid event");
+expect(pageTransition.active === true, "the fresh pure transition stays pending");
+flushTimers();
+expect(resizeCalls === 1, "the fresh pure transition settles on the fallback");
+
+// A stale token never flushes after the live transition has settled.
+resetCounters();
+beginLayoutTransition({ gridChanged: true });
+const liveToken = beginLayoutTransition({ gridChanged: true });
+appEl.dispatch("transitionend", { propertyName: "grid-template-columns", target: appEl });
+expect(resizeCalls === 1, "the newest token settles on the app grid event");
 settleLayoutTransition(liveToken - 1);
 expect(resizeCalls === 1, "old tokens are ignored after settling");
 
@@ -4379,6 +6582,7 @@ global.glassMotionReduced = () => reduceMotion;
 global.resizeAll = () => {};
 global.applyJoystickLayout = () => {};
 global.updateHudPlacement = () => {};
+global.flushPendingMappingJoystickReveal = () => {};
 global.renderer = { render: () => {} };
 global.scene = {};
 global.camera = {};
@@ -4458,20 +6662,29 @@ const frames = new Map();
 let nextFrame = 1;
 let renderCalls = 0;
 let cameraUpdates = 0;
+let resizeCalls = 0;
+const order = [];
+let reduceMotion = false;
 const state = { view: "3d" };
-const renderer = { render() { renderCalls += 1; } };
+const renderer = { render() { renderCalls += 1; order.push("render"); } };
 const scene = {};
 const camera = {};
-const updateCamera = () => { cameraUpdates += 1; };
+const updateCamera = () => { cameraUpdates += 1; order.push("camera"); };
+const pageTransition = { active: false, expectsGrid: false };
+const glassMotionReduced = () => reduceMotion;
+const resizeAll = () => { resizeCalls += 1; order.push("resize"); };
+const fpsMeter = { markFrame() {}, setActive() {} };
 const requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
 const cancelAnimationFrame = (id) => { frames.delete(id); };
 
 const api = new Function(
   "state", "renderer", "scene", "camera", "updateCamera",
   "requestAnimationFrame", "cancelAnimationFrame",
+  "pageTransition", "glassMotionReduced", "resizeAll", "fpsMeter",
   block + `
 return { mapViewActive, render, ensureMapRenderLoop, pauseMapRenderLoop, frameId: () => mapRenderFrame };`,
-)(state, renderer, scene, camera, updateCamera, requestAnimationFrame, cancelAnimationFrame);
+)(state, renderer, scene, camera, updateCamera, requestAnimationFrame, cancelAnimationFrame,
+   pageTransition, glassMotionReduced, resizeAll, fpsMeter);
 const { mapViewActive, render, ensureMapRenderLoop, pauseMapRenderLoop, frameId } = api;
 
 function expect(condition, message) { if (!condition) throw new Error(message); }
@@ -4520,6 +6733,51 @@ state.view = "mapping";
 expect(mapViewActive() === true, "mapping is a map view");
 ensureMapRenderLoop();
 expect(frames.size === 1, "mapping schedules one pending frame");
+
+// --- Live viewport sync during a grid-expecting transition ---
+// A render frame in a map view during an active grid transition must resize the
+// cached drawing buffer before updating the camera and drawing, so the old
+// buffer is never stretched to the new CSS box.
+pageTransition.active = true;
+pageTransition.expectsGrid = true;
+reduceMotion = false;
+state.view = "3d";
+order.length = 0;
+resizeCalls = 0;
+renderCalls = 0;
+cameraUpdates = 0;
+render();
+expect(resizeCalls === 1, "an active grid transition in a map view resizes the buffer");
+expect(order.join(">") === "resize>camera>render", "resize precedes camera and draw");
+
+// Negative gate: a pure view transition never live-resizes.
+pageTransition.expectsGrid = false;
+resizeCalls = 0;
+order.length = 0;
+render();
+expect(resizeCalls === 0, "a pure view transition never live-resizes");
+
+// Negative gate: an inactive transition never live-resizes.
+pageTransition.active = false;
+pageTransition.expectsGrid = true;
+resizeCalls = 0;
+render();
+expect(resizeCalls === 0, "an inactive transition never live-resizes");
+
+// Negative gate: reduced motion keeps the next-frame settle path.
+pageTransition.active = true;
+pageTransition.expectsGrid = true;
+reduceMotion = true;
+resizeCalls = 0;
+render();
+expect(resizeCalls === 0, "reduced motion never live-resizes");
+
+// Negative gate: a hidden/system view never live-resizes.
+reduceMotion = false;
+state.view = "system";
+resizeCalls = 0;
+render();
+expect(resizeCalls === 0, "a system view never live-resizes");
 
 console.log("render loop ok");
 """
@@ -4756,8 +7014,8 @@ def _navigation_node(
     node.action_status = SourceCache("action_status", 2.0)
     node.odom = SourceCache("odom", 2.0)
     node.layers = {
-        name: SourceCache(name, 2.0, static_source=True)
-        for name in ("local_map", "mapcloud", "mapground")
+        name: SourceCache(name, 2.0, static_source=name != "obstacles")
+        for name in ("global_map", "local_map", "mapcloud", "mapground", "obstacles")
     }
     node.paths = {}
     node.viewers = ViewerRegistry(timeout_sec=10.0)
@@ -6068,9 +8326,27 @@ def test_readme_documents_liquid_glass_transitions():
     assert "SVG" in readme
     assert "?glass=" in readme
     assert "prefers-reduced-motion" in readme
-    assert "prefers-reduced-transparency" in readme
-    assert "saveData" in readme
+    assert "prefers-reduced-transparency" not in readme
+    assert "Glass Strength" in readme
+    assert "web_control_glass_strength" in readme
+    assert "localStorage" in readme
+    assert "650ms" in readme
+    assert "--layout-slide-ms" in readme
+    assert "--fade-ms" in readme
+    assert "--thumb-ms" in readme
+    assert "420ms" in readme
+    assert "220ms" in readme
+    assert "--joystick-reveal-ms" in readme
+    assert "--joystick-hide-ms" in readme
+    assert "无白闪的实时 resize" in readme
+    assert "渲染循环每帧" in readme
+    assert "唯一的 `renderer.setSize` 调用点" in readme
     assert "独立实现" in readme
+    assert "liquidTrackFilter" in readme
+    assert "THIRD_PARTY_NOTICES" in readme
+    assert "MIT" in readme
+    assert "未复制上游代码或素材" not in readme
+    assert "无需附带上游 MIT 声明" not in readme
     assert "config/web_control.yaml" not in readme
 
 
@@ -6438,7 +8714,7 @@ def test_web_control_yaml_declares_teleop_defaults():
     parameters = config["web_control"]["ros__parameters"]
 
     assert parameters["teleop_cmd_vel_topic"] == "/cmd_vel"
-    assert parameters["teleop_max_linear_speed"] == 1.5
+    assert parameters["teleop_max_linear_speed"] == 1.0
     assert parameters["teleop_wheelbase"] == 0.65
     assert parameters["teleop_max_steer_angle"] == 0.461
     assert parameters["teleop_steering_exponent"] == 0.5
@@ -6457,21 +8733,84 @@ def test_mapping_joystick_is_a_mapping_only_sibling_overlay():
     assert 'id="mapCanvas3d"' in viewport
     assert 'id="mappingJoystick" class="joystick" hidden' in viewport
     assert viewport.index('id="mapCanvas3d"') < viewport.index('id="mappingJoystick"')
-    assert 'id="joystickBase"' in viewport
-    assert 'id="joystickKnob"' in viewport
-    assert 'id="joystickStatus"' in viewport
+    assert 'id="throttleStick"' in viewport
+    assert 'id="steeringStick"' in viewport
+    assert 'id="throttleBase"' in viewport
+    assert 'id="steeringBase"' in viewport
+    assert 'id="throttleKnob"' in viewport
+    assert 'id="steeringKnob"' in viewport
+    # The single-joystick status text is gone for good.
+    assert 'id="joystickStatus"' not in index_html
 
-    assert 'setMappingJoystickVisible(tab === "mapping")' in app_js
+    assert "setMappingJoystickVisible(true, { deferReveal: deferJoystickReveal });" in app_js
+    assert "setMappingJoystickVisible(false);" in app_js
     assert ".joystick {" in styles_css
     assert "position: absolute;" in styles_css
-    assert "--joystick-size" in styles_css
-    assert ".stage.hud-lower-right .hud" in styles_css
+    assert "--stick-size" in styles_css
+    assert ".stage.hud-center .hud" in styles_css
     assert 'id="joystickSettings"' in viewport
-    assert 'id="joystickMoveHandle"' in viewport
-    assert 'id="joystickResizeHandle"' in viewport
+    assert 'id="throttleMoveHandle"' in viewport
+    assert 'id="steeringResizeHandle"' in viewport
 
 
-_MAPPING_JOYSTICK_NODE_HARNESS = r"""
+def test_joystick_reveal_and_hide_css_contract():
+    index_html, app_js, styles_css = _frontend_sources()
+
+    base = _css_rule_block(styles_css, ".joystick")
+    # A not-yet-revealed joystick must never be interactive.
+    assert "pointer-events: none;" in base
+    assert "opacity: 0;" in base
+
+    concealed = _css_rule_block(styles_css, ".joystick.joystick-concealed")
+    assert "opacity: 0;" in concealed
+    assert "pointer-events: none;" in concealed
+    assert "var(--joystick-hide-ms)" in concealed
+    assert "var(--layout-ease)" in concealed
+
+    revealed = _css_rule_block(styles_css, ".joystick.joystick-revealed")
+    assert "opacity: 1;" in revealed
+    assert "var(--joystick-reveal-ms)" in revealed
+    assert "var(--layout-ease)" in revealed
+
+    # The full-viewport layer is never itself interactive; only its sticks and
+    # shared controls accept pointers so the map canvas keeps its gestures.
+    interactive = _css_rule_block(
+        styles_css, ".joystick.joystick-revealed .joystick-stick"
+    )
+    assert "pointer-events: auto;" in interactive
+
+    for block in (base, concealed, revealed):
+        assert "filter" not in block
+        assert "backdrop-filter" not in block
+
+    assert ".joystick[hidden]" in styles_css
+
+    assert "const JOYSTICK_REVEAL_MS = 420;" in app_js
+    assert "const JOYSTICK_HIDE_MS = 220;" in app_js
+    assert "const mappingJoystickVisibility = {" in app_js
+    assert "pendingReveal" in app_js
+    assert "deferReveal" in app_js
+    for name in (
+        "cancelMappingJoystickVisibility",
+        "concealMappingJoystick",
+        "revealMappingJoystick",
+        "scheduleMappingJoystickReveal",
+        "flushPendingMappingJoystickReveal",
+        "setMappingJoystickVisible",
+    ):
+        assert f"function {name}(" in app_js
+
+    block = app_js[
+        app_js.index("// --- Mapping joystick") : app_js.index("// --- End mapping joystick")
+    ]
+    assert "localStorage" not in block
+    assert "sessionStorage" not in block
+    assert "token !== mappingJoystickVisibility.token" in block
+    assert "joystick.hidden" in app_js
+    assert "flushPendingMappingJoystickReveal();" in app_js
+
+
+_JOYSTICK_VISIBILITY_NODE_HARNESS = r"""
 const fs = require("fs");
 const source = fs.readFileSync(process.env.APP_JS, "utf8");
 const blockStart = source.indexOf("// --- Mapping joystick");
@@ -6480,328 +8819,558 @@ if (blockStart < 0 || blockEnd < 0) throw new Error("mapping joystick block not 
 const block = source.slice(blockStart, blockEnd);
 
 function makeElement() {
+  const classes = new Set();
   return {
-    hidden: false,
-    textContent: "",
-    className: "",
-    style: {},
-    captured: [],
-    listeners: {},
+    hidden: true,
+    inert: false,
+    attributes: {},
     classList: {
-      values: new Set(),
+      add(name) { classes.add(name); },
+      remove(name) { classes.delete(name); },
       toggle(name, on) {
-        if (on) this.values.add(name);
-        else this.values.delete(name);
+        if (on) classes.add(name);
+        else classes.delete(name);
       },
-      contains(name) { return this.values.has(name); },
+      contains(name) { return classes.has(name); },
     },
-    setPointerCapture(id) { this.captured.push(id); },
-    addEventListener(name, handler) { this.listeners[name] = handler; },
-    getBoundingClientRect() { return { left: 0, top: 0, width: 100, height: 100 }; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
   };
 }
 
-const elements = {
-  mappingJoystick: makeElement(),
-  joystickKnob: makeElement(),
-  joystickStatus: makeElement(),
-};
+const joystick = makeElement();
 const stage = makeElement();
 global.document = {
-  hidden: false,
-  getElementById(id) { return elements[id] || null; },
+  getElementById(id) { return id === "mappingJoystick" ? joystick : null; },
   querySelector(selector) { return selector === ".stage" ? stage : null; },
-  addEventListener() {},
-};
-const intervalHandlers = new Map();
-let nextIntervalId = 1;
-global.window = {
-  addEventListener() {},
-  setInterval(handler) {
-    const id = nextIntervalId;
-    nextIntervalId += 1;
-    intervalHandlers.set(id, handler);
-    return id;
-  },
-  clearInterval(id) { intervalHandlers.delete(id); },
 };
 
-const beacons = [];
-try {
-  Object.defineProperty(globalThis, "navigator", {
-    value: { sendBeacon(url, body) { beacons.push({ url, body }); return true; } },
-    configurable: true,
-  });
-} catch (error) {
-  globalThis.navigator.sendBeacon = (url, body) => {
-    beacons.push({ url, body });
-    return true;
-  };
-}
-
-let fakeNow = 0;
-Date.now = () => fakeNow;
-
+const timers = new Map();
+const frames = new Map();
+// cancelAnimationFrame does not guarantee the callback never runs (it may
+// already be queued), so keep the cancelled callbacks and let the test invoke
+// them directly to prove the token guard, not the cancellation, is what
+// suppresses stale reveals.
+const cancelledFrames = [];
+let nextTimer = 1;
+let nextFrame = 1;
+global.setTimeout = (fn) => { const id = nextTimer++; timers.set(id, fn); return id; };
+global.clearTimeout = (id) => { timers.delete(id); };
+global.requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+global.cancelAnimationFrame = (id) => {
+  if (frames.has(id)) cancelledFrames.push(frames.get(id));
+  frames.delete(id);
+};
+let reduceMotion = false;
+global.glassMotionReduced = () => reduceMotion;
+let layoutCalls = 0;
+global.applyJoystickLayout = () => { layoutCalls += 1; };
+let stopCalls = 0;
+global.stopTeleop = async () => { stopCalls += 1; };
 global.viewerSessionId = () => "tab-session";
 
-const posts = [];
-const deferred = [];
-let deferRequests = false;
-let failNextRequest = false;
-global.postJson = async (url, payload) => {
-  posts.push({ url, payload });
-  if (failNextRequest) {
-    failNextRequest = false;
-    throw new Error("network down");
-  }
-  const active = payload.throttle !== 0 || payload.steering !== 0;
-  if (deferRequests) {
-    return await new Promise((resolve, reject) => {
-      deferred.push({ resolve, reject, payload, active });
-    });
-  }
-  return { ok: true, teleop: { active } };
-};
-global.fetchWithTimeout = async () => ({ ok: true });
-
-eval(block + "\nglobalThis.__teleopState = teleop;");
-const teleopState = globalThis.__teleopState;
+const api = new Function(block + `
+stopTeleop = global.stopTeleop;
+return { setMappingJoystickVisible, mappingJoystickVisibility, flushPendingMappingJoystickReveal, teleop };`)();
+const {
+  setMappingJoystickVisible, mappingJoystickVisibility,
+  flushPendingMappingJoystickReveal, teleop,
+} = api;
 
 function expect(condition, message) { if (!condition) throw new Error(message); }
-
-expect(teleopState.clientId === "tab-session", "joystick reuses viewerSessionId for client_id");
-
-const baseElement = makeElement();
-let propagationStops = 0;
-function makeEvent(pointerId, clientX, clientY) {
-  return {
-    pointerId,
-    pointerType: "mouse",
-    clientX,
-    clientY,
-    currentTarget: baseElement,
-    preventDefault() {},
-    stopPropagation() { propagationStops += 1; },
-  };
+function flushFrames() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((fn) => fn());
+}
+function flushTimers() {
+  const pending = Array.from(timers.values());
+  timers.clear();
+  pending.forEach((fn) => fn());
 }
 
-const radius = 50;
-const upLeft = joystickAxes(-40, -40, radius);
-expect(upLeft.throttle > 0 && upLeft.steering > 0, "upper-left is forward and left");
-const upRight = joystickAxes(40, -40, radius);
-expect(upRight.throttle > 0 && upRight.steering < 0, "upper-right is forward and right");
-const downLeft = joystickAxes(-40, 40, radius);
-expect(downLeft.throttle < 0 && downLeft.steering > 0, "lower-left is reverse and left");
-const downRight = joystickAxes(40, 40, radius);
-expect(downRight.throttle < 0 && downRight.steering < 0, "lower-right is reverse and right");
-const horizontal = joystickAxes(-40, 0, radius);
-expect(horizontal.throttle === 0 && horizontal.steering > 0, "horizontal drag has zero throttle");
-const centered = joystickAxes(2, -2, radius);
-expect(centered.throttle === 0 && centered.steering === 0, "dead zone centers the axes");
-const clamped = joystickAxes(-100, -100, radius);
-expect(clamped.throttle === 1 && clamped.steering === 1, "offsets clamp to the unit circle");
-
 (async () => {
-  fakeNow = 0;
-  await joystickPointerDown(makeEvent(1, 30, 30));
-  expect(posts.length === 1, "pointerdown sends the first command");
-  expect(posts[0].url === "/api/teleop", "pointerdown posts to /api/teleop");
-  expect(posts[0].payload.client_id === teleopState.clientId, "active send carries the tab client_id");
-  expect(Number.isInteger(posts[0].payload.seq) && posts[0].payload.seq > 0, "active send carries a positive integer seq");
-  expect(posts[0].payload.throttle > 0 && posts[0].payload.steering > 0, "pointerdown posts the upper-left axes");
-  expect(baseElement.captured.length === 1, "pointerdown captures the active pointer");
-  expect(propagationStops >= 1, "pointerdown stops propagation to the map canvas");
-  expect(elements.joystickKnob.style.transform === "translate(-20px, -20px)", "knob follows the pointer");
-  expect(intervalHandlers.size === 1, "pointerdown starts one fixed-rate send loop");
-
-  fakeNow = 100;
-  await Array.from(intervalHandlers.values())[0]();
-  expect(posts.length === 2, "stationary hold continues sending at 10 Hz");
-
-  fakeNow = 150;
-  await joystickPointerMove(makeEvent(1, 50, 50));
-  expect(posts.length === 3, "returning to center sends one immediate zero");
-  expect(posts[2].payload.throttle === 0, "center transition posts zero throttle");
-
-  fakeNow = 250;
-  await Array.from(intervalHandlers.values())[0]();
-  expect(posts.length === 3, "center hold does not stream zero commands");
-
-  await joystickPointerMove(makeEvent(1, 20, 20));
-  expect(posts.length === 4, "leaving center sends one immediate active command");
-
-  fakeNow = 300;
-  await joystickPointerMove(makeEvent(1, 10, 10));
-  expect(posts.length === 4, "active pointermove is throttled within 100 ms");
-
-  fakeNow = 350;
-  await Array.from(intervalHandlers.values())[0]();
-  expect(posts.length === 5, "active hold sends again after 100 ms");
-
-  fakeNow = 400;
-  await joystickPointerMove(makeEvent(1, 20, 20));
-  expect(posts.length === 5, "active pointermove shares the send throttle");
-
-  const beforeSecondPointer = posts.length;
-  await joystickPointerDown(makeEvent(2, 80, 80));
-  expect(baseElement.captured.length === 1, "second pointer is not captured");
-  expect(posts.length === beforeSecondPointer, "second pointer does not take control");
-
-  fakeNow = 450;
-  await joystickPointerUp(makeEvent(1, 20, 20));
-  expect(posts[posts.length - 1].payload.throttle === 0, "release sends a zero throttle");
-  expect(posts[posts.length - 1].payload.steering === 0, "release sends a zero steering");
-  expect(posts[posts.length - 1].payload.client_id === posts[0].payload.client_id, "stop shares the active client_id");
-  expect(posts[posts.length - 1].payload.seq > posts[0].payload.seq, "stop seq is higher than the active seq");
-  expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "release centers the knob");
-  expect(intervalHandlers.size === 0, "release clears the send loop");
-
-  fakeNow = 300;
-  await joystickPointerDown(makeEvent(3, -10, 90));
-  fakeNow = 400;
-  await joystickPointerCancel(makeEvent(3, -10, 90));
-  expect(posts[posts.length - 1].payload.throttle === 0, "cancel sends a zero command");
-
-  fakeNow = 500;
-  await joystickPointerDown(makeEvent(4, 10, 10));
-  fakeNow = 600;
-  await handleJoystickBlur();
-  expect(posts[posts.length - 1].payload.throttle === 0, "blur sends a zero command");
-
-  fakeNow = 700;
-  await joystickPointerDown(makeEvent(5, 10, 10));
-  document.hidden = true;
-  fakeNow = 800;
-  await handleVisibilityChange();
-  expect(posts[posts.length - 1].payload.throttle === 0, "hidden document sends a zero command");
-  document.hidden = false;
-
-  fakeNow = 900;
-  await joystickPointerDown(makeEvent(6, 10, 10));
+  // Immediate show (3d -> Mapping): exposed while concealed, measured at final
+  // geometry, then revealed on the next frame.
+  layoutCalls = 0;
   await setMappingJoystickVisible(true);
-  expect(elements.mappingJoystick.hidden === false, "joystick is visible for Mapping");
-  expect(stage.classList.contains("mapping-active"), "HUD shift class is applied for Mapping");
-  fakeNow = 1000;
+  expect(joystick.hidden === false, "show removes hidden before measuring");
+  expect(joystick.classList.contains("joystick-concealed"), "show starts concealed");
+  expect(!joystick.classList.contains("joystick-revealed"), "show does not reveal before layout");
+  expect(joystick.inert === true, "show blocks input until revealed");
+  expect(joystick.getAttribute("aria-hidden") === "true", "concealed joystick is aria-hidden");
+  expect(layoutCalls === 1, "immediate show applies joystick layout exactly once while concealed");
+  expect(frames.size === 1, "immediate show schedules exactly one reveal frame");
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "the reveal frame reveals the joystick");
+  expect(!joystick.classList.contains("joystick-concealed"), "the reveal frame clears concealment");
+  expect(joystick.inert === false, "reveal restores interaction");
+  expect(joystick.getAttribute("aria-hidden") === "false", "revealed joystick is exposed");
+  expect(mappingJoystickVisibility.visible === true, "visibility state records the reveal");
+
+  // Deferred show (System -> Mapping): stay concealed and unpositioned until the
+  // settled-layout hook measures the final geometry and schedules the reveal.
   await setMappingJoystickVisible(false);
-  expect(elements.mappingJoystick.hidden === true, "joystick is hidden away from Mapping");
-  expect(!stage.classList.contains("mapping-active"), "HUD shift class is removed away from Mapping");
-  expect(posts[posts.length - 1].payload.throttle === 0, "tab switch sends a zero command");
+  flushTimers();
+  layoutCalls = 0;
+  await setMappingJoystickVisible(true, { deferReveal: true });
+  expect(joystick.hidden === false, "deferred show exposes the concealed joystick");
+  expect(joystick.classList.contains("joystick-concealed"), "deferred show stays concealed");
+  expect(joystick.inert === true, "deferred show stays inert");
+  expect(mappingJoystickVisibility.pendingReveal === true, "deferred show records a pending reveal");
+  expect(!joystick.classList.contains("joystick-revealed"), "deferred show does not reveal early");
+  expect(layoutCalls === 0, "deferred show does not measure mid-transition");
+  expect(frames.size === 0, "deferred show schedules no reveal frame yet");
+  // Simulate doDeferredLayoutFlush: reposition at settled geometry, then reveal.
+  applyJoystickLayout();
+  flushPendingMappingJoystickReveal();
+  expect(layoutCalls === 1, "the settled-layout hook measures exactly once");
+  expect(mappingJoystickVisibility.pendingReveal === false, "the hook consumes the pending reveal");
+  expect(frames.size === 1, "the settled-layout hook schedules the reveal frame");
+  expect(!joystick.classList.contains("joystick-revealed"), "the reveal still waits for its frame");
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "the deferred joystick reveals after settle");
+  expect(mappingJoystickVisibility.visible === true, "deferred reveal records visibility");
 
-  fakeNow = 1100;
-  await joystickPointerDown(makeEvent(7, 10, 10));
-  const seqBeforePageHide = teleopState.seq;
-  handlePageHide();
-  expect(beacons.length === 1, "page shutdown sends one keepalive stop");
-  const beacon = JSON.parse(beacons[0].body);
-  expect(beacon.throttle === 0, "keepalive stop is a zero command");
-  expect(beacon.client_id === teleopState.clientId, "keepalive stop carries the tab client_id");
-  expect(Number.isInteger(beacon.seq) && beacon.seq > seqBeforePageHide, "keepalive stop increments seq");
+  // Hiding before the transition settles prevents the pending reveal.
+  await setMappingJoystickVisible(false);
+  flushTimers();
+  layoutCalls = 0;
+  await setMappingJoystickVisible(true, { deferReveal: true });
+  expect(mappingJoystickVisibility.pendingReveal === true, "second deferred show is pending");
+  await setMappingJoystickVisible(false);
+  expect(mappingJoystickVisibility.pendingReveal === false, "hide clears the pending reveal");
+  flushPendingMappingJoystickReveal();
+  expect(frames.size === 0, "a cancelled pending reveal schedules no frame");
+  expect(layoutCalls === 0, "a cancelled pending reveal does not measure");
+  expect(!joystick.classList.contains("joystick-revealed"), "hide before settle prevents reveal");
+  flushTimers();
+  expect(joystick.hidden === true, "hide commits display:none");
 
-  let previousSeq = 0;
-  for (const post of posts) {
-    expect(post.payload.client_id === teleopState.clientId, "every teleop post carries the tab client_id");
-    expect(Number.isInteger(post.payload.seq) && post.payload.seq > previousSeq, "teleop seq strictly increases");
-    previousSeq = post.payload.seq;
-  }
+  // Rapid switch: a stale reveal frame must not resurrect a hidden joystick.
+  const showing = setMappingJoystickVisible(true);
+  await setMappingJoystickVisible(false);
+  expect(joystick.classList.contains("joystick-concealed"), "hide conceals immediately");
+  expect(joystick.inert === true, "hide blocks input immediately");
+  expect(joystick.hidden === false, "hide keeps the element mounted during the fade");
+  expect(timers.size === 1, "hide arms exactly one hidden timeout");
+  expect(cancelledFrames.length === 1, "hide captures the cancelled reveal frame");
+  // A browser may still execute a frame callback that was cancelled after it
+  // was queued; invoking the captured callback directly proves the token guard
+  // (not the cancellation) rejects the stale reveal.
+  const staleReveal = cancelledFrames.pop();
+  staleReveal();
+  expect(
+    !joystick.classList.contains("joystick-revealed"),
+    "a captured stale reveal callback is ignored by the token guard",
+  );
+  flushFrames();
+  expect(!joystick.classList.contains("joystick-revealed"), "a stale reveal frame is ignored");
+  flushTimers();
+  expect(joystick.hidden === true, "the hide timeout commits display:none");
+  await showing;
 
-  // A failed nonzero send clears the loop but keeps the stop obligation.
-  teleopState.stopRequired = false;
-  teleopState.pointerId = null;
-  teleopState.active = false;
-  fakeNow = 1200;
-  failNextRequest = true;
-  await joystickPointerDown(makeEvent(8, 20, 20));
-  expect(intervalHandlers.size === 0, "failed active send clears the interval");
-  expect(elements.joystickKnob.style.transform === "translate(0px, 0px)", "failed active send centers the knob");
-  expect(teleopState.pointerId === null, "failed active send releases the pointer");
-  expect(teleopState.stopRequired === true, "failed active send leaves stopRequired true");
+  // Repeated immediate show cancels the older frame and still reveals.
+  await setMappingJoystickVisible(true);
+  await setMappingJoystickVisible(true);
+  expect(frames.size === 1, "the newer show cancels the older reveal frame");
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "the newest show still reveals");
 
-  const beforeFailureRelease = posts.length;
-  fakeNow = 1300;
-  await joystickPointerUp(makeEvent(8, 20, 20));
-  expect(posts.length === beforeFailureRelease + 1, "release after failure still sends a stop");
-  expect(posts[posts.length - 1].payload.throttle === 0, "release after failure sends zero");
-  expect(teleopState.stopRequired === false, "successful zero clears stopRequired");
+  // Hide stops teleop exactly once.
+  teleop.active = true;
+  const stopBefore = stopCalls;
+  await setMappingJoystickVisible(false);
+  expect(stopCalls === stopBefore + 1, "hide requests exactly one teleop stop");
+  expect(joystick.hidden === false, "hide waits for the fade before display:none");
+  flushTimers();
+  expect(joystick.hidden === true, "hide commits display:none after the fade");
+  teleop.active = false;
 
-  // stopRequired survives a failed zero and is only cleared by a successful zero.
-  teleopState.stopRequired = true;
-  failNextRequest = true;
-  fakeNow = 1400;
-  await stopTeleop("failed-zero");
-  expect(teleopState.stopRequired === true, "failed zero request keeps stopRequired true");
+  // Reduced motion snaps both directions without frames or timers.
+  reduceMotion = true;
+  joystick.hidden = true;
+  await setMappingJoystickVisible(true);
+  expect(joystick.classList.contains("joystick-revealed"), "reduced motion reveals synchronously");
+  expect(frames.size === 0, "reduced motion schedules no reveal frame");
+  await setMappingJoystickVisible(false);
+  expect(joystick.hidden === true, "reduced motion hides synchronously");
+  expect(timers.size === 0, "reduced motion arms no hide timeout");
 
-  const beforeSuccessfulZero = posts.length;
-  fakeNow = 1500;
-  await stopTeleop("retry-zero");
-  expect(teleopState.stopRequired === false, "successful zero clears stopRequired");
-  expect(posts.length === beforeSuccessfulZero + 1, "retry zero is sent");
-  const afterClearedZero = posts.length;
-  fakeNow = 1550;
-  await stopTeleop("already-stopped");
-  expect(posts.length === afterClearedZero, "no continuous zero loop once stopRequired is clear");
-
-  // Deferred/out-of-order: the stop must carry a higher seq than the slow active.
-  teleopState.stopRequired = false;
-  teleopState.pointerId = null;
-  teleopState.active = false;
-  teleopState.throttle = 0;
-  teleopState.steering = 0;
-  deferRequests = true;
-  fakeNow = 1600;
-  const downPromise = joystickPointerDown(makeEvent(10, 20, 20));
-  const activePost = posts[posts.length - 1];
-  expect(teleopState.stopRequired === true, "nonzero request sets stopRequired before it resolves");
-  fakeNow = 1700;
-  const upPromise = joystickPointerUp(makeEvent(10, 20, 20));
-  const stopPost = posts[posts.length - 1];
-  expect(stopPost.payload.throttle === 0 && stopPost.payload.steering === 0, "deferred stop is zero");
-  expect(stopPost.payload.client_id === activePost.payload.client_id, "deferred stop shares client_id");
-  expect(stopPost.payload.seq > activePost.payload.seq, "deferred stop seq is higher");
-  const stopEntry = deferred.find((entry) => entry.payload === stopPost.payload);
-  const activeEntry = deferred.find((entry) => entry.payload === activePost.payload);
-  expect(stopEntry && activeEntry, "both deferred requests are pending");
-  stopEntry.resolve({ ok: true, teleop: { active: false } });
-  await upPromise;
-  expect(teleopState.stopRequired === false, "out-of-order stop success clears stopRequired");
-  activeEntry.resolve({ ok: true, stale: true });
-  await downPromise;
-  expect(teleopState.stopRequired === false, "stale active response does not re-arm stopRequired");
-  deferRequests = false;
-
-  console.log("mapping joystick ok");
+  console.log("joystick visibility ok");
 })().catch((error) => { console.error(error); process.exit(1); });
 """
 
 
-def test_mapping_joystick_pointer_lifecycle_and_throttling_execute_under_node():
-    if shutil.which("node") is None:
-        pytest.skip("node is not installed")
-    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
-    completed = subprocess.run(
-        ["node", "-e", _MAPPING_JOYSTICK_NODE_HARNESS],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={**os.environ, "APP_JS": str(app_js)},
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "mapping joystick ok" in completed.stdout
+def test_joystick_visibility_lifecycle_executes_under_node():
+    completed = _run_app_node_harness(_JOYSTICK_VISIBILITY_NODE_HARNESS)
+    assert "joystick visibility ok" in completed.stdout
+
+
+_SET_TAB_REENTRANT_GRID_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+
+function sliceBlock(startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error("missing block " + startMarker);
+  return source.slice(start, end);
+}
+function sliceFunction(signature) {
+  const start = source.indexOf(signature);
+  if (start < 0) throw new Error("missing " + signature);
+  let index = source.indexOf("{", start);
+  let depth = 0;
+  for (; index < source.length; index += 1) {
+    const ch = source[index];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  throw new Error("unterminated " + signature);
+}
+
+const sidebarBlock = sliceBlock("// --- Sidebar collapse", "// --- End sidebar collapse");
+const transitionBlock = sliceBlock(
+  "// --- Page transition state machine",
+  "// --- End page transition state machine",
+);
+const joystickBlock = sliceBlock("// --- Mapping joystick", "// --- End mapping joystick");
+const setTabSource = sliceFunction("function setTab(tab)");
+// The real live-resize gate reads pageTransition, so pulling it into this
+// integration harness proves the state set by setTab actually enables resize.
+const syncViewportSource = sliceFunction("function syncMapViewportDuringGridTransition()");
+
+function makeClassList() {
+  const classes = new Set();
+  return {
+    add(name) { classes.add(name); },
+    remove(name) { classes.delete(name); },
+    contains(name) { return classes.has(name); },
+    toggle(name, on) {
+      if (on === undefined) {
+        if (classes.has(name)) classes.delete(name);
+        else classes.add(name);
+      } else if (on) {
+        classes.add(name);
+      } else {
+        classes.delete(name);
+      }
+    },
+  };
+}
+function makeElement(id, dataset) {
+  return {
+    id,
+    hidden: false,
+    inert: false,
+    attributes: {},
+    dataset: dataset || {},
+    classList: makeClassList(),
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
+    contains() { return false; },
+    focus() { global.document.activeElement = this; },
+  };
+}
+
+const elements = {};
+function register(id, classes) {
+  const element = makeElement(id);
+  (classes || []).forEach((name) => element.classList.add(name));
+  elements[id] = element;
+  return element;
+}
+const panels = [
+  makeElement("panel-navigation", { panel: "navigation" }),
+  makeElement("panel-mapping", { panel: "mapping" }),
+  makeElement("panel-system", { panel: "" }),
+];
+panels[0].classList.add("active");
+
+const view3d = register("view3d", ["active"]);
+const viewSystem = register("viewSystem");
+const viewTabs = register("viewTabs");
+viewTabs.dataset.active = "3d";
+register("tab3dMap", ["active"]);
+register("tabMapping");
+register("tabSystem");
+const appEl = register("app");
+register("controlPanel");
+register("sidebarToggle");
+const joystick = register("mappingJoystick");
+joystick.hidden = true;
+const stage = register("stage");
+
+global.document = {
+  body: makeElement("body"),
+  activeElement: null,
+  getElementById(id) { return elements[id] || null; },
+  querySelector(selector) {
+    if (selector === ".app") return appEl;
+    if (selector === ".stage") return stage;
+    if (selector === ".panel-view.active") {
+      return panels.find((panel) => panel.classList.contains("active")) || null;
+    }
+    return null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-panel]") return panels;
+    return [];
+  },
+};
+
+let layoutCalls = 0;
+let liveResizeCalls = 0;
+global.state = { view: "3d" };
+global.mapViewActive = () => global.state.view === "3d" || global.state.view === "mapping";
+global.layerGroup = { visible: false };
+global.pathGroup = { visible: false };
+global.markerGroup = { visible: false };
+global.vehicleGroup = { visible: false };
+global.mappingLayerGroup = { visible: false };
+global.mappingPathGroup = { visible: false };
+global.mappingVehicleGroup = { visible: false };
+global.viewerSessionId = () => "tab-session";
+global.stopTeleop = async () => {};
+global.glassMotionReduced = () => false;
+global.applyJoystickLayout = () => { layoutCalls += 1; };
+global.resizeAll = () => { liveResizeCalls += 1; };
+global.updateHudPlacement = () => {};
+global.renderer = { render() {} };
+global.scene = {};
+global.camera = {};
+global.exitJoystickLayout = () => {};
+global.markGlassDrop = () => {};
+global.ensureMapRenderLoop = () => {};
+global.pauseMapRenderLoop = () => {};
+global.pollMaps3d = () => {};
+global.pollMappingState = () => {};
+global.pollMapping3d = () => {};
+global.pollMappingPath = () => {};
+global.pollSystem = () => {};
+global.refreshController = { tick() {} };
+global.focusIfInside = () => {};
+
+const timers = new Map();
+const frames = new Map();
+let nextTimer = 1;
+let nextFrame = 1;
+global.setTimeout = (fn) => { const id = nextTimer++; timers.set(id, fn); return id; };
+global.clearTimeout = (id) => { timers.delete(id); };
+global.requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+global.cancelAnimationFrame = (id) => { frames.delete(id); };
+
+const api = new Function([
+  sidebarBlock,
+  transitionBlock,
+  joystickBlock,
+  // setTab repositions the segmented capsule through this module-level handle;
+  // the harness declares it null so the existing switch path still runs.
+  "let viewTabsControl = null;",
+  setTabSource,
+  syncViewportSource,
+  `
+stopTeleop = global.stopTeleop;
+return {
+  setTab,
+  pageTransition,
+  settleLayoutTransition,
+  mappingJoystickVisibility,
+  flushPendingMappingJoystickReveal,
+  syncMapViewportDuringGridTransition,
+};`,
+].join("\n"))();
+const {
+  setTab, pageTransition, settleLayoutTransition,
+  mappingJoystickVisibility, flushPendingMappingJoystickReveal,
+  syncMapViewportDuringGridTransition,
+} = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function flushFrames() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((fn) => fn());
+}
+function flushTimers() {
+  const pending = Array.from(timers.values());
+  timers.clear();
+  pending.forEach((fn) => fn());
+}
+
+(async () => {
+  // Normal 3d -> Mapping stays immediate: a pure view/panel transition is
+  // active, but it does not expect the grid, so the reveal is not deferred.
+  layoutCalls = 0;
+  frames.clear();
+  setTab("mapping");
+  expect(pageTransition.active === true, "3d->Mapping arms a layout transition");
+  expect(pageTransition.expectsGrid === false, "3d->Mapping does not expect the grid");
+  expect(
+    mappingJoystickVisibility.pendingReveal === false,
+    "3d->Mapping does not defer the reveal",
+  );
+  expect(layoutCalls === 1, "3d->Mapping measures the joystick immediately");
+  expect(frames.size === 1, "3d->Mapping schedules the reveal frame immediately");
+  expect(joystick.classList.contains("joystick-concealed"), "immediate show starts concealed");
+  expect(joystick.inert === true, "immediate show starts inert");
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "3d->Mapping reveals on its frame");
+
+  // Return to a stable System state before exercising the grid case.
+  setTab("system");
+  flushTimers();
+  frames.clear();
+  layoutCalls = 0;
+
+  // System -> Mapping: the sidebar grid starts sliding, so the reveal defers.
+  setTab("mapping");
+  expect(pageTransition.active === true, "System->Mapping arms the grid transition");
+  expect(pageTransition.expectsGrid === true, "System->Mapping expects the grid");
+  expect(mappingJoystickVisibility.pendingReveal === true, "System->Mapping defers the reveal");
+  expect(joystick.classList.contains("joystick-concealed"), "deferred show stays concealed");
+  expect(joystick.inert === true, "deferred show stays inert");
+  expect(layoutCalls === 0, "deferred show does not measure mid-slide");
+  expect(frames.size === 0, "deferred show schedules no reveal frame");
+
+  // Re-entrant Mapping click while the grid is still in flight: the sidebar no
+  // longer changes, so sidebarChanged is false, but the active transition still
+  // expects the grid. The reveal must stay pending rather than clearing it and
+  // measuring/revealing mid-slide.
+  const inFlightToken = pageTransition.token;
+  setTab("mapping");
+  expect(pageTransition.token === inFlightToken, "the re-entrant click arms no new transition");
+  expect(
+    pageTransition.active === true && pageTransition.expectsGrid === true,
+    "the grid transition is still in flight",
+  );
+  expect(
+    mappingJoystickVisibility.pendingReveal === true,
+    "the re-entrant click keeps the reveal pending",
+  );
+  expect(joystick.classList.contains("joystick-concealed"), "the re-entrant click stays concealed");
+  expect(
+    !joystick.classList.contains("joystick-revealed"),
+    "the re-entrant click never reveals mid-slide",
+  );
+  expect(joystick.inert === true, "the re-entrant click stays inert");
+  expect(layoutCalls === 0, "the re-entrant click does not measure mid-slide");
+  expect(frames.size === 0, "the re-entrant click schedules no reveal frame");
+
+  // Settling the grid repositions once and only then schedules the reveal.
+  settleLayoutTransition(pageTransition.token);
+  expect(pageTransition.active === false, "the grid transition settles");
+  expect(layoutCalls === 1, "the settled flush measures exactly once");
+  expect(
+    mappingJoystickVisibility.pendingReveal === false,
+    "the settled flush consumes the pending reveal",
+  );
+  expect(frames.size === 1, "the settled flush schedules exactly one reveal frame");
+  expect(!joystick.classList.contains("joystick-revealed"), "the reveal still waits for its frame");
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "the deferred reveal completes after settle");
+
+  // System -> Mapping -> 3d: the System->Mapping begin expects the grid, then a
+  // pure Mapping->3d begin arrives while the grid slide is still physically
+  // running. The pure begin must NOT clear expectsGrid, so live resize stays
+  // eligible and a later Mapping reveal still defers until the grid settles.
+  setTab("system");
+  flushTimers();
+  setTab("mapping");
+  expect(pageTransition.active === true, "System->Mapping arms the sticky grid run");
+  expect(pageTransition.expectsGrid === true, "System->Mapping expects the grid");
+  setTab("3d");
+  expect(pageTransition.active === true, "the pure begin keeps the run active");
+  expect(
+    pageTransition.expectsGrid === true,
+    "the pure begin during the grid slide preserves expectsGrid",
+  );
+  liveResizeCalls = 0;
+  syncMapViewportDuringGridTransition();
+  expect(
+    liveResizeCalls === 1,
+    "live resize stays eligible while the sticky grid run is in flight",
+  );
+
+  // A later Mapping click in the same in-flight run must still defer its reveal.
+  frames.clear();
+  layoutCalls = 0;
+  setTab("mapping");
+  expect(
+    mappingJoystickVisibility.pendingReveal === true,
+    "the later Mapping reveal defers until the sticky grid run settles",
+  );
+  expect(joystick.classList.contains("joystick-concealed"), "the later reveal stays concealed");
+  expect(layoutCalls === 0, "the later reveal does not measure mid-slide");
+  expect(frames.size === 0, "the later reveal schedules no frame before settle");
+
+  // The grid settles, and only then does the deferred reveal complete.
+  settleLayoutTransition(pageTransition.token);
+  expect(pageTransition.active === false, "the sticky grid run settles");
+  expect(pageTransition.expectsGrid === false, "settling clears the sticky expectation");
+  expect(layoutCalls === 1, "the settle measures the deferred reveal once");
+  expect(
+    mappingJoystickVisibility.pendingReveal === false,
+    "the settle consumes the pending reveal",
+  );
+  flushFrames();
+  expect(joystick.classList.contains("joystick-revealed"), "the later reveal completes after settle");
+
+  // A hide while the deferred reveal is pending must cancel it.
+  setTab("3d");
+  flushTimers();
+  setTab("system");
+  flushTimers();
+  frames.clear();
+  layoutCalls = 0;
+  setTab("mapping");
+  expect(mappingJoystickVisibility.pendingReveal === true, "entering Mapping defers the reveal again");
+  setTab("3d");
+  expect(
+    mappingJoystickVisibility.pendingReveal === false,
+    "hide during the wait clears the pending reveal",
+  );
+  expect(joystick.classList.contains("joystick-concealed"), "hide during the wait stays concealed");
+  expect(!joystick.classList.contains("joystick-revealed"), "hide during the wait prevents reveal");
+  flushPendingMappingJoystickReveal();
+  expect(frames.size === 0, "a cancelled pending reveal schedules no frame");
+  expect(layoutCalls === 0, "a cancelled pending reveal does not measure");
+
+  console.log("set tab reentrant grid ok");
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+
+
+def test_set_tab_reentrant_grid_defers_joystick_reveal_under_node():
+    completed = _run_app_node_harness(_SET_TAB_REENTRANT_GRID_NODE_HARNESS)
+    assert "set tab reentrant grid ok" in completed.stdout
 
 
 def test_mapping_joystick_exposes_adjustable_layout_controls():
     index_html, app_js, styles_css = _frontend_sources()
 
-    assert 'id="joystickMoveHandle"' in index_html
-    assert 'id="joystickResizeHandle"' in index_html
+    assert 'id="throttleMoveHandle"' in index_html
+    assert 'id="steeringMoveHandle"' in index_html
+    assert 'id="throttleResizeHandle"' in index_html
+    assert 'id="steeringResizeHandle"' in index_html
     assert 'id="joystickSettings"' in index_html
     assert 'id="joystickDone"' in index_html
     assert 'id="joystickSettingsError"' in index_html
     assert 'aria-label="Joystick settings"' in index_html
 
-    assert "--joystick-size" in styles_css
+    assert "--stick-size" in styles_css
     assert ".joystick.layout-mode" in styles_css
-    assert ".stage.hud-lower-right .hud" in styles_css
+    assert ".stage.hud-center .hud" in styles_css
     assert "function applyJoystickLayout()" in app_js
+    assert "joystick.hidden" in app_js
+    assert "if (!viewportWidth || !viewportHeight) {" in app_js
+    assert "const mappingJoystickVisibility = {" in app_js
+    assert "function scheduleMappingJoystickReveal(" in app_js
+    assert "function flushPendingMappingJoystickReveal(" in app_js
     assert "function clampedJoystickSize(value)" in app_js
     assert "function updateHudPlacement()" in app_js
     assert "function enterJoystickLayout()" in app_js
@@ -6809,268 +9378,6 @@ def test_mapping_joystick_exposes_adjustable_layout_controls():
     assert 'getJson("/api/ui/preferences")' in app_js
     assert 'postJson("/api/ui/preferences"' in app_js
     assert "teleop.layoutMode" in app_js
-
-
-_JOYSTICK_LAYOUT_NODE_HARNESS = r"""
-const fs = require("fs");
-const source = fs.readFileSync(process.env.APP_JS, "utf8");
-const startA = source.indexOf("// --- Mapping joystick");
-const endA = source.indexOf("// --- End mapping joystick");
-const startB = source.indexOf("// --- Joystick layout");
-const endB = source.indexOf("// --- End joystick layout");
-if (startA < 0 || endA < 0 || startB < 0 || endB < 0) {
-  throw new Error("joystick layout block not found");
-}
-const block = source.slice(startA, endA) + "\n" + source.slice(startB, endB);
-
-function makeElement(id) {
-  const classes = new Set();
-  return {
-    id,
-    hidden: false,
-    textContent: "",
-    offsetWidth: 0,
-    offsetHeight: 0,
-    captured: [],
-    attributes: {},
-    style: {
-      left: "0px",
-      top: "0px",
-      values: {},
-      setProperty(name, value) { this.values[name] = value; },
-    },
-    classList: {
-      toggle(name, on) {
-        if (on === undefined) {
-          if (classes.has(name)) classes.delete(name);
-          else classes.add(name);
-        } else if (on) {
-          classes.add(name);
-        } else {
-          classes.delete(name);
-        }
-      },
-      add(name) { classes.add(name); },
-      remove(name) { classes.delete(name); },
-      contains(name) { return classes.has(name); },
-    },
-    setAttribute(name, value) { this.attributes[name] = value; },
-    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
-    setPointerCapture(pointerId) { this.captured.push(pointerId); },
-    addEventListener() {},
-    getBoundingClientRect() {
-      const left = Number.parseFloat(this.style.left) || 0;
-      const top = Number.parseFloat(this.style.top) || 0;
-      const width = this.offsetWidth || 0;
-      const height = this.offsetHeight || 0;
-      return { left, top, right: left + width, bottom: top + height, width, height };
-    },
-  };
-}
-
-const elements = {
-  view3d: makeElement("view3d"),
-  mappingJoystick: makeElement("mappingJoystick"),
-  joystickBase: makeElement("joystickBase"),
-  joystickKnob: makeElement("joystickKnob"),
-  joystickStatus: makeElement("joystickStatus"),
-  joystickMoveHandle: makeElement("joystickMoveHandle"),
-  joystickResizeHandle: makeElement("joystickResizeHandle"),
-  joystickSettings: makeElement("joystickSettings"),
-  joystickDone: makeElement("joystickDone"),
-  joystickSettingsError: makeElement("joystickSettingsError"),
-  hud: makeElement("hud"),
-};
-elements.view3d.clientWidth = 400;
-elements.view3d.clientHeight = 300;
-elements.view3d.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
-elements.mappingJoystick.offsetWidth = 100;
-elements.mappingJoystick.offsetHeight = 140;
-elements.joystickBase.offsetWidth = 100;
-elements.joystickBase.offsetHeight = 100;
-elements.hud.offsetWidth = 60;
-elements.hud.offsetHeight = 20;
-
-const stage = makeElement("stage");
-stage.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
-
-global.state = { view: "mapping" };
-global.document = {
-  hidden: false,
-  getElementById(id) { return elements[id] || null; },
-  querySelector(selector) { return selector === ".stage" ? stage : null; },
-  addEventListener() {},
-};
-global.window = {
-  addEventListener() {},
-  setInterval() { return 1; },
-  clearInterval() {},
-};
-global.viewerSessionId = () => "tab-session";
-
-const teleopPosts = [];
-const uiPosts = [];
-let failUiSave = false;
-global.postJson = async (url, payload) => {
-  if (url === "/api/ui/preferences") {
-    if (failUiSave) throw new Error("network down");
-    uiPosts.push(payload);
-    return { ok: true, joystick: payload };
-  }
-  teleopPosts.push({ url, payload });
-  const active = payload.throttle !== 0 || payload.steering !== 0;
-  return { ok: true, teleop: { active } };
-};
-global.getJson = async () => ({
-  ok: true,
-  joystick: { size: 220, x_ratio: 0.25, y_ratio: 0.5 },
-});
-global.fetchWithTimeout = async () => ({ ok: true });
-
-// Run the two blocks in an isolated function scope so their declarations do
-// not leak into this harness and clash with the names destructured below.
-const joystickApi = new Function(block + `
-return {
-  teleop, joystickLayout, refreshJoystickPreferences, joystickPointerDown,
-  enterJoystickLayout, exitJoystickLayout, beginJoystickMove, moveJoystickGesture,
-  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
-  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
-};`)();
-const {
-  teleop, joystickLayout, refreshJoystickPreferences, joystickPointerDown,
-  enterJoystickLayout, exitJoystickLayout, beginJoystickMove, moveJoystickGesture,
-  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
-  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
-} = joystickApi;
-
-function expect(condition, message) { if (!condition) throw new Error(message); }
-
-function makeEvent(pointerId, clientX, clientY, currentTarget) {
-  return {
-    pointerId,
-    pointerType: "mouse",
-    clientX,
-    clientY,
-    currentTarget: currentTarget || elements.joystickBase,
-    preventDefault() {},
-    stopPropagation() {},
-  };
-}
-
-(async () => {
-  await refreshJoystickPreferences();
-  expect(joystickLayout.size === 220, "preferences size applied");
-  expect(joystickLayout.xRatio === 0.25, "preferences x ratio applied");
-  expect(joystickLayout.yRatio === 0.5, "preferences y ratio applied");
-  expect(
-    elements.mappingJoystick.style.values["--joystick-size"] === "220px",
-    "size css variable applied",
-  );
-
-  await joystickPointerDown(makeEvent(1, 30, 30));
-  expect(teleop.active === true, "drive gesture active before layout mode");
-  const teleopBeforeLayout = teleopPosts.length;
-
-  await enterJoystickLayout();
-  expect(teleop.layoutMode === true, "layout mode disables drive");
-  expect(joystickLayout.mode === true, "layout mode state set");
-  expect(elements.mappingJoystick.classList.contains("layout-mode"), "layout class applied");
-  expect(teleopPosts.length === teleopBeforeLayout + 1, "entering layout posts one stop");
-  expect(teleopPosts[teleopPosts.length - 1].payload.throttle === 0, "layout stop is zero throttle");
-  expect(teleopPosts[teleopPosts.length - 1].payload.steering === 0, "layout stop is zero steering");
-
-  const teleopAfterLayout = teleopPosts.length;
-  await joystickPointerDown(makeEvent(2, 30, 30));
-  expect(teleopPosts.length === teleopAfterLayout, "drive gesture disabled in layout mode");
-  expect(teleop.pointerId === null, "disabled gesture does not capture the pointer");
-
-  const uiBeforeResize = uiPosts.length;
-  beginJoystickResize(makeEvent(3, 0, 0, elements.joystickResizeHandle));
-  resizeJoystickGesture(makeEvent(3, 500, 500, elements.joystickResizeHandle));
-  expect(joystickLayout.size === 260, "resize clamps to max");
-  resizeJoystickGesture(makeEvent(3, -500, -500, elements.joystickResizeHandle));
-  expect(joystickLayout.size === 140, "resize clamps to min");
-  expect(uiPosts.length === uiBeforeResize, "resize preview does not write");
-  await finishJoystickGesture(makeEvent(3, -500, -500, elements.joystickResizeHandle));
-  expect(uiPosts.length === uiBeforeResize + 1, "resize release writes once");
-  expect(uiPosts[uiPosts.length - 1].size === 140, "resize write carries the clamped size");
-
-  const uiBeforeMove = uiPosts.length;
-  beginJoystickMove(makeEvent(4, 0, 0, elements.joystickMoveHandle));
-  moveJoystickGesture(makeEvent(4, -9999, -9999, elements.joystickMoveHandle));
-  expect(
-    Number.parseFloat(elements.mappingJoystick.style.left) === JOYSTICK_VIEWPORT_MARGIN,
-    "move clamps the left edge",
-  );
-  expect(
-    Number.parseFloat(elements.mappingJoystick.style.top) === JOYSTICK_VIEWPORT_MARGIN,
-    "move clamps the top edge",
-  );
-  moveJoystickGesture(makeEvent(4, 9999, 9999, elements.joystickMoveHandle));
-  expect(
-    Number.parseFloat(elements.mappingJoystick.style.left) <= 400 - 100 - JOYSTICK_VIEWPORT_MARGIN,
-    "move clamps the right edge",
-  );
-  expect(
-    Number.parseFloat(elements.mappingJoystick.style.top) <= 300 - 140 - JOYSTICK_VIEWPORT_MARGIN,
-    "move clamps the bottom edge",
-  );
-  expect(uiPosts.length === uiBeforeMove, "move preview does not write");
-  await finishJoystickGesture(makeEvent(4, 9999, 9999, elements.joystickMoveHandle));
-  expect(uiPosts.length === uiBeforeMove + 1, "move release writes once");
-  const savedPosition = uiPosts[uiPosts.length - 1];
-  expect(savedPosition.x_ratio >= 0 && savedPosition.x_ratio <= 1, "move x ratio in range");
-  expect(savedPosition.y_ratio >= 0 && savedPosition.y_ratio <= 1, "move y ratio in range");
-
-  joystickLayout.xRatio = 0;
-  joystickLayout.yRatio = 1;
-  applyJoystickLayout();
-  expect(stage.classList.contains("hud-lower-right"), "HUD avoids the lower-left joystick");
-  joystickLayout.xRatio = 1;
-  joystickLayout.yRatio = 1;
-  applyJoystickLayout();
-  expect(!stage.classList.contains("hud-lower-right"), "HUD returns to the lower-left");
-
-  failUiSave = true;
-  beginJoystickResize(makeEvent(5, 0, 0, elements.joystickResizeHandle));
-  resizeJoystickGesture(makeEvent(5, 20, 20, elements.joystickResizeHandle));
-  await finishJoystickGesture(makeEvent(5, 20, 20, elements.joystickResizeHandle));
-  expect(joystickLayout.mode === true, "failed save keeps layout mode");
-  expect(
-    typeof joystickLayout.saveError === "string" && joystickLayout.saveError.length > 0,
-    "failed save records an error",
-  );
-  expect(elements.joystickSettingsError.hidden === false, "failed save shows the error");
-  failUiSave = false;
-  beginJoystickResize(makeEvent(6, 0, 0, elements.joystickResizeHandle));
-  resizeJoystickGesture(makeEvent(6, 0, 0, elements.joystickResizeHandle));
-  await finishJoystickGesture(makeEvent(6, 0, 0, elements.joystickResizeHandle));
-  expect(joystickLayout.saveError === null, "retry clears the error");
-  expect(elements.joystickSettingsError.hidden === true, "retry hides the error");
-
-  exitJoystickLayout();
-  expect(teleop.layoutMode === false, "exit restores drive control");
-  expect(joystickLayout.mode === false, "exit clears layout mode");
-  expect(!elements.mappingJoystick.classList.contains("layout-mode"), "exit removes the layout class");
-
-  console.log("joystick layout ok");
-})().catch((error) => { console.error(error); process.exit(1); });
-"""
-
-
-def test_mapping_joystick_layout_mode_persists_and_clamps_under_node():
-    if shutil.which("node") is None:
-        pytest.skip("node is not installed")
-    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
-    completed = subprocess.run(
-        ["node", "-e", _JOYSTICK_LAYOUT_NODE_HARNESS],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env={**os.environ, "APP_JS": str(app_js)},
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "joystick layout ok" in completed.stdout
 
 
 def _run_app_node_harness(harness):
@@ -7088,289 +9395,6 @@ def _run_app_node_harness(harness):
     return completed
 
 
-_JOYSTICK_NODE_PREAMBLE = r"""
-const fs = require("fs");
-const source = fs.readFileSync(process.env.APP_JS, "utf8");
-const startA = source.indexOf("// --- Mapping joystick");
-const endA = source.indexOf("// --- End mapping joystick");
-const startB = source.indexOf("// --- Joystick layout");
-const endB = source.indexOf("// --- End joystick layout");
-if (startA < 0 || endA < 0 || startB < 0 || endB < 0) {
-  throw new Error("joystick layout block not found");
-}
-const block = source.slice(startA, endA) + "\n" + source.slice(startB, endB);
-
-function makeElement(id) {
-  const classes = new Set();
-  return {
-    id,
-    hidden: false,
-    textContent: "",
-    offsetWidth: 0,
-    offsetHeight: 0,
-    captured: [],
-    attributes: {},
-    style: {
-      left: "0px",
-      top: "0px",
-      values: {},
-      setProperty(name, value) { this.values[name] = value; },
-    },
-    classList: {
-      toggle(name, on) {
-        if (on === undefined) {
-          if (classes.has(name)) classes.delete(name);
-          else classes.add(name);
-        } else if (on) {
-          classes.add(name);
-        } else {
-          classes.delete(name);
-        }
-      },
-      add(name) { classes.add(name); },
-      remove(name) { classes.delete(name); },
-      contains(name) { return classes.has(name); },
-    },
-    setAttribute(name, value) { this.attributes[name] = value; },
-    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; },
-    setPointerCapture(pointerId) { this.captured.push(pointerId); },
-    addEventListener() {},
-    getBoundingClientRect() {
-      const left = Number.parseFloat(this.style.left) || 0;
-      const top = Number.parseFloat(this.style.top) || 0;
-      const width = this.offsetWidth || 0;
-      const height = this.offsetHeight || 0;
-      return { left, top, right: left + width, bottom: top + height, width, height };
-    },
-  };
-}
-
-const elements = {
-  view3d: makeElement("view3d"),
-  mappingJoystick: makeElement("mappingJoystick"),
-  joystickBase: makeElement("joystickBase"),
-  joystickKnob: makeElement("joystickKnob"),
-  joystickStatus: makeElement("joystickStatus"),
-  joystickMoveHandle: makeElement("joystickMoveHandle"),
-  joystickResizeHandle: makeElement("joystickResizeHandle"),
-  joystickSettings: makeElement("joystickSettings"),
-  joystickDone: makeElement("joystickDone"),
-  joystickSettingsError: makeElement("joystickSettingsError"),
-  hud: makeElement("hud"),
-};
-elements.view3d.clientWidth = 400;
-elements.view3d.clientHeight = 300;
-elements.view3d.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
-elements.mappingJoystick.offsetWidth = 100;
-elements.mappingJoystick.offsetHeight = 140;
-elements.joystickBase.offsetWidth = 100;
-elements.joystickBase.offsetHeight = 100;
-elements.hud.offsetWidth = 60;
-elements.hud.offsetHeight = 20;
-
-const stage = makeElement("stage");
-stage.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 300, width: 400, height: 300 });
-
-global.state = { view: "mapping" };
-global.document = {
-  hidden: false,
-  getElementById(id) { return elements[id] || null; },
-  querySelector(selector) { return selector === ".stage" ? stage : null; },
-  addEventListener() {},
-};
-global.window = {
-  addEventListener() {},
-  setInterval() { return 1; },
-  clearInterval() {},
-};
-global.viewerSessionId = () => "tab-session";
-
-const teleopPosts = [];
-const uiPosts = [];
-global.handleUiPost = async (payload) => ({ ok: true, joystick: payload });
-global.handleTeleopPost = async (url, payload) => {
-  teleopPosts.push({ url, payload });
-  return { ok: true, teleop: { active: payload.throttle !== 0 || payload.steering !== 0 } };
-};
-global.postJson = (url, payload) => {
-  if (url === "/api/ui/preferences") return global.handleUiPost(payload);
-  return global.handleTeleopPost(url, payload);
-};
-global.handleGetJson = async () => ({ ok: true, joystick: { size: 220, x_ratio: 0.25, y_ratio: 0.5 } });
-global.getJson = () => global.handleGetJson();
-global.fetchWithTimeout = async () => ({ ok: true });
-
-const joystickApi = new Function(block + `
-return {
-  teleop, joystickLayout, refreshJoystickPreferences, persistJoystickPreferences,
-  enterJoystickLayout, exitJoystickLayout, stopTeleop,
-  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
-  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
-};`)();
-const {
-  teleop, joystickLayout, refreshJoystickPreferences, persistJoystickPreferences,
-  enterJoystickLayout, exitJoystickLayout, stopTeleop,
-  beginJoystickResize, resizeJoystickGesture, finishJoystickGesture,
-  applyJoystickLayout, JOYSTICK_VIEWPORT_MARGIN,
-} = joystickApi;
-
-function expect(condition, message) { if (!condition) throw new Error(message); }
-
-function makeEvent(pointerId, clientX, clientY, currentTarget) {
-  return {
-    pointerId,
-    pointerType: "mouse",
-    clientX,
-    clientY,
-    currentTarget: currentTarget || elements.joystickBase,
-    preventDefault() {},
-    stopPropagation() {},
-  };
-}
-
-(async () => {
-"""
-
-
-def _joystick_node_harness(scenario: str) -> str:
-    return (
-        _JOYSTICK_NODE_PREAMBLE
-        + scenario
-        + "\n})().catch((error) => { console.error(error); process.exit(1); });\n"
-    )
-
-
-_JOYSTICK_ENTRY_RACE_SCENARIO = r"""
-teleop.active = true;
-teleop.pointerId = 7;
-let resolveStop = null;
-global.handleTeleopPost = async (url, payload) => {
-  teleopPosts.push({ url, payload });
-  return new Promise((resolve) => {
-    resolveStop = () => resolve({ ok: true, teleop: { active: false } });
-  });
-};
-const entering = enterJoystickLayout();
-expect(teleop.layoutMode === true, "entry sets the guard before awaiting the stop");
-expect(typeof resolveStop === "function", "entry awaits one stop request");
-const stopPost = teleopPosts[teleopPosts.length - 1].payload;
-expect(stopPost.client_id === teleop.clientId, "stop carries the teleop client id");
-expect(Number.isInteger(stopPost.seq) && stopPost.seq > 0, "stop carries a positive seq");
-exitJoystickLayout();
-expect(teleop.layoutMode === false, "exiting during the stop clears the guard");
-resolveStop();
-await entering;
-expect(joystickLayout.mode === false, "stale entry continuation does not restore layout mode");
-expect(
-  !elements.mappingJoystick.classList.contains("layout-mode"),
-  "stale entry continuation does not restore the layout class",
-);
-console.log("joystick entry race ok");
-"""
-
-
-def test_mapping_joystick_layout_entry_race_under_node():
-    completed = _run_app_node_harness(
-        _joystick_node_harness(_JOYSTICK_ENTRY_RACE_SCENARIO)
-    )
-    assert "joystick entry race ok" in completed.stdout
-
-
-_JOYSTICK_IDLE_ENTRY_SCENARIO = r"""
-expect(
-  teleop.active === false && teleop.pointerId === null && teleop.stopRequired === false,
-  "teleop starts idle",
-);
-await enterJoystickLayout();
-expect(teleopPosts.length === 1, "idle layout entry still requests exactly one stop");
-const stop = teleopPosts[0].payload;
-expect(stop.throttle === 0 && stop.steering === 0, "idle layout entry stop is a zero command");
-const postsAfterEntry = teleopPosts.length;
-await stopTeleop("blur");
-expect(teleopPosts.length === postsAfterEntry, "already-stopped ordinary stop stays silent");
-console.log("joystick idle entry ok");
-"""
-
-
-def test_mapping_joystick_idle_layout_entry_requests_zero_stop_under_node():
-    completed = _run_app_node_harness(
-        _joystick_node_harness(_JOYSTICK_IDLE_ENTRY_SCENARIO)
-    )
-    assert "joystick idle entry ok" in completed.stdout
-
-
-_JOYSTICK_OVERHANG_SCENARIO = r"""
-joystickLayout.mode = true;
-joystickLayout.size = 260;
-joystickLayout.xRatio = 1;
-joystickLayout.yRatio = 1;
-applyJoystickLayout();
-const left = Number.parseFloat(elements.mappingJoystick.style.left);
-const top = Number.parseFloat(elements.mappingJoystick.style.top);
-// The CSS resize handle is 0.16 of the base and overhangs its edge by 0.08.
-const overhang = 260 * 0.08;
-expect(
-  left + elements.mappingJoystick.offsetWidth + overhang <= elements.view3d.clientWidth,
-  "resize handle stays inside the right viewport edge",
-);
-expect(
-  top + elements.mappingJoystick.offsetHeight + overhang <= elements.view3d.clientHeight,
-  "resize handle stays inside the bottom viewport edge",
-);
-console.log("joystick resize overhang ok");
-"""
-
-
-def test_mapping_joystick_resize_handle_stays_inside_viewport_under_node():
-    completed = _run_app_node_harness(
-        _joystick_node_harness(_JOYSTICK_OVERHANG_SCENARIO)
-    )
-    assert "joystick resize overhang ok" in completed.stdout
-
-
-_JOYSTICK_REVISION_SCENARIO = r"""
-joystickLayout.mode = true;
-const pendingUi = [];
-global.handleUiPost = (payload) => new Promise((resolve) => {
-  pendingUi.push({ payload, resolve });
-});
-
-joystickLayout.size = 150;
-const firstSave = persistJoystickPreferences();
-joystickLayout.size = 200;
-const secondSave = persistJoystickPreferences();
-expect(pendingUi.length === 2, "two preference saves are in flight");
-pendingUi[1].resolve({ ok: true, joystick: { size: 200, x_ratio: 0.2, y_ratio: 0.5 } });
-await secondSave;
-expect(joystickLayout.size === 200, "newer save result applies");
-expect(joystickLayout.xRatio === 0.2, "newer save ratios apply");
-pendingUi[0].resolve({ ok: true, joystick: { size: 150, x_ratio: 0.1, y_ratio: 0.4 } });
-await firstSave;
-expect(joystickLayout.size === 200, "older save response cannot overwrite a newer save result");
-expect(joystickLayout.xRatio === 0.2, "older save response cannot overwrite newer save ratios");
-
-joystickLayout.size = 160;
-const gestureSave = persistJoystickPreferences();
-const gestureEntry = pendingUi[pendingUi.length - 1];
-beginJoystickResize(makeEvent(9, 0, 0, elements.joystickResizeHandle));
-resizeJoystickGesture(makeEvent(9, 30, 30, elements.joystickResizeHandle));
-const gestureSize = joystickLayout.size;
-expect(gestureSize !== 160, "gesture preview changed the size");
-gestureEntry.resolve({ ok: true, joystick: { size: 140, x_ratio: 0.9, y_ratio: 0.9 } });
-await gestureSave;
-expect(joystickLayout.size === gestureSize, "older save response cannot overwrite a newer in-progress gesture");
-expect(joystickLayout.xRatio === 0.2, "older save response cannot overwrite a newer gesture ratios");
-console.log("joystick preference revision ok");
-"""
-
-
-def test_mapping_joystick_ignores_stale_preference_responses_under_node():
-    completed = _run_app_node_harness(
-        _joystick_node_harness(_JOYSTICK_REVISION_SCENARIO)
-    )
-    assert "joystick preference revision ok" in completed.stdout
-
-
 def test_sidebar_toggle_is_single_accessible_button():
     index_html, app_js, styles_css = _frontend_sources()
 
@@ -7381,7 +9405,7 @@ def test_sidebar_toggle_is_single_accessible_button():
 
     assert "grid-template-columns: minmax(0, 1fr) var(--panel-width, 360px);" in styles_css
     assert ".app.sidebar-collapsed" in styles_css
-    assert "grid-template-columns var(--layout-transition-ms) var(--glass-drop-ease)" in styles_css
+    assert "grid-template-columns var(--layout-slide-ms) var(--layout-ease)" in styles_css
     assert ".app.sidebar-collapsed .panel" in styles_css
     assert ".app.system-mode .sidebar-toggle" in styles_css
     assert "var(--panel-width, 340px);" in styles_css
@@ -7628,3 +9652,589 @@ def test_sidebar_system_entry_focuses_visible_tab_under_node():
     )
     assert completed.returncode == 0, completed.stderr
     assert "sidebar focus target ok" in completed.stdout
+
+
+# --- Live latency and FPS indicators -----------------------------------------
+
+
+def _html_div_block(html, opening):
+    """Return one ``<div>...</div>`` block, matched by nesting depth."""
+    start = html.index(opening)
+    depth = 0
+    index = start
+    while index < len(html):
+        open_at = html.find("<div", index)
+        close_at = html.find("</div>", index)
+        if close_at == -1:
+            break
+        if open_at != -1 and open_at < close_at:
+            depth += 1
+            index = open_at + len("<div")
+        else:
+            depth -= 1
+            index = close_at + len("</div>")
+            if depth == 0:
+                return html[start:index]
+    raise AssertionError(f"unterminated div starting at {opening!r}")
+
+
+def test_sidebar_header_exposes_latency_and_fps_pills():
+    index_html, _app_js, _styles_css = _frontend_sources()
+
+    status_group = _html_div_block(index_html, '<div class="header-status">')
+
+    # Compact status pills live in the existing upper-right status group.
+    assert 'id="latencyStatus"' in status_group
+    assert 'id="latencyValue"' in status_group
+    assert 'id="fpsStatus"' in status_group
+    assert 'id="fpsValue"' in status_group
+    assert 'id="viewerCount"' in status_group
+    assert 'id="serverState"' in status_group
+    assert 'id="performanceStatus"' in status_group
+    assert status_group.count('class="pill performance') == 1
+    assert 'class="performance-separator"' in status_group
+
+    # Unambiguous visible labels and a neutral placeholder.
+    assert '<span class="performance-name">Latency</span>' not in status_group
+    assert '<span class="performance-name">FPS</span>' in status_group
+    assert '<span id="latencyValue" class="performance-value">--</span>' in status_group
+    assert '<span id="fpsValue" class="performance-value">--</span>' in status_group
+
+    # Accessible, non-chatty live regions with descriptive titles.
+    assert 'role="status"' in status_group
+    assert 'aria-live="off"' in status_group
+    assert 'title="Browser-to-backend HTTP round-trip time"' in status_group
+    assert 'title="WebGL map render frames per second"' in status_group
+
+
+def test_frontend_measures_latency_from_existing_state_polls():
+    _index_html, app_js, _styles_css = _frontend_sources()
+
+    assert "function createLatencyMeter(options)" in app_js
+    assert "async function timedGetJson(url)" in app_js
+    assert "latencyMeter.record(startedAt, response.ok)" in app_js
+    assert "latencyMeter.record(startedAt, false)" in app_js
+    assert "const LATENCY_DISPLAY_INTERVAL_MS = 2000;" in app_js
+    assert "displayIntervalMs: LATENCY_DISPLAY_INTERVAL_MS" in app_js
+
+    # Reuse existing frequent lightweight polls instead of adding an endpoint.
+    assert 'timedGetJson("/api/pose")' in app_js
+    assert 'timedGetJson("/api/state")' in app_js
+    assert 'timedGetJson("/api/logs"' not in app_js
+    assert '"/api/latency"' not in app_js
+    assert '"/api/ping"' not in app_js
+
+    # Monotonic timing for the round trip.
+    assert "performance.now()" in app_js
+
+    poll_pose = _js_function_body(app_js, "async function pollPose()")
+    assert 'timedGetJson("/api/pose")' in poll_pose
+    poll_state = _js_function_body(app_js, "async function pollState()")
+    assert 'timedGetJson("/api/state")' in poll_state
+
+
+def test_frontend_fps_uses_webgl_render_loop_only():
+    _index_html, app_js, _styles_css = _frontend_sources()
+
+    assert "function createFpsMeter(options)" in app_js
+
+    render_body = _js_function_body(app_js, "function render()")
+    assert "fpsMeter.markFrame();" in render_body
+    assert "requestAnimationFrame(render)" in render_body
+
+    ensure_body = _js_function_body(app_js, "function ensureMapRenderLoop()")
+    assert "fpsMeter.setActive(true);" in ensure_body
+    pause_body = _js_function_body(app_js, "function pauseMapRenderLoop()")
+    assert "fpsMeter.setActive(false);" in pause_body
+
+    # The low-frequency refresh only repaints stale state; it never counts as a frame.
+    assert "setInterval(refreshPerformanceIndicators, 500)" in app_js
+    refresh_body = _js_function_body(app_js, "function refreshPerformanceIndicators()")
+    assert "markFrame" not in refresh_body
+
+
+_PERFORMANCE_METER_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("// --- Live performance meters");
+const end = source.indexOf("// --- End live performance meters");
+if (start < 0 || end < 0) throw new Error("performance meter block not found");
+const block = source.slice(start, end);
+
+const api = new Function(
+  block + "\nreturn { createLatencyMeter, createFpsMeter };",
+)();
+const { createLatencyMeter, createFpsMeter } = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+// --- Latency: EMA over measured round trips, with failure and staleness ---
+let clock = 1000;
+const latencyNow = () => clock;
+const latencyEvents = [];
+const latency = createLatencyMeter({
+  now: latencyNow,
+  staleMs: 3000,
+  smoothing: 0.25,
+  onChange: (text, available) => latencyEvents.push([text, available]),
+});
+
+expect(latency.text() === "--", "latency is unavailable before any sample");
+expect(latency.available() === false, "latency is unavailable before any sample");
+
+latency.record(960, true); // 40 ms
+expect(latency.text() === "40 ms", "the first latency sample is shown");
+expect(latency.available() === true, "a fresh latency sample is available");
+expect(latencyEvents.length === 1, "the first latency sample is published immediately");
+
+clock = 1100;
+latency.record(1060, true); // another 40 ms keeps the average
+expect(latency.text() === "40 ms", "steady samples keep the smoothed value");
+
+clock = 1200;
+latency.record(1140, true); // 60 -> 40 + 0.25 * 20 = 45
+expect(latency.text() === "45 ms", "latency smooths toward recent samples");
+expect(latencyEvents.length === 1, "live latency display is throttled within two seconds");
+
+latency.record(1150, false);
+expect(latency.text() === "--", "a failed request reports unavailable");
+expect(latency.available() === false, "a failed request is not available");
+
+clock = 1300;
+latency.record(1250, true); // 50 -> 45 + 0.25 * 5 = 46.25 -> 46
+expect(latency.text() === "46 ms", "latency recovers after a failure");
+expect(latency.available() === true, "a recovered sample is available");
+
+clock = 3300;
+latency.record(3250, true);
+expect(
+  latencyEvents.at(-1)[0] === "47 ms" && latencyEvents.at(-1)[1] === true,
+  "latency display publishes the latest smoothed value after two seconds",
+);
+
+clock = 6301; // more than staleMs since the last success
+latency.refresh();
+expect(latency.text() === "--", "a stale latency reports unavailable");
+expect(latency.available() === false, "a stale latency is not available");
+
+expect(
+  latencyEvents.some(([text, available]) => text === "--" && available === false),
+  "onChange publishes unavailable states",
+);
+
+// --- FPS: rendered frames over a window, smoothing, inactivity, staleness ---
+clock = 0;
+const fpsNow = () => clock;
+const fps = createFpsMeter({
+  now: fpsNow,
+  windowMs: 1000,
+  staleMs: 2000,
+  smoothing: 0.4,
+});
+
+expect(fps.text() === "--", "fps is unavailable before the loop is active");
+expect(fps.available() === false, "an inactive loop is unavailable");
+
+fps.markFrame(); // t=0
+clock = 250; fps.markFrame();
+clock = 500; fps.markFrame();
+clock = 1000; fps.markFrame();
+expect(fps.text() === "4", "the first window counts 4 frames per second");
+expect(fps.available() === true, "a completed window is available");
+
+for (let t = 1100; t <= 2000; t += 100) {
+  clock = t;
+  fps.markFrame();
+}
+// 10 frames / 1000 ms, smoothed: 4 + 0.4 * (10 - 4) = 6.4 -> 6
+expect(fps.text() === "6", "fps smooths toward the recent window");
+
+fps.setActive(false);
+expect(fps.text() === "--", "pausing the render loop hides fps");
+expect(fps.available() === false, "a paused render loop is unavailable");
+
+clock = 3000;
+fps.markFrame();
+expect(fps.text() === "--", "fps waits for a full window after reactivation");
+
+clock = 4000;
+fps.markFrame();
+expect(fps.text() === "2", "a resumed window reports its own rate");
+expect(fps.available() === true, "a resumed window is available");
+
+clock = 6001; // more than staleMs since the last rendered frame
+fps.refresh();
+expect(fps.text() === "--", "a stale fps reports unavailable");
+expect(fps.available() === false, "a stale fps is unavailable");
+
+console.log("performance meters ok");
+"""
+
+
+def test_live_latency_and_fps_meters_execute_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _PERFORMANCE_METER_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "performance meters ok" in completed.stdout
+
+
+_PERFORMANCE_DOM_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("// --- Live performance indicator UI");
+const end = source.indexOf("// --- End live performance indicator UI");
+if (start < 0 || end < 0) throw new Error("performance indicator UI block not found");
+const block = source.slice(start, end);
+
+function makeElement(value) {
+  const element = {
+    textContent: value,
+    attributes: {},
+    classes: new Set(),
+  };
+  element.setAttribute = (name, value) => { element.attributes[name] = value; };
+  element.classList = {
+    toggle(name, on) {
+      if (on) element.classes.add(name);
+      else element.classes.delete(name);
+    },
+  };
+  return element;
+}
+
+const elements = {
+  latencyStatus: makeElement(""),
+  latencyValue: makeElement("--"),
+  fpsStatus: makeElement(""),
+  fpsValue: makeElement("--"),
+};
+global.document = { getElementById(id) { return elements[id] || null; } };
+
+const api = new Function(
+  block + "\nreturn { updateLatencyIndicator, updateFpsIndicator };",
+)();
+const { updateLatencyIndicator, updateFpsIndicator } = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+
+updateLatencyIndicator("24 ms", true);
+expect(elements.latencyValue.textContent === "24 ms", "latency value shows the sample");
+expect(elements.latencyStatus.classes.has("is-idle") === false, "a live sample is not idle");
+expect(
+  elements.latencyStatus.attributes["aria-label"] === "Backend latency 24 ms",
+  "the latency pill exposes an accessible label",
+);
+
+updateLatencyIndicator("--", false);
+expect(elements.latencyValue.textContent === "--", "a stale latency shows --");
+expect(elements.latencyStatus.classes.has("is-idle") === true, "a stale latency is idle");
+expect(
+  elements.latencyStatus.attributes["aria-label"] === "Backend latency unavailable",
+  "a stale latency is announced as unavailable",
+);
+
+updateFpsIndicator("60", true);
+expect(elements.fpsValue.textContent === "60", "fps value shows the rate");
+expect(elements.fpsStatus.classes.has("is-idle") === false, "an active loop is not idle");
+expect(
+  elements.fpsStatus.attributes["aria-label"] === "Map frame rate 60",
+  "the fps pill exposes an accessible label",
+);
+
+updateFpsIndicator("--", false);
+expect(elements.fpsValue.textContent === "--", "an inactive loop shows --");
+expect(elements.fpsStatus.classes.has("is-idle") === true, "an inactive loop is idle");
+expect(
+  elements.fpsStatus.attributes["aria-label"] === "Map frame rate unavailable",
+  "an inactive loop is announced as unavailable",
+);
+
+console.log("performance indicator dom ok");
+"""
+
+
+def test_performance_indicator_dom_binding_executes_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _PERFORMANCE_DOM_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "performance indicator dom ok" in completed.stdout
+
+
+_RENDER_LOOP_FPS_NODE_HARNESS = r"""
+const fs = require("fs");
+const source = fs.readFileSync(process.env.APP_JS, "utf8");
+const start = source.indexOf("let mapRenderFrame = null;");
+const end = source.indexOf("function canvasPoint(event)");
+if (start < 0 || end < 0) throw new Error("map render loop block not found");
+const block = source.slice(start, end);
+
+const frames = new Map();
+let nextFrame = 1;
+let fpsFrames = 0;
+let fpsActive = null;
+const state = { view: "3d" };
+const renderer = { render() {} };
+const scene = {};
+const camera = {};
+const updateCamera = () => {};
+const pageTransition = { active: false, expectsGrid: false };
+const glassMotionReduced = () => false;
+const resizeAll = () => {};
+const requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
+const cancelAnimationFrame = (id) => { frames.delete(id); };
+const fpsMeter = {
+  markFrame() { fpsFrames += 1; },
+  setActive(value) { fpsActive = value; },
+};
+
+const api = new Function(
+  "state", "renderer", "scene", "camera", "updateCamera",
+  "requestAnimationFrame", "cancelAnimationFrame",
+  "pageTransition", "glassMotionReduced", "resizeAll", "fpsMeter",
+  block + "\nreturn { render, ensureMapRenderLoop, pauseMapRenderLoop };",
+)(
+  state, renderer, scene, camera, updateCamera, requestAnimationFrame,
+  cancelAnimationFrame, pageTransition, glassMotionReduced, resizeAll, fpsMeter,
+);
+const { render, ensureMapRenderLoop, pauseMapRenderLoop } = api;
+
+function expect(condition, message) { if (!condition) throw new Error(message); }
+function flushFrame() {
+  const pending = Array.from(frames.values());
+  frames.clear();
+  pending.forEach((fn) => fn());
+}
+
+state.view = "3d";
+ensureMapRenderLoop();
+expect(fpsActive === true, "starting the map loop activates fps");
+
+fpsFrames = 0;
+flushFrame();
+expect(fpsFrames === 1, "each rendered map frame is counted");
+
+state.view = "system";
+pauseMapRenderLoop();
+expect(fpsActive === false, "leaving the map view deactivates fps");
+fpsFrames = 0;
+render();
+expect(fpsFrames === 0, "a draw outside the map view is never counted");
+
+state.view = "mapping";
+ensureMapRenderLoop();
+expect(fpsActive === true, "re-entering a map view reactivates fps");
+
+console.log("render loop fps ok");
+"""
+
+
+def test_map_render_loop_notches_fps_and_clears_when_inactive_under_node():
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    completed = subprocess.run(
+        ["node", "-e", _RENDER_LOOP_FPS_NODE_HARNESS],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "APP_JS": str(app_js)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "render loop fps ok" in completed.stdout
+
+
+def test_performance_indicator_styling_matches_glass_pills():
+    _index_html, _app_js, styles_css = _frontend_sources()
+
+    header_status = _css_rule_block(styles_css, ".header-status")
+    assert "flex-wrap: nowrap;" in header_status
+    assert "gap: 4px;" in header_status
+
+    performance = _css_rule_block(styles_css, ".pill.performance")
+    assert "white-space: nowrap;" in performance
+    assert "font-variant-numeric: tabular-nums;" in performance
+
+    assert ".pill.performance .performance-metric.is-idle" in styles_css
+    assert ".pill.performance .performance-metric.latency" in styles_css
+    assert ".pill.performance .performance-metric.fps" in styles_css
+
+    media_start = styles_css.index("@media (max-width: 520px)")
+    media_block = styles_css[media_start : styles_css.index("\n}", media_start)]
+    assert ".header-status" in media_block
+
+
+def _gated_stdout_process(gate, lines):
+    class _GatedStdoutProcess:
+        pid = 4321
+        returncode = 0
+
+        @property
+        def stdout(self):
+            for line in lines[:-1]:
+                yield line
+            gate.wait(timeout=5)
+            yield lines[-1]
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _sig):
+            pass
+
+    return _GatedStdoutProcess()
+
+
+def test_managed_stop_waits_for_reader_to_flush_trailing_lines(tmp_path, monkeypatch):
+    from web_control.log_store import ManagedLogStore
+    from web_control.web_control_node import ManagedLaunchProcess
+
+    store = ManagedLogStore(tmp_path / "logs")
+    logs = TerminalLogBuffer("chassis", max_lines=20)
+    process = ManagedLaunchProcess(
+        "chassis",
+        ["ros2", "launch", "hunter_base", "x.py"],
+        logs,
+        _LoggerStub(),
+        log_store=store,
+    )
+    with process.lock:
+        process._begin_session_locked()
+    session = process.session
+    assert session is not None
+
+    gate = threading.Event()
+    fake = _gated_stdout_process(gate, ["leading line\n", "final trailing line\n"])
+    process.process = fake
+    process.pgid = 4321
+    process.generation = 1
+    done = threading.Event()
+    process.reader_done = done
+    reader = threading.Thread(
+        target=process._read_output, args=(fake, 1, session, done), daemon=True
+    )
+    process.reader_thread = reader
+    reader.start()
+
+    monkeypatch.setattr(web_control_node.os, "killpg", lambda *_a, **_k: None)
+    stopper = threading.Thread(target=process.stop)
+    stopper.start()
+    # Let ``stop`` reach its drain wait, then release the reader's final line.
+    stopper.join(timeout=0.3)
+    gate.set()
+    stopper.join(timeout=5)
+
+    assert not stopper.is_alive()
+    content = session.path.read_text(encoding="utf-8")
+    assert "final trailing line" in content
+    assert session.closed is True
+
+
+def test_stale_reader_without_session_never_writes_new_file(tmp_path):
+    from web_control.log_store import ManagedLogStore
+    from web_control.web_control_node import ManagedLaunchProcess
+
+    store = ManagedLogStore(tmp_path / "logs")
+    logs = TerminalLogBuffer("chassis", max_lines=20)
+    process = ManagedLaunchProcess(
+        "chassis",
+        ["ros2", "launch", "hunter_base", "x.py"],
+        logs,
+        _LoggerStub(),
+        log_store=store,
+    )
+    new_session = store.start_session("chassis", ["ros2", "launch", "new", "y.py"])
+    logs.attach_session(new_session)
+    new_session.write_line("new round line")
+
+    class _OnceProcess:
+        pid = 1
+        returncode = 0
+
+        @property
+        def stdout(self):
+            return iter(["stale old round line\n"])
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    process.generation = 2
+    done = threading.Event()
+    # Explicit ``None`` means the previous round had no persistent session.
+    process._read_output(_OnceProcess(), 1, None, done)
+
+    assert done.is_set()
+    content = new_session.path.read_text(encoding="utf-8")
+    assert "stale old round line" not in content
+    assert new_session.closed is False
+
+
+def test_chassis_sequence_stop_records_inflight_preflight_output(
+    monkeypatch, tmp_path
+):
+    from web_control.log_store import ManagedLogStore
+    from web_control.web_control_node import (
+        CHASSIS_CAN_PREFLIGHT_COMMANDS,
+        ManagedSequenceLaunchProcess,
+    )
+
+    gate = threading.Event()
+    first = tuple(CHASSIS_CAN_PREFLIGHT_COMMANDS[0])
+    launched = []
+    recorder = _PreflightSpawnRecorder(
+        gate=gate, outputs={first: "CAN diagnostics line\n"}
+    )
+    monkeypatch.setattr(web_control_node.subprocess, "Popen", recorder)
+    monkeypatch.setattr(
+        web_control_node.ManagedLaunchProcess,
+        "_start_locked",
+        lambda self: launched.append(list(self.command)),
+    )
+    store = ManagedLogStore(tmp_path / "logs")
+    logs = TerminalLogBuffer("chassis", max_lines=50)
+    process = ManagedSequenceLaunchProcess(
+        "chassis",
+        [list(step) for step in CHASSIS_CAN_PREFLIGHT_COMMANDS],
+        ["ros2", "launch", "hunter_base", "hunter_base.launch.py"],
+        logs,
+        _LoggerStub(),
+        log_store=store,
+    )
+
+    monkeypatch.setattr(
+        web_control_node.os, "killpg", lambda _pgid, _sig: gate.set()
+    )
+    monkeypatch.setattr(web_control_node.os, "getpgid", lambda _pid: 5000)
+
+    process.start()
+    assert recorder.first_spawn.wait(timeout=5)
+    session = process.session
+    process.stop()
+    process.sequence_thread.join(timeout=5)
+
+    assert session is not None
+    assert "CAN diagnostics line" in session.path.read_text(encoding="utf-8")
+    # The cancelled sequence never advanced to the second prerequisite.
+    assert recorder.calls == [first]
+    assert launched == []

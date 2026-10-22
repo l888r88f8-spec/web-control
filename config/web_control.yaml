@@ -4,9 +4,11 @@ web_control:
     port: 8080                           # HTTP listen port
     map_frame: "map"                     # Frame used for published poses
 
+    global_map_topic: "/lio_sam/localization/global_map"  # Localization global map (latched)
     local_map_topic: "/lio_sam/localization/local_map"   # Localization local map
     mapcloud_topic: "mapcloud"                         # Navigation point cloud
     mapground_topic: "/weighted_ground"                 # Goal selection ground cloud
+    obstacle_topic: "/aggregated_pc"                    # Live navigation obstacle cloud
     odom_topic: "/lio_sam/localization/odometry"        # Navigation odometry
 
     mapping_global_map_topic: "/lio_sam/mapping/map_global"          # Mapping global map
@@ -20,8 +22,11 @@ web_control:
     cancel_goal_service: "/p2p_move_base/_action/cancel_goal"  # Cancel goal service
     path_topics: "/global_path"                 # Comma-separated path topics
 
-    max_2d_points_per_layer: 60000        # Max 2D points sent per layer
-    max_3d_points_per_layer: 60000        # Max 3D points sent per layer
+    # Point clouds are cached once in 3D. max_2d_points_per_layer only caps the
+    # legacy /api/map2d XY projection computed on request; no 2D cache is kept.
+    max_2d_points_per_layer: 60000        # Lazy /api/map2d output cap, not a second cache
+    max_3d_points_per_layer: 60000        # Max retained/sent 3D points per layer
+    cloud_demand_ttl_sec: 2.0             # Pause non-latched cloud decode after last map request (s)
     stale_timeout_sec: 2.0                # Source stale timeout seconds
 
     localization_launch_package: "lio_sam_hesai"                  # Localization launch package
@@ -33,13 +38,47 @@ web_control:
     mapping_launch_package: "lio_sam_hesai"                       # Mapping launch package
     mapping_launch_file: "mapping.launch.py"                      # Mapping launch file
     mapping_launch_args: ""                                       # Extra mapping launch args
+    recording_root: "/"                                           # Absolute root for rosbag directory browsing
+    chassis_launch_package: "hunter_base"                         # Chassis launch package
+    chassis_launch_file: "hunter_base.launch.py"                  # Chassis launch file
+    chassis_launch_args: ""                                       # Extra chassis launch args
+    imu_launch_package: "fdilink_ahrs"                            # IMU launch package
+    imu_launch_file: "ahrs_driver.launch.py"                      # IMU launch file
+    imu_launch_args: ""                                           # Extra IMU launch args
+    lidar_launch_package: "hesai_ros_driver"                      # Lidar launch package
+    lidar_launch_file: "start.py"                                 # Lidar launch file
+    lidar_launch_args: ""                                         # Extra lidar launch args
     managed_log_lines: 400               # Terminal log lines kept per process
+    managed_log_dir: ""                  # Persistent log root (default ~/.local/state/web_control/logs)
+    tf_topic: "/tf"                      # Dynamic transform topic
+    tf_static_topic: "/tf_static"        # Latched static transform topic
+    tf_stale_timeout_sec: 2.0            # Age after which a dynamic edge is stale
+    tf_cache_size: 4096                  # Max cached TF edges before eviction
     viewer_timeout_sec: 10.0             # Viewer heartbeat timeout seconds
     teleop_cmd_vel_topic: "/cmd_vel"           # Hunter velocity command topic
-    teleop_max_linear_speed: 1.5              # Max forward/reverse speed (m/s)
+    teleop_max_linear_speed: 1.0              # Max forward/reverse speed (m/s)
     teleop_wheelbase: 0.65                    # Hunter wheelbase (m)
     teleop_max_steer_angle: 0.461             # Max central steering angle (rad)
     teleop_steering_exponent: 0.5             # Steering curve exponent
     teleop_deadzone: 0.08                     # Normalized center dead zone
     teleop_command_timeout: 0.4               # Watchdog timeout (s)
     teleop_publish_rate: 20.0                 # Active command publish rate (Hz)
+    diagnostics_enabled: true               # Always-on topic/motion monitoring timer
+    diagnostics_imu_topic: "/imu"            # FDI IMU (sensor_msgs/Imu)
+    diagnostics_lidar_topic: "/lidar_points" # Hesai raw cloud (raw receive counter only)
+    diagnostics_chassis_odom_topic: "/odom1" # Hunter wheel odometry
+    diagnostics_window_sec: 5.0              # Sliding window for received Hz
+    diagnostics_stale_timeout_sec: 2.0       # Topic/motion age treated as stale
+    diagnostics_sample_period_sec: 1.0       # Background sample and log flush
+    diagnostics_snapshot_period_sec: 5.0     # Periodic JSONL snapshot interval
+    diagnostics_publisher_refresh_sec: 1.0   # Publisher count query interval
+    diagnostics_max_log_bytes: 10485760      # Rotate diagnostics log at 10 MiB
+    diagnostics_retain_days: 7               # Completed diagnostics log age limit
+    diagnostics_retain_bytes: 104857600      # Completed diagnostics total size limit
+    resource_logging_enabled: true           # Backend-only periodic resource JSONL (no UI)
+    resource_sample_period_sec: 1.0          # Resource sample/persist interval (seconds)
+    motion_start_threshold_mps: 0.05         # Moving entry threshold
+    motion_stop_threshold_mps: 0.02          # Moving exit threshold (hysteresis)
+    motion_debounce_sec: 0.3                 # Start/stop debounce
+    motion_max_gap_sec: 0.5                  # Never integrate across a larger gap
+    motion_max_speed_mps: 3.0                # Reject implausible measured speed

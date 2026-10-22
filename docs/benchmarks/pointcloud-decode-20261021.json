@@ -1,0 +1,43 @@
+{
+  "environment": {
+    "python": "3.10.12",
+    "platform": "Linux-5.15.136-tegra-aarch64-with-glibc2.35",
+    "cpu": "aarch64",
+    "numpy": "1.21.5",
+    "pid": 3
+  },
+  "method": {
+    "kind": "isolated synthetic PointCloud2, not robot CPU",
+    "points": 200000,
+    "iterations": 5,
+    "warmup_iterations": 1,
+    "max_points": 60000,
+    "old_algorithm": "pure-Python struct.unpack per point + math.isfinite + downsample_points (equivalent to read_points path; sensor_msgs_py is unavailable in this harness)",
+    "new_algorithm": "web_control.pointcloud_runtime.parse_pointcloud2"
+  },
+  "output": {
+    "finite_count": 196912,
+    "output_points": 49229,
+    "identical": true,
+    "last_output_point": [
+      199.99899291992188,
+      -9.495246887207031,
+      1.4221802949905396
+    ]
+  },
+  "old": {
+    "wall_sec_per_iteration": 0.237201,
+    "process_cpu_sec_per_iteration": 0.236163,
+    "tracemalloc_peak_bytes": 33131921
+  },
+  "new": {
+    "wall_sec_per_iteration": 0.051645,
+    "process_cpu_sec_per_iteration": 0.051517,
+    "tracemalloc_peak_bytes": 11821848
+  },
+  "ratios": {
+    "wall_speedup": 4.59,
+    "cpu_speedup": 4.58,
+    "peak_memory_reduction": 2.8
+  }
+}

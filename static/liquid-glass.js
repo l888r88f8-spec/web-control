@@ -1,11 +1,10 @@
-// Provenance: the idea of feeding a static feImage displacement map into
-// feDisplacementMap and referencing the resulting filter from
-// `backdrop-filter: url(#id)` follows the technique demonstrated by
-// https://github.com/shuding/liquid-glass ("Copy-paste Liquid Glass effect
-// using SVG filters"). The filter markup, the LIQUID_DROP_MAP asset, and this
-// capability helper are independently implemented for this repository. No
-// upstream code or asset is copied, so no upstream license notice is required
-// while this remains a conceptual reimplementation.
+// Provenance: the static LIQUID_DROP_MAP asset, the #liquidDrop filter markup,
+// and this glass-mode helper are independently implemented for this
+// repository. The dynamic tab-track generator in track-refraction.js adapts
+// code from https://github.com/shuding/liquid-glass (MIT, Copyright (c) 2025
+// Shu Ding); see THIRD_PARTY_NOTICES.md. The technique of feeding a static
+// feImage displacement map into feDisplacementMap and referencing the filter
+// from `backdrop-filter: url(#id)` follows that upstream demonstration.
 
 const FILTER_ID = "liquidDrop";
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -24,9 +23,10 @@ const LIQUID_DROP_MAP =
 let initialized = false;
 let currentMode = null;
 let manualOverride = null;
+let savedMode = null;
 let motionQuery = null;
-let transparencyQuery = null;
 let listenersAttached = false;
+const modeListeners = new Set();
 
 function prefersReduceMotion() {
   if (!motionQuery && typeof window !== "undefined" && typeof window.matchMedia === "function") {
@@ -35,55 +35,45 @@ function prefersReduceMotion() {
   return Boolean(motionQuery && motionQuery.matches);
 }
 
-function prefersReducedTransparency() {
-  if (!transparencyQuery && typeof window !== "undefined" && typeof window.matchMedia === "function") {
-    transparencyQuery = window.matchMedia("(prefers-reduced-transparency: reduce)");
-  }
-  return Boolean(transparencyQuery && transparencyQuery.matches);
-}
-
-function saveDataEnabled() {
-  const connection = navigator.connection;
-  return Boolean(connection && connection.saveData === true);
-}
-
-function isChromiumEngine() {
-  const userAgentData = navigator.userAgentData;
-  if (userAgentData && Array.isArray(userAgentData.brands)) {
-    if (userAgentData.brands.some((brand) => /Chromium/i.test(brand.brand || ""))) return true;
-  }
-  return /Chromium\/|Chrome\//.test(navigator.userAgent || "");
-}
-
-function supportsDisplacement() {
-  if (typeof CSS === "undefined" || typeof CSS.supports !== "function") return false;
-  try {
-    return (
-      CSS.supports("backdrop-filter", "url(#liquidDrop)") ||
-      CSS.supports("-webkit-backdrop-filter", "url(#liquidDrop)")
-    );
-  } catch (_error) {
-    return false;
-  }
-}
-
 function overrideFromSearch() {
   if (typeof window === "undefined" || !window.location) return null;
   const match = /[?&]glass=(full|light|off)(?:&|$)/.exec(window.location.search || "");
   return match ? match[1] : null;
 }
 
+// The strength is chosen only by explicit signals: a runtime/manual override, an
+// explicit ?glass= query, or the operator's saved browser-local choice. The
+// browser engine, its CSS capabilities, and accessibility media queries never
+// remap the mode; unsupported CSS simply degrades in place. Without any explicit
+// choice, everyone gets Full.
 export function detectGlassMode() {
-  const override = manualOverride || overrideFromSearch();
-  if (override) return override;
-  if (prefersReducedTransparency()) return "off";
-  if (saveDataEnabled()) return "light";
-  if (isChromiumEngine() && supportsDisplacement()) return "full";
-  return "light";
+  if (manualOverride) return manualOverride;
+  const queryOverride = overrideFromSearch();
+  if (queryOverride) return queryOverride;
+  if (savedMode) return savedMode;
+  return "full";
 }
 
 export function glassMode() {
   return currentMode;
+}
+
+export function onGlassModeChange(listener) {
+  if (typeof listener !== "function") return () => {};
+  modeListeners.add(listener);
+  return () => {
+    modeListeners.delete(listener);
+  };
+}
+
+function notifyGlassMode(mode) {
+  modeListeners.forEach((listener) => {
+    try {
+      listener(mode);
+    } catch (_error) {
+      // A broken subscriber must never break glass mode switching.
+    }
+  });
 }
 
 export function glassMotionReduced() {
@@ -129,6 +119,7 @@ export function applyGlassMode(mode) {
   root.setAttribute("data-glass-mode", resolved);
   if (resolved === "full") injectLiquidFilter();
   else removeLiquidFilter();
+  notifyGlassMode(resolved);
   return resolved;
 }
 
@@ -137,31 +128,29 @@ function applyMotionClass() {
   document.documentElement.classList.toggle("glass-motion-reduced", reduced);
 }
 
+// Apply an explicit strength and make it outrank the query and saved choice for
+// the rest of the page. Persistence is the caller's responsibility so this
+// module stays free of browser storage.
+export function setGlassMode(mode) {
+  manualOverride = GLASS_MODES.includes(mode) ? mode : null;
+  return applyGlassMode(detectGlassMode());
+}
+
 function attachListenersOnce() {
   if (listenersAttached) return;
   listenersAttached = true;
   if (motionQuery && typeof motionQuery.addEventListener === "function") {
     motionQuery.addEventListener("change", applyMotionClass);
   }
-  if (transparencyQuery && typeof transparencyQuery.addEventListener === "function") {
-    transparencyQuery.addEventListener("change", () => applyGlassMode(detectGlassMode()));
-  }
-  const connection = navigator.connection;
-  if (connection && typeof connection.addEventListener === "function") {
-    connection.addEventListener("change", () => applyGlassMode(detectGlassMode()));
-  }
-  window.__webControlSetGlassMode = (mode) => {
-    manualOverride = GLASS_MODES.includes(mode) ? mode : null;
-    return applyGlassMode(detectGlassMode());
-  };
+  window.__webControlSetGlassMode = setGlassMode;
 }
 
 export function initLiquidGlass(options = {}) {
   if (initialized) return currentMode;
   initialized = true;
   if (options && GLASS_MODES.includes(options.mode)) manualOverride = options.mode;
+  if (options && GLASS_MODES.includes(options.savedMode)) savedMode = options.savedMode;
   prefersReduceMotion();
-  prefersReducedTransparency();
   applyMotionClass();
   attachListenersOnce();
   return applyGlassMode(detectGlassMode());

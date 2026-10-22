@@ -8,6 +8,8 @@ from collections import deque
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Optional
 
+from web_control.log_store import LogSession, LogStorageError
+
 CpuTicks = tuple[int, ...]
 CpuSnapshot = dict[str, Any]
 
@@ -400,6 +402,10 @@ class SourceCache:
     stamp: Optional[float] = None
     frame_id: str = ""
     count: int = 0
+    # Monotonic content generation. Point-cloud HTTP serialization keys on it
+    # so a cached body can never outlive an update or clear, without keeping a
+    # separate revision map in the node.
+    version: int = 0
 
     def update(
         self, data: Any, stamp: float, frame_id: str = "", count: int = 0
@@ -408,12 +414,14 @@ class SourceCache:
         self.stamp = stamp
         self.frame_id = frame_id
         self.count = count
+        self.version += 1
 
     def clear(self) -> None:
         self.data = None
         self.stamp = None
         self.frame_id = ""
         self.count = 0
+        self.version += 1
 
     def status(self, now: float) -> str:
         if self.stamp is None:
@@ -434,6 +442,12 @@ class SourceCache:
         }
 
 
+# Distinguishes "caller omitted the session" (fall back to the buffer's current
+# session) from an explicit ``None`` (this round has no persistent session, so
+# never spill into whatever session the buffer currently holds).
+_SESSION_UNSPECIFIED = object()
+
+
 class TerminalLogBuffer:
     def __init__(self, target: str, max_lines: int = 400) -> None:
         self.target = target
@@ -446,15 +460,62 @@ class TerminalLogBuffer:
         self.running = False
         self.returncode: int | None = None
         self.lock = threading.RLock()
+        # Optional persistent session writing every sanitised line to disk.
+        self.session: LogSession | None = None
+        self.persist_error: str | None = None
 
-    def append(self, line: str) -> None:
+    def attach_session(self, session: LogSession | None) -> None:
+        with self.lock:
+            self.session = session
+            self.persist_error = None if session is None else session.write_error
+
+    def set_persist_error(self, message: str) -> None:
+        with self.lock:
+            self.persist_error = message
+
+    def _write_session(self, text: str, session: Any = _SESSION_UNSPECIFIED) -> None:
+        target = self.session if session is _SESSION_UNSPECIFIED else session
+        if target is None or target.closed:
+            return
+        try:
+            target.write_line(text)
+        except LogStorageError as exc:
+            # Keep the live buffer and the running process working; only the
+            # persistent copy is degraded and the error is surfaced via the API.
+            self.persist_error = str(exc)
+
+    def append(self, line: str, session: Any = _SESSION_UNSPECIFIED) -> None:
         clean_lines = line.splitlines() or [line]
         with self.lock:
             for clean_line in clean_lines:
+                text = ANSI_ESCAPE_RE.sub("", clean_line).rstrip("\r\n")
                 self._seq += 1
-                self.lines.append(
-                    (self._seq, ANSI_ESCAPE_RE.sub("", clean_line).rstrip("\r\n"))
-                )
+                self.lines.append((self._seq, text))
+                self._write_session(text, session)
+
+    def finish_session(
+        self, session: Any = _SESSION_UNSPECIFIED, message: str | None = None
+    ) -> None:
+        """Record a final status line and close the session's file handle."""
+        with self.lock:
+            target = self.session if session is _SESSION_UNSPECIFIED else session
+            if message is not None:
+                self._seq += 1
+                self.lines.append((self._seq, message))
+                self._write_session(message, target)
+            if target is not None:
+                target.close()
+            if self.session is target:
+                self.session = None
+            if target is not None and target.write_error:
+                self.persist_error = target.write_error
+
+    def session_info(self) -> dict[str, Any]:
+        with self.lock:
+            info: dict[str, Any] = {"persist_error": self.persist_error}
+            if self.session is not None:
+                info.update(self.session.metadata())
+            return info
 
     def set_process_state(
         self, enabled: bool, running: bool, returncode: int | None
