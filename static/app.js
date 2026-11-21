@@ -2626,7 +2626,6 @@ function createCloudStreamController({
   getDesired,
   onMetadata = () => {},
   onFallback = () => {},
-  documentHidden = () => false,
   fallbackIntervalMs = 1000,
   reconnectDelayMs = 1000,
   maxReconnectDelayMs = 10000,
@@ -2706,7 +2705,9 @@ function createCloudStreamController({
     fallbackSignature = desiredSignature(desired);
     onFallback(desired);
     fallbackTimer = setIntervalFn(() => {
-      const latest = documentHidden() ? null : getDesired();
+      // The checked layers stay live while the tab is hidden; only a closed
+      // page (the stream dies with it) stops the demand renewal.
+      const latest = getDesired();
       if (!latest || desiredSignature(latest) !== fallbackSignature) return;
       onFallback(latest);
     }, fallbackIntervalMs);
@@ -2767,7 +2768,7 @@ function createCloudStreamController({
       const delay = Math.min(maxReconnectDelayMs, reconnectDelayMs * Math.max(1, failures));
       reconnectTimer = setTimer(() => {
         reconnectTimer = null;
-        const latest = documentHidden() ? null : getDesired();
+        const latest = getDesired();
         if (!latest) {
           close();
           return;
@@ -2782,7 +2783,7 @@ function createCloudStreamController({
   }
 
   function sync() {
-    const desired = documentHidden() ? null : getDesired();
+    const desired = getDesired();
     if (!hasResources(desired)) {
       close();
       return;
@@ -2868,7 +2869,8 @@ const refreshController = createRefreshController({
 });
 
 function desiredCloudStream() {
-  if (document.hidden) return null;
+  // Checked layers stay live even while the tab is hidden; the backend keeps
+  // their subscriptions and caches so returning does not reload anything.
   if (state.view === "3d") {
     const layers = Object.keys(LAYERS).filter((name) => LAYERS[name].enabled);
     const topics = Array.isArray(state.pathTopics) ? state.pathTopics : [];
@@ -2901,7 +2903,6 @@ function desiredCloudStream() {
 
 const cloudStreamController = createCloudStreamController({
   getDesired: desiredCloudStream,
-  documentHidden: () => document.hidden,
   onMetadata: (entries, epoch) => refreshController.noteCloudMetadata(entries, epoch),
   onFallback: (desired) => {
     void refreshController.pollFallback(desired);
