@@ -945,7 +945,16 @@ function updateMarkerSlot(group, key, factory, pose) {
   const direction =
     marker.userData.markerDirection ||
     (marker.userData.markerDirection = new THREE.Vector3());
-  direction.set(Math.cos(yaw), 0, -Math.sin(yaw)).normalize();
+  const attitude = rosPoseQuaternion(pose);
+  if (attitude) {
+    // The marker group carries the full body attitude, so the arrow stays
+    // body-forward in local space and pitch/roll tilt it with the chassis.
+    marker.quaternion.set(attitude.x, attitude.y, attitude.z, attitude.w);
+    direction.set(1, 0, 0);
+  } else {
+    marker.quaternion.set(0, 0, 0, 1);
+    direction.set(Math.cos(yaw), 0, -Math.sin(yaw)).normalize();
+  }
   marker.userData.markerArrow.setDirection(direction);
   marker.visible = true;
 }
