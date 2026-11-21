@@ -110,7 +110,7 @@ Navigation 3D 视图显示局部规划器发布的预测轨迹 `/best_trajectory
 
 ## 话题监控与轮速里程
 
-**System → 话题与运动** 面板与后台计时器持续监控 IMU/底盘里程计，并从 Hesai 驱动发布的轻量 `diagnostic_msgs/DiagnosticArray` 心跳获取 LiDAR 的**驱动发布频率**，不依赖浏览器是否打开。默认不接收原始 `PointCloud2`，避免日常运行时持续复制完整点云；只有显式 opt-in 时才额外统计网页端实际接收频率。接口字段、QoS、重启/过期语义与激活步骤见 [`docs/lidar-publish-stats.md`](docs/lidar-publish-stats.md)。
+**System → 话题与运动** 面板与后台计时器持续监控 IMU/底盘里程计，并从 Hesai 驱动发布的轻量 `diagnostic_msgs/DiagnosticArray` 心跳获取 LiDAR 的**驱动发布频率**，不依赖浏览器是否打开。默认不接收原始 `PointCloud2`，避免日常运行时持续复制完整点云；只有显式 opt-in 时才额外统计网页端实际接收频率。驱动侧接口字段、QoS 与启用步骤见 [Hesai 驱动发布统计](docs/driver_publish_stats/README.md)。
 
 - `diagnostics_imu_topic` 默认 `/imu`（FDI `sensor_msgs/Imu`）。监控订阅统一使用 `BEST_EFFORT`/`VOLATILE`/depth 10，可同时接收 reliable 与 best-effort 发布者；仅额外显示最后一次加速度与角速度，作为辅助观察，IMU 单独不能证明运动。数据过期或不可用时明确标注“最近一次/不可用”，不伪装成实时观测。
 - `diagnostics_lidar_topic` 默认 `/lidar_points`（Hesai `sensor_msgs/PointCloud2`）。`diagnostics_lidar_stats_topic` 默认 `/lidar_points/statistics`，由驱动按点云话题派生（点云话题 + `/statistics`）。网页默认只订阅这个约 1 Hz 的小消息，QoS 为 `BEST_EFFORT`/`VOLATILE`/depth 1；回调再按状态名 `hesai_lidar_publish` 和 `source_topic`（必须等于配置的点云话题）过滤，其他 `DiagnosticArray` 发布者不能覆盖 LiDAR 行。到达新鲜度只用网页单调时钟，数值字段要求有限、非负且窗口大于 0；坏消息/无关消息只计入 `invalid_count`，不崩溃、不伪造 0 Hz、不刷新新鲜度。超过 `diagnostics_lidar_stats_stale_timeout_sec`（默认 3.0 s）未收到有效统计时显示 `统计过期`，实时 Hz 为 `null`，历史 `last_publish_hz` 仅作离线参考。
@@ -137,7 +137,7 @@ Navigation 3D 视图显示局部规划器发布的预测轨迹 `/best_trajectory
 - **序列化缓存**：默认每个逻辑接口只保留**一个当前版本**的已编码响应，多个客户端或未变化数据复用同一字节串，`max_entries` 限制整体数量；显式要求保留多个版本的调用仍受支持。状态变为 `stale`/`waiting`、清空或新帧会改变 key，不会返回旧状态。2D 仍是请求时从 3D 懒投影的旧 API 形状。
 - **生命周期**：clear、导航/定位/建图停止、手动切换地图和销毁都会递增代次并丢弃队列/在途结果、待处理原始帧和序列化字节，并通过元数据通知使浏览器拒绝旧代次；空障碍帧清空图层，停止后迟到的帧不会复活旧数据。销毁时先有界停止 worker/SSE hub，再关闭日志/节点。坏点云只记录错误并丢弃该帧，不影响控制。
 - **依赖**：`package.xml` 已声明 `python3-numpy`；使用系统现有 NumPy，无需安装新包。SSE 使用 Python 标准库和浏览器原生 `EventSource`，没有新增第三方依赖。若遇到 NumPy 不支持的字段类型，才回退到旧 `sensor_msgs_py` 读取路径；布局损坏会明确报错而不是静默误解码。
-- **基准（仅合成数据，非实机 CPU）**：20 万点、5 次迭代下，解码墙钟/进程 CPU 约从 0.237 s 降到 0.0516 s（约 4.59x），`tracemalloc` 峰值约从 33.1 MB 降到 11.8 MB（约 2.8x），输出与旧算法逐点一致。环境、方法和限制见 `docs/benchmarks/pointcloud-optimization.md`，脚本为 `benchmarks/pointcloud_benchmark.py`。这是隔离合成数据的解码基准，不是实机/节点 CPU 或持续负载结果；真实收益取决于点云大小、话题频率和是否打开地图页，需在目标机器上确认。
+- **基准（仅合成数据，非实机 CPU）**：20 万点、5 次迭代下，解码墙钟/进程 CPU 约从 0.237 s 降到 0.0516 s（约 4.59x），`tracemalloc` 峰值约从 33.1 MB 降到 11.8 MB（约 2.8x），输出与旧算法逐点一致。基准脚本为 `benchmarks/pointcloud_benchmark.py`。这是隔离合成数据的解码基准，不是实机/节点 CPU 或持续负载结果；真实收益取决于点云大小、话题频率和是否打开地图页，需在目标机器上确认。
 
 ## TF 树
 
