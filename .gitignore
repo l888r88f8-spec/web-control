@@ -11,3 +11,5 @@ test/
 tests/
 /.dufomap_online_result.md
 /docs/driver_publish_stats/publish_stats_collector_test.cc
+/docs/superpowers/plans/
+/docs/superpowers/specs/

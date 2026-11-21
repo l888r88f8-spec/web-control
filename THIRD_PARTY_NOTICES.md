@@ -18,10 +18,7 @@ The adaptation re-evaluates the SDF in CSS pixels for the wide `#viewTabs`
 pill, regenerates the map at the real border-box size and current DPR, adds
 `ResizeObserver`/window/DPR lifecycle, coalescing, generation guarding and
 idempotent teardown, and uses the hyphenated `color-interpolation-filters`
-attribute. The design is documented in
-`docs/superpowers/specs/2026-09-23-dynamic-liquid-glass-tabs-design.md` and the
-implementation plan in
-`docs/superpowers/plans/2026-09-23-dynamic-liquid-glass-tabs.md`.
+attribute.
 
 The static `LIQUID_DROP_MAP` asset, the `#liquidDrop` filter markup, the
 capability helper, the stylesheet, and the transition state machine remain
