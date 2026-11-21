@@ -1038,24 +1038,32 @@ const PERCEPTION_WINDOW_GENERATRICES = 8;
 let perceptionWindowKey = "";
 let perceptionWindowLabelKey = "";
 
-// Body-frame wire cylinder as a flat LineSegments vertex array.  Rings lie in
-// the body XY plane, which rosToThree maps to the Three.js XZ plane, so the
-// outline tilts with the vehicle once the group carries the body attitude.
-function perceptionWindowSegmentPositions(window, minHeight, maxHeight) {
+// Body-frame wire cylinder.  Rings lie in the body XY plane, which
+// rosToThree maps to the Three.js XZ plane, so the outline tilts with the
+// vehicle once the group carries the body attitude.  Each ring is a closed
+// polyline (`LineLoop`) so its dash distances accumulate around the whole
+// circle; drawing it as many short segments would make every segment shorter
+// than one dash and the ring would render solid.
+function perceptionWindowRingPositions(window, height) {
+  const radius = Number(window);
+  const ringHeight = Number(height);
+  const positions = [];
+  for (let index = 0; index < PERCEPTION_WINDOW_RING_SEGMENTS; index += 1) {
+    const angle = (index / PERCEPTION_WINDOW_RING_SEGMENTS) * Math.PI * 2;
+    positions.push(
+      Math.cos(angle) * radius,
+      ringHeight,
+      Math.sin(angle) * radius,
+    );
+  }
+  return positions;
+}
+
+function perceptionWindowGeneratrixPositions(window, minHeight, maxHeight) {
   const radius = Number(window);
   const low = Number(minHeight);
   const high = Number(maxHeight);
   const positions = [];
-  for (let index = 0; index < PERCEPTION_WINDOW_RING_SEGMENTS; index += 1) {
-    const start = (index / PERCEPTION_WINDOW_RING_SEGMENTS) * Math.PI * 2;
-    const end = ((index + 1) / PERCEPTION_WINDOW_RING_SEGMENTS) * Math.PI * 2;
-    for (const height of [low, high]) {
-      positions.push(
-        Math.cos(start) * radius, height, Math.sin(start) * radius,
-        Math.cos(end) * radius, height, Math.sin(end) * radius,
-      );
-    }
-  }
   for (let index = 0; index < PERCEPTION_WINDOW_GENERATRICES; index += 1) {
     const angle = (index / PERCEPTION_WINDOW_GENERATRICES) * Math.PI * 2;
     const x = Math.cos(angle) * radius;
@@ -1063,6 +1071,20 @@ function perceptionWindowSegmentPositions(window, minHeight, maxHeight) {
     positions.push(x, low, z, x, high, z);
   }
   return positions;
+}
+
+// Every indicator segment is dashed.  The dash must be shorter than the
+// shortest drawn span (a 0.8 m generatrix for the -0.2..0.6 m window) so no
+// span renders as one solid stroke.
+function perceptionWindowMaterial() {
+  return new THREE.LineDashedMaterial({
+    color: PERCEPTION_WINDOW_COLOR,
+    dashSize: 0.3,
+    gapSize: 0.2,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false,
+  });
 }
 
 // rosToThree maps (x, y, z) -> (x, z, -y).  That mapping is a proper rotation,
@@ -1099,25 +1121,36 @@ function buildPerceptionWindowGeometry(layer) {
   if (key === perceptionWindowKey) return;
   clearPerceptionWindowGeometry();
   perceptionWindowKey = key;
-  const positions = perceptionWindowSegmentPositions(
-    layer.window,
-    layer.min_height,
-    layer.max_height,
+  for (const height of [layer.min_height, layer.max_height]) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new THREE.Float32BufferAttribute(
+        perceptionWindowRingPositions(layer.window, height), 3,
+      ),
+    );
+    const ring = new THREE.LineLoop(geometry, perceptionWindowMaterial());
+    ring.computeLineDistances();
+    ring.name = "perception_window_ring";
+    perceptionWindowGroup.add(ring);
+  }
+  const generatrixGeometry = new THREE.BufferGeometry();
+  generatrixGeometry.setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute(
+      perceptionWindowGeneratrixPositions(
+        layer.window,
+        layer.min_height,
+        layer.max_height,
+      ), 3,
+    ),
   );
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  const material = new THREE.LineDashedMaterial({
-    color: PERCEPTION_WINDOW_COLOR,
-    dashSize: 0.8,
-    gapSize: 0.5,
-    transparent: true,
-    opacity: 0.85,
-    depthWrite: false,
-  });
-  const edges = new THREE.LineSegments(geometry, material);
-  edges.computeLineDistances();
-  edges.name = "perception_window_edges";
-  perceptionWindowGroup.add(edges);
+  const generatrices = new THREE.LineSegments(
+    generatrixGeometry, perceptionWindowMaterial(),
+  );
+  generatrices.computeLineDistances();
+  generatrices.name = "perception_window_edges";
+  perceptionWindowGroup.add(generatrices);
 }
 
 function updatePerceptionWindowLabel(layer) {
