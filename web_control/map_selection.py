@@ -38,6 +38,12 @@ DEFAULT_TOPIC_LOGGING_ENABLED = True
 # ``mode`` and only takes effect when the selected map actually has sc_db.bin.
 DEFAULT_AUTO_RELOCALIZATION = True
 
+# The unified p2p_move_base navigation launch selects exactly one global
+# planner.  The preference is shared by every browser and stored beside the
+# other UI choices; an unknown saved value falls back to the legacy planner.
+NAVIGATION_PLANNERS = ("original", "grid")
+DEFAULT_NAVIGATION_PLANNER = "original"
+
 JOYSTICK_DEFAULT_SIZE = 180.0
 JOYSTICK_MIN_SIZE = 140.0
 JOYSTICK_MAX_SIZE = 260.0
@@ -108,6 +114,23 @@ def validate_auto_relocalization(value: Any) -> bool:
 def saved_auto_relocalization(value: Any) -> bool:
     """Return a saved boolean, defaulting old/invalid files to enabled."""
     return value if type(value) is bool else DEFAULT_AUTO_RELOCALIZATION
+
+
+def validate_navigation_planner(value: Any) -> str:
+    """Return a strictly supplied planner name, rejecting every other value."""
+    if not isinstance(value, str) or value not in NAVIGATION_PLANNERS:
+        raise ValueError(
+            "planner must be one of: " + ", ".join(NAVIGATION_PLANNERS)
+        )
+    return value
+
+
+def saved_navigation_planner(value: Any) -> str:
+    """Return a saved planner, defaulting unknown/missing data to original."""
+    try:
+        return validate_navigation_planner(value)
+    except ValueError:
+        return DEFAULT_NAVIGATION_PLANNER
 
 
 def _runtime_home(home: Path | None) -> Path:
@@ -341,6 +364,26 @@ class SelectionStore:
         with _STORE_LOCK:
             payload = self._read_payload()
             payload["auto_relocalization"] = validated
+            _atomic_write_text(self.path, json.dumps(payload) + "\n")
+        return validated
+
+    def load_navigation_planner(self) -> str:
+        """Return the next-start global planner, defaulting to original."""
+        payload = self._read_payload()
+        ui = payload.get("ui")
+        value = ui.get("navigation_planner") if isinstance(ui, dict) else None
+        return saved_navigation_planner(value)
+
+    def save_navigation_planner(self, planner: Any) -> str:
+        """Atomically merge the planner choice without touching other prefs."""
+        validated = validate_navigation_planner(planner)
+        with _STORE_LOCK:
+            payload = self._read_payload()
+            ui = payload.get("ui")
+            if not isinstance(ui, dict):
+                ui = {}
+            ui["navigation_planner"] = validated
+            payload["ui"] = ui
             _atomic_write_text(self.path, json.dumps(payload) + "\n")
         return validated
 

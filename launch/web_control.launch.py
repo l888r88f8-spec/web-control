@@ -1,7 +1,8 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
@@ -25,7 +26,13 @@ def generate_launch_description():
                 name="web_control",
                 output="screen",
                 emulate_tty=True,
-                parameters=[config_file],
+                parameters=[
+                    {"use_sim_time": ParameterValue(
+                        EnvironmentVariable("USE_SIM_TIME", default_value="false"),
+                        value_type=bool,
+                    )},
+                    config_file,
+                ],
             ),
         ]
     )

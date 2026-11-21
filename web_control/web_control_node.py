@@ -87,6 +87,14 @@ try:
 except ModuleNotFoundError:
     MarkerArray = None
 
+# The perception window is read from the node that owns it, so the overlay can
+# never drift from the values its launch file supplied. Optional for the same
+# reason as the other service types: a partial install must still boot.
+try:
+    from rcl_interfaces.srv import GetParameters
+except ModuleNotFoundError:
+    GetParameters = None
+
 try:
     from lio_sam_hesai.srv import SaveMapOptions
 except ModuleNotFoundError:
@@ -121,7 +129,6 @@ from web_control.core import (
     ViewerRegistry,
     build_managed_launch_command,
     build_system_usage_payload,
-    downsample_points,
     project_points_2d,
     quaternion_from_yaw,
     validate_pose_payload,
@@ -151,6 +158,7 @@ from web_control.map_selection import (
     default_selection_path,
     validate_auto_relocalization,
     validate_map_mode,
+    validate_navigation_planner,
     validate_topic_logging_enabled,
 )
 from web_control.navigation_control import (
@@ -177,6 +185,7 @@ from web_control.recording import (
     validate_topic_selection,
 )
 from web_control.teleop import TeleopController
+from web_control.terrain import terrain_markers_to_triangles
 from web_control.tf_tree import TfTreeCache
 
 LAYER_NAMES = {
@@ -186,6 +195,9 @@ LAYER_NAMES = {
     "mapcloud",
     "mapground",
     "obstacles",
+    # Grid planner terrain cells (visualization_msgs/MarkerArray converted to
+    # per-vertex triangles).  It rides the same revision/refresh pipeline.
+    "grid_terrain",
 }
 MAPPING_LAYER_NAMES = {"global_map", "ground"}
 ACTION_STATUS_NAMES = {
@@ -1078,6 +1090,7 @@ _ALL_CLOUD_KEYS = (
     ("nav", "mapcloud"),
     ("nav", "mapground"),
     ("nav", "obstacles"),
+    ("nav", "grid_terrain"),
     ("mapping", "global_map"),
     ("mapping", "ground"),
 )
@@ -1091,6 +1104,7 @@ _CLOUD_STREAM_LAYERS = {
             "mapcloud",
             "mapground",
             "obstacles",
+            "grid_terrain",
         }
     ),
     "mapping": frozenset({"global_map", "ground"}),
@@ -1256,9 +1270,9 @@ def _layer_payload_snapshot(
 ) -> tuple[dict[str, Any], int]:
     """Read one layer atomically and return payload plus cache generation.
 
-    The projection/downsample for the legacy 2D view runs after the cache lock
-    is released; the version is captured under the same lock as the points so
-    a response body can never be cached under the wrong generation.
+    The projection for the legacy 2D view runs after the cache lock is
+    released; the version is captured under the same lock as the points so a
+    response body can never be cached under the wrong generation.
     """
     layer = normalize_layer_name(layer_name)
     now = owner.now_sec()
@@ -1273,29 +1287,37 @@ def _layer_payload_snapshot(
         generations = getattr(owner, "_cloud_generations", None) or {}
         generation = int(generations.get(key, 0))
         points_3d = data.get("points3d", [])
+        # Triangle layers carry per-vertex colours and need a mesh renderer;
+        # ordinary point clouds omit both keys and keep the existing payload.
+        format_name = data.get("format")
+        colors = data.get("colors")
     hub = getattr(owner, "cloud_hub", None)
     epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
     if mode == "3d":
         points = points_3d
     else:
-        # Legacy /api/map2d compatibility only.  Project XY from the cached
-        # 3D points on explicit request without writing a second cache.
-        points = project_points_2d(
-            downsample_points(points_3d, owner.max_2d_points)
-        )
-    return (
-        {
-            "layer": layer,
-            "status": status,
-            "frame_id": frame_id,
-            "count": count,
-            "version": version,
-            "generation": generation,
-            "epoch": epoch,
-            "points": points,
-        },
-        version,
-    )
+        # Legacy /api/map2d compatibility only.  Project every cached 3D
+        # point on explicit request without writing a second cache or cap.
+        points = project_points_2d(points_3d)
+    payload = {
+        "layer": layer,
+        "status": status,
+        "frame_id": frame_id,
+        "count": count,
+        "version": version,
+        "generation": generation,
+        "epoch": epoch,
+        "points": points,
+    }
+    if mode == "3d":
+        # Triangle layers carry per-vertex colours; ordinary point clouds omit
+        # both keys and keep the existing payload.  The legacy 2D projection is
+        # always points-only, so it never advertises a mesh format.
+        if format_name is not None:
+            payload["format"] = format_name
+        if colors is not None:
+            payload["colors"] = colors
+    return payload, version
 
 
 def _mapping_layer_payload_snapshot(
@@ -1426,6 +1448,11 @@ class WebControlNode(Node):
         self.declare_parameter("mapcloud_topic", "mapcloud")
         self.declare_parameter("mapground_topic", "mapground")
         self.declare_parameter("obstacle_topic", "/aggregated_pc")
+        # Latched MarkerArray terrain from the grid global planner.  Empty
+        # disables the subscription and leaves the grid terrain layer hidden.
+        self.declare_parameter(
+            "grid_terrain_topic", "/grid_global_planner/terrain"
+        )
         self.declare_parameter("odom_topic", "/lio_sam/localization/odometry")
         self.declare_parameter("mapping_global_map_topic", "/lio_sam/mapping/map_global")
         self.declare_parameter("mapping_ground_topic", "/lio_sam/mapping/ground_cloud_global")
@@ -1437,6 +1464,14 @@ class WebControlNode(Node):
         self.declare_parameter(
             "cancel_goal_service", "/p2p_move_base/_action/cancel_goal"
         )
+        # Bounds of the shared preprocessing/perception window are not
+        # duplicated here: they are queried from the preprocessor node at
+        # runtime, so p2p_move_base_localization.yaml stays the only source of
+        # truth. Empty service name or a zero refresh disables the overlay.
+        self.declare_parameter(
+            "perception_window_service", "/shared_cloud_preprocessor/get_parameters"
+        )
+        self.declare_parameter("perception_window_refresh_sec", 5.0)
         self.declare_parameter("save_map_service", "/lio_sam/save_map_options")
         # Absolute directory tree the recording browser may use. "/" keeps
         # mounted disks available; validation still resolves symlinks/writability.
@@ -1450,10 +1485,17 @@ class WebControlNode(Node):
         self.trajectory_topic = str(
             self.get_parameter("trajectory_topic").value
         ).strip()
-        # Legacy /api/map2d only: caps the on-request XY projection; point-cloud
-        # ingestion never builds or stores a 2D cache.
-        self.declare_parameter("max_2d_points_per_layer", 60000)
-        self.declare_parameter("max_3d_points_per_layer", 40000)
+        # Distance-parameterized tail of the same predicted trajectory, also a
+        # PoseArray. Kept as a separate source so the browser can draw it in a
+        # second colour instead of extending the planned-looking tube. Empty
+        # disables it.
+        self.declare_parameter("probe_trajectory_topic", "/best_trajectory_probe")
+        self.probe_trajectory_topic = str(
+            self.get_parameter("probe_trajectory_topic").value
+        ).strip()
+        # Point-cloud display is intentionally unlimited.  Upstream publishers
+        # own their input size; the latest-frame queue/cache eviction bounds
+        # memory without truncating received points or terrain vertices.
         # Every cloud layer decodes only while a browser displays it (within
         # cloud_demand_ttl_sec, default 2 s).  The three latched navigation
         # maps keep a 1 Hz output ceiling; idle subscriptions are released
@@ -1474,7 +1516,7 @@ class WebControlNode(Node):
         self.declare_parameter("localization_launch_args", "use_rviz:=false")
         self.declare_parameter("navigation_launch_package", "p2p_move_base")
         self.declare_parameter(
-            "navigation_launch_file", "p2p_move_base_localization.launch.py"
+            "navigation_launch_file", "p2p_move_base_navigation.launch.py"
         )
         self.declare_parameter("navigation_launch_args", "")
         self.declare_parameter("mapping_launch_package", "lio_sam_hesai")
@@ -1530,8 +1572,6 @@ class WebControlNode(Node):
         self.host = self.get_parameter("host").value
         self.port = int(self.get_parameter("port").value)
         self.map_frame = str(self.get_parameter("map_frame").value)
-        self.max_2d_points = int(self.get_parameter("max_2d_points_per_layer").value)
-        self.max_3d_points = int(self.get_parameter("max_3d_points_per_layer").value)
         self.cloud_demand_ttl = max(
             0.0, float(self.get_parameter("cloud_demand_ttl_sec").value)
         )
@@ -1695,6 +1735,11 @@ class WebControlNode(Node):
             "mapcloud": SourceCache("mapcloud", self.stale_timeout, static_source=True),
             "mapground": SourceCache("mapground", self.stale_timeout, static_source=True),
             "obstacles": SourceCache("obstacles", self.stale_timeout, static_source=False),
+            # Latched grid terrain snapshots are full replacements.  They are
+            # owner-scoped like navigation map clouds and cleared on stop.
+            "grid_terrain": SourceCache(
+                "grid_terrain", self.stale_timeout, static_source=True
+            ),
         }
         self.mapping_layers = {
             "global_map": SourceCache("mapping_global_map", self.stale_timeout, static_source=True),
@@ -1724,7 +1769,7 @@ class WebControlNode(Node):
         self.cloud_hub.refresh()
         self.cloud_worker = PointCloudIngestWorker(
             self._apply_pointcloud_result,
-            max_points=self.max_3d_points,
+            max_points=0,
             legacy_reader=self._legacy_pointcloud_reader,
             logger=self.get_logger(),
             demand_ttl_sec=self.cloud_demand_ttl,
@@ -1779,6 +1824,37 @@ class WebControlNode(Node):
             self.get_logger().warning(
                 "action_msgs CancelGoal srv is unavailable; pause and clear "
                 "requests will be rejected"
+            )
+
+        # Perception window overlay: the preprocessor declares the window on
+        # its own node, so ask it instead of copying the numbers into this file.
+        self.perception_window_names = (
+            "perception_window_size",
+            "min_obstacle_height",
+            "marking_height",
+            "robot_base_frame",
+        )
+        self.perception_window_client: Any | None = None
+        self.perception_window_future: Any | None = None
+        self.perception_window: dict[str, Any] | None = None
+        self.perception_window_stamp = 0.0
+        window_service = str(
+            self.get_parameter("perception_window_service").value or ""
+        ).strip()
+        window_refresh = float(
+            self.get_parameter("perception_window_refresh_sec").value or 0.0
+        )
+        if GetParameters is not None and window_service and window_refresh > 0.0:
+            self.perception_window_client = self.create_client(
+                GetParameters, window_service
+            )
+            self.perception_window_timer = self.create_timer(
+                window_refresh, self.perception_window_timer_callback
+            )
+        elif GetParameters is None:
+            self.get_logger().warning(
+                "rcl_interfaces GetParameters is unavailable; the perception "
+                "window overlay stays hidden"
             )
 
         self.initialpose_pub = self.create_publisher(
@@ -1900,6 +1976,18 @@ class WebControlNode(Node):
                 PoseArray,
                 self.trajectory_topic,
                 partial(self.pose_array_path_callback, self.trajectory_topic),
+                state_qos,
+            )
+        if self.probe_trajectory_topic:
+            self.paths[self.probe_trajectory_topic] = SourceCache(
+                self.probe_trajectory_topic, self.stale_timeout
+            )
+            self.create_subscription(
+                PoseArray,
+                self.probe_trajectory_topic,
+                partial(
+                    self.pose_array_path_callback, self.probe_trajectory_topic
+                ),
                 state_qos,
             )
 
@@ -2246,7 +2334,12 @@ class WebControlNode(Node):
         with self.lock:
             advance_cloud_generation(
                 self,
-                [("nav", "mapcloud"), ("nav", "mapground"), ("nav", "obstacles")],
+                [
+                    ("nav", "mapcloud"),
+                    ("nav", "mapground"),
+                    ("nav", "obstacles"),
+                    ("nav", "grid_terrain"),
+                ],
             )
             advance_state_generation(self, _all_path_state_keys(self))
             self.action_status.clear()
@@ -2256,7 +2349,7 @@ class WebControlNode(Node):
             # obstacle debug topic).  Drop them as soon as navigation stops so
             # no stale geometry survives the lifecycle.  global_map/local_map
             # are localization-owned and intentionally remain.
-            for name in ("mapcloud", "mapground", "obstacles"):
+            for name in ("mapcloud", "mapground", "obstacles", "grid_terrain"):
                 if name in self.layers:
                     self.layers[name].clear()
             self.mapground_seen = False
@@ -2416,6 +2509,34 @@ class WebControlNode(Node):
         validated = self.map_selection.save_joystick_preferences(payload)
         response = success_response("ui preferences saved", self.now_sec())
         response["joystick"] = validated
+        return response
+
+    def select_navigation_planner(self, payload: Any) -> dict[str, Any]:
+        """Persist the next-start planner; running navigation locks the choice.
+
+        The unified launch starts only the saved planner.  Refusing a change
+        while the navigation launch is alive makes it impossible for the web
+        UI to start the other planner beside a running one.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"planner"}:
+            raise ValueError("planner payload must contain only planner")
+        planner = validate_navigation_planner(payload["planner"])
+        # ``start_managed_target`` builds the launch command from the saved
+        # planner and starts the process under this same lock.  Checking the
+        # running state and saving here therefore cannot interleave with a
+        # start: either the start command sees the new planner, or the process
+        # is already marked running and this request is rejected.
+        with self.lock:
+            process = self.managed_processes.get("navigation")
+            if process is not None and process.is_running():
+                raise MapSelectionConflictError(
+                    "stop navigation before changing the planner"
+                )
+            validated = self.map_selection.save_navigation_planner(planner)
+        response = success_response(
+            f"navigation planner set to {validated}", self.now_sec()
+        )
+        response["planner"] = validated
         return response
 
     def select_map(self, payload: Any) -> dict[str, Any]:
@@ -2618,11 +2739,15 @@ class WebControlNode(Node):
         if target == "navigation":
             entry = self.require_valid_selection()
             map_root = Path(entry["global_map_path"]).parent
+            # The unified launch starts exactly this planner, while map_path
+            # keeps the existing "GlobalMap parent directory" navigation
+            # semantics.  Both values override stale launch_args entries.
+            planner = self.map_selection.load_navigation_planner()
             return build_selected_launch_command(
                 str(self.get_parameter("navigation_launch_package").value),
                 str(self.get_parameter("navigation_launch_file").value),
                 str(self.get_parameter("navigation_launch_args").value),
-                {"map_path": str(map_root)},
+                {"map_path": str(map_root), "planner": planner},
             )
         return self.managed_processes[target].command
 
@@ -2763,6 +2888,55 @@ class WebControlNode(Node):
             return
         enqueue("nav", "obstacles", msg, clear_on_empty=True)
 
+    def grid_terrain_callback(self, msg: Any) -> None:
+        """Apply one latched grid terrain snapshot as triangle vertices.
+
+        The grid planner emits a full replacement on every map update, so an
+        empty conversion clears the layer rather than leaving the old cells on
+        screen.  Every complete finite triangle is retained; conversion runs on
+        the ROS callback only for this low-rate, latched topic.
+
+        The lifecycle generation is captured before the conversion and checked
+        again before the cache is written.  A navigation stop or map change can
+        therefore not be undone by a message whose callback was already running
+        when the generation advanced.
+        """
+        key = ("nav", "grid_terrain")
+        with self.lock:
+            generations = getattr(self, "_cloud_generations", None) or {}
+            generation = int(generations.get(key, 0))
+        terrain = terrain_markers_to_triangles(
+            getattr(msg, "markers", ()) or ()
+        )
+        points = terrain["points"]
+        frame_id = str(terrain["frame_id"] or self.map_frame)
+        changed = False
+        with self.lock:
+            generations = getattr(self, "_cloud_generations", None) or {}
+            if generation != int(generations.get(key, 0)):
+                return
+            cache = self.layers.get("grid_terrain")
+            if cache is None:
+                return
+            if not points:
+                if cache.data is not None:
+                    cache.clear()
+                    changed = True
+            else:
+                cache.update(
+                    {
+                        "points3d": points,
+                        "colors": terrain["colors"],
+                        "format": "triangles",
+                    },
+                    stamp=self.now_sec(),
+                    frame_id=frame_id,
+                    count=len(points),
+                )
+                changed = True
+        if changed:
+            publish_cloud_metadata_if_available(self)
+
     def mapping_pointcloud_callback(self, layer_name: str, msg: PointCloud2) -> None:
         enqueue = getattr(self, "_enqueue_pointcloud", None)
         if enqueue is None:
@@ -2850,11 +3024,10 @@ class WebControlNode(Node):
                     publish()
             return
 
-        # Point-cloud ingestion only builds the 3D cache.  The legacy 2D view
-        # is projected lazily by layer_payload(), so callbacks never allocate
-        # or downsample a second, 2D-only point set.
-        points_3d = downsample_points(points, self.max_3d_points)
-        payload = {"points3d": [[x, y, z] for x, y, z in points_3d]}
+        # Point-cloud ingestion only builds the 3D cache and keeps every
+        # received finite point.  The legacy 2D view is projected lazily by
+        # layer_payload(), so callbacks never allocate a second 2D-only set.
+        payload = {"points3d": [[x, y, z] for x, y, z in points]}
         with self.lock:
             cache.update(
                 payload,
@@ -2879,6 +3052,12 @@ class WebControlNode(Node):
             "y": pose.position.y,
             "z": pose.position.z,
             "yaw": yaw_from_quaternion(q),
+            # Full body attitude: the perception-window outline follows the
+            # vehicle's roll and pitch as well as its heading.
+            "qx": q["x"],
+            "qy": q["y"],
+            "qz": q["z"],
+            "qw": q["w"],
             "frame_id": msg.header.frame_id,
         }
         with self.lock:
@@ -2898,6 +3077,11 @@ class WebControlNode(Node):
             "y": pose.position.y,
             "z": pose.position.z,
             "yaw": yaw_from_quaternion(q),
+            # Same attitude contract as the navigation pose.
+            "qx": q["x"],
+            "qy": q["y"],
+            "qz": q["z"],
+            "qw": q["w"],
             "frame_id": msg.header.frame_id,
         }
         with self.lock:
@@ -3087,6 +3271,80 @@ class WebControlNode(Node):
                 if not self.navigation_control.has_goal():
                     self.published_goal = None
 
+    def perception_window_timer_callback(self) -> None:
+        """Refresh the window bounds owned by the preprocessor node."""
+        client = self.perception_window_client
+        if client is None:
+            return
+        pending = self.perception_window_future
+        if pending is not None and not pending.done():
+            return
+        try:
+            ready = bool(client.service_is_ready())
+        except Exception:
+            ready = False
+        if not ready:
+            with self.lock:
+                self.perception_window = None
+                self.perception_window_stamp = self.now_sec()
+            return
+        request = GetParameters.Request()
+        request.names = list(self.perception_window_names)
+        try:
+            future = client.call_async(request)
+        except Exception:
+            with self.lock:
+                self.perception_window = None
+                self.perception_window_stamp = self.now_sec()
+            return
+        self.perception_window_future = future
+        future.add_done_callback(self.perception_window_response)
+
+    def perception_window_response(self, future: Any) -> None:
+        """Store ``{window, min_height, max_height, frame}`` from the response."""
+        window: dict[str, Any] | None = None
+        try:
+            response = future.result()
+        except Exception:
+            response = None
+        if response is not None:
+            values = list(response.values)
+            if len(values) == len(self.perception_window_names):
+                # PARAMETER_DOUBLE is 3 and PARAMETER_STRING is 4; a NOT_SET
+                # entry means the remote node never declared the parameter.
+                if (
+                    values[0].type == 3
+                    and values[1].type == 3
+                    and values[2].type == 3
+                ):
+                    size = float(values[0].double_value)
+                    low = float(values[1].double_value)
+                    high = float(values[2].double_value)
+                    frame = str(values[3].string_value or "")
+                    if (
+                        math.isfinite(size)
+                        and size > 0.0
+                        and math.isfinite(low)
+                        and math.isfinite(high)
+                        and low <= high
+                    ):
+                        window = {
+                            "window": size,
+                            "min_height": low,
+                            "max_height": high,
+                            "frame": frame or "base_link",
+                        }
+        with self.lock:
+            self.perception_window = window
+            self.perception_window_stamp = self.now_sec()
+
+    def perception_window_payload(self) -> dict[str, Any]:
+        return {
+            **(self.perception_window or {}),
+            "available": self.perception_window is not None,
+            "updated": self.perception_window_stamp,
+        }
+
     def state_payload(self) -> dict[str, Any]:
         now = self.now_sec()
         with self.lock:
@@ -3109,6 +3367,9 @@ class WebControlNode(Node):
                 # Lets the browser draw the predicted trajectory distinctly
                 # from the global planning path.
                 "trajectory_topic": getattr(self, "trajectory_topic", ""),
+                "probe_trajectory_topic": getattr(
+                    self, "probe_trajectory_topic", ""
+                ),
                 "navigation_action": {
                     **self.action_status.summary(now),
                     "data": self.action_status.data
@@ -3119,6 +3380,12 @@ class WebControlNode(Node):
                 ),
                 "viewers": self.viewers.count(now),
                 "map_frame": self.map_frame,
+                # Bounds of the preprocessor's crop window, mirrored from the
+                # node that owns them; unavailable while it is not running.
+                "perception_window": self.perception_window_payload(),
+                # Next-start global planner chosen for the unified navigation
+                # launch.  The browser disables the picker while it runs.
+                "navigation_planner": self.map_selection.load_navigation_planner(),
                 "navigation_control": self.navigation_control.snapshot(
                     self.map_selection.load()
                 ),
@@ -3488,7 +3755,6 @@ class WebControlNode(Node):
             payload["status"],
             payload["frame_id"],
             payload["count"],
-            self.max_2d_points if mode != "3d" else 0,
         )
         return cache.encode(
             ("nav", payload["layer"], mode),
@@ -4338,6 +4604,8 @@ class WebControlNode(Node):
                         self.send_json(node.resume_navigation())
                     elif self.path == "/api/navigation/clear":
                         self.send_json(node.clear_navigation())
+                    elif self.path == "/api/navigation/planner":
+                        self.send_json(node.select_navigation_planner(payload))
                     elif self.path == "/api/managed/start":
                         self.send_json(
                             node.start_managed_target(str(payload.get("target", "")))

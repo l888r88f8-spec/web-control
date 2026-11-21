@@ -8,7 +8,8 @@ web_control:
     local_map_topic: "/lio_sam/localization/local_map"   # Localization local map
     current_lidar_topic: "/lio_sam/localization/current_lidar"  # Localization current scan (map frame)
     mapcloud_topic: "mapcloud"                         # Navigation point cloud
-    mapground_topic: "/weighted_ground"                 # Goal selection ground cloud
+    mapground_topic: "/weighted_ground"                       # Navigation ground cloud
+    grid_terrain_topic: "/grid_global_planner/terrain"  # Grid planner terrain (latched MarkerArray)
     obstacle_topic: "/aggregated_pc"                    # Live navigation obstacle cloud
     odom_topic: "/lio_sam/localization/odometry"        # Navigation odometry
 
@@ -21,13 +22,19 @@ web_control:
     goal_topic: "goal_pose_3d"                  # Goal pose output
     action_status_topic: "/p2p_move_base/_action/status"  # Navigation action status
     cancel_goal_service: "/p2p_move_base/_action/cancel_goal"  # Cancel goal service
-    path_topics: "/global_path"                 # Comma-separated nav_msgs/Path topics
+    # Perception window overlay reads perception_window_size / min_obstacle_height /
+    # marking_height from that node so the 3D box cannot drift from the launch
+    # config. Empty service name or 0 refresh disables the overlay.
+    perception_window_service: "/shared_cloud_preprocessor/get_parameters"
+    perception_window_refresh_sec: 5.0  # Re-query interval for the window bounds (s)
+    path_topics: "/global_path"  # Comma-separated nav_msgs/Path topics
     trajectory_topic: "/best_trajectory"        # Predicted local trajectory (geometry_msgs/PoseArray); empty disables
+    probe_trajectory_topic: "/best_trajectory_probe"  # Distance-probe tail of the same prediction, drawn green; empty disables
 
-    # Point clouds are cached once in 3D. max_2d_points_per_layer only caps the
-    # legacy /api/map2d XY projection computed on request; no 2D cache is kept.
-    max_2d_points_per_layer: 60000        # Lazy /api/map2d output cap, not a second cache
-    max_3d_points_per_layer: 60000        # Max retained/sent 3D points per layer
+    # Point clouds are cached once in 3D and displayed without a point cap.
+    # The legacy /api/map2d XY projection is computed on request with no cap;
+    # no second 2D cache is kept.  The latest-frame queue and cache eviction
+    # bound memory without truncating received points or terrain vertices.
     cloud_demand_ttl_sec: 2.0             # Pause cloud decode after the last display request (s)
     cloud_subscription_idle_sec: 5.0      # Release idle cloud subscriptions and their decoded cache (s); 0 keeps them until exit
     stale_timeout_sec: 2.0                # Source stale timeout seconds
@@ -36,7 +43,7 @@ web_control:
     localization_launch_file: "localization_with_nonground.launch.py"  # Localization launch file
     localization_launch_args: ""                                  # Extra localization launch args
     navigation_launch_package: "p2p_move_base"                    # Navigation launch package
-    navigation_launch_file: "p2p_move_base_localization.launch.py" # Navigation launch file
+    navigation_launch_file: "p2p_move_base_navigation.launch.py" # Unified entry; planner:=original|grid is injected at start
     navigation_launch_args: ""                                    # Extra navigation launch args
     mapping_launch_package: "lio_sam_hesai"                       # Mapping launch package
     mapping_launch_file: "mapping.launch.py"                      # Mapping launch file

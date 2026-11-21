@@ -1,18 +1,12 @@
 # Hesai driver publish statistics
 
 This directory documents the canonical-driver side of the LiDAR
-"驱动发布频率" feature and keeps the standalone C++ test.  The web-control side
-is already applied.  The driver implementation is in the canonical workspace
+"驱动发布频率" feature. The driver implementation is in the canonical workspace
 `/home/robot/hesailidar_ws`.
 
 There is intentionally no patch or copied header here: the canonical driver
 workspace owns `src/utility/publish_stats_collector.hpp`, and keeping a second
 copy would drift from the implementation being built.
-
-## Contents
-
-- `publish_stats_collector_test.cc` — standalone C++17 unit test, no ROS or
-  hardware.  It is kept at this path for the driver-side verification workflow.
 
 ## Build (low priority, single job)
 
@@ -35,7 +29,7 @@ another install prefix.  Do not use `/home/robot/hunter_navigation_arm64` or
 
 ## Standalone collector test
 
-Build against the canonical driver headers:
+With a local copy of `publish_stats_collector_test.cc`, build against the canonical driver headers:
 
 ```bash
 g++ -std=c++17 -O2 -pthread \

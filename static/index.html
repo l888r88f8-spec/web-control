@@ -244,6 +244,13 @@
             <button id="navigationProcessToggle" class="start-log" data-managed-target="navigation" type="button" aria-pressed="false">Start Navigation</button>
             <button id="navigationTopicLoggingToggle" class="start-log topic-logging-toggle" data-topic-logging-toggle type="button" aria-pressed="false" disabled>开始记录话题</button>
           </div>
+          <div class="map-mode-picker">
+            <label for="navigationPlanner">全局规划器</label>
+            <select id="navigationPlanner" aria-label="全局规划器" title="导航停止后可切换" disabled>
+              <option value="original">原全局</option>
+              <option value="grid">Grid</option>
+            </select>
+          </div>
           <div class="startup-rate-row">
             <span class="rate-chip" data-diagnostics-chip="imu">IMU --</span>
             <span class="rate-chip" data-diagnostics-chip="lidar">Lidar --</span>
@@ -351,6 +358,8 @@
           <label><input type="checkbox" data-layer="mapcloud" checked> navigation map</label>
           <label><input type="checkbox" data-layer="mapground" checked> ground map</label>
           <label><input type="checkbox" data-layer="obstacles" checked> obstacles</label>
+          <label><input type="checkbox" data-layer="grid_terrain" checked> grid terrain</label>
+          <label><input type="checkbox" id="perceptionWindowLayer" checked> perception window <span id="perceptionWindowSize" class="layer-note"></span></label>
           <label><input type="checkbox" id="pathLayer" checked> planning paths</label>
           <label><input type="checkbox" id="trajectoryLayer" checked> best trajectory</label>
           <label><input type="checkbox" id="vehicleLayer" checked> vehicle</label>

@@ -65,6 +65,9 @@ const LAYERS = {
   // overlay.  No height/intensity attribute is consumed, so its colour cannot
   // be tinted away by the map cloud pipeline.
   obstacles: { color: 0xff0000, points3d: [], enabled: true, object: null, lastFetch3d: 0, pointSize: 5, opacity: 1.0, flatColor: true },
+  // Grid planner terrain is a triangle mesh with per-vertex colours from the
+  // latched MarkerArray, not a height-coloured point cloud.
+  grid_terrain: { color: 0x7ed0ff, points3d: [], colors: [], format: "triangles", enabled: true, object: null, lastFetch3d: 0 },
 };
 
 const MAPPING_LAYERS = {
@@ -86,6 +89,7 @@ const state = {
   paths: {},
   pathTopics: [],
   trajectoryTopic: "",
+  probeTrajectoryTopic: "",
   mappingOdom: null,
   mappingPath: [],
   mapSceneCleared: false,
@@ -96,6 +100,8 @@ const state = {
   mapSelectPending: false,
   localizationRunning: false,
   navigationRunning: false,
+  navigationPlanner: "original",
+  navigationPlannerPending: false,
   chassisRunning: false,
   imuRunning: false,
   lidarRunning: false,
@@ -133,6 +139,10 @@ const state = {
   showVehicle: true,
   showMappingPath: true,
   showMappingVehicle: true,
+  showPerceptionWindow: true,
+  // Mirror of the shared preprocessor's crop bounds, polled through
+  // /api/state. Null until that node answers.
+  perceptionWindow: null,
   camera: { yaw: -0.72, pitch: 0.82, distance: 58, target: new THREE.Vector3(0, 0, 0) },
   pointer: { active: false, button: 0, start: null, previous: null, selecting: false, touches: new Map(), touchStart: null },
 };
@@ -167,7 +177,8 @@ const vehicleGroup = new THREE.Group();
 const mappingLayerGroup = new THREE.Group();
 const mappingPathGroup = new THREE.Group();
 const mappingVehicleGroup = new THREE.Group();
-scene.add(layerGroup, pathGroup, markerGroup, vehicleGroup, mappingLayerGroup, mappingPathGroup, mappingVehicleGroup);
+const perceptionWindowGroup = new THREE.Group();
+scene.add(layerGroup, pathGroup, markerGroup, vehicleGroup, mappingLayerGroup, mappingPathGroup, mappingVehicleGroup, perceptionWindowGroup);
 
 scene.add(new THREE.GridHelper(120, 60, 0x8aa0b4, 0x334155));
 const axes = new THREE.AxesHelper(4);
@@ -469,9 +480,13 @@ let lastRenderWidth = 0;
 let lastRenderHeight = 0;
 
 function resizeAll() {
-  const rect = mapCanvas3d.getBoundingClientRect();
-  const width = Math.max(1, Math.round(rect.width));
-  const height = Math.max(1, Math.round(rect.height));
+  // clientWidth/clientHeight are the untransformed layout box. The viewport's
+  // fade animates a scale, so the bounding rect changes every frame even when
+  // the layout does not; measuring it would rebuild the drawing buffer for the
+  // whole fade. The compositor scales the buffer instead, which is what the
+  // transform is for.
+  const width = Math.max(1, mapCanvas3d.clientWidth);
+  const height = Math.max(1, mapCanvas3d.clientHeight);
   if (width === lastRenderWidth && height === lastRenderHeight) {
     return false;
   }
@@ -570,19 +585,28 @@ function groundIntersection(event) {
   return raycaster.ray.intersectPlane(groundPlane, hit) ? hit : null;
 }
 
-function pointCloudIntersection(event) {
-  if (!LAYERS.mapground.object || !LAYERS.mapground.enabled) return null;
+// Goal picking must use every rendered ground surface, not just the point
+// cloud: the grid planner's terrain layer is a triangle mesh.  Raycasting both
+// enabled objects and keeping the nearest hit means a click works whether the
+// operator is looking at the ground map, the grid terrain, or both.
+function goalSurfaceIntersection(event) {
   const rect = mapCanvas3d.getBoundingClientRect();
   pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointerNdc, camera);
-  const hits = raycaster.intersectObject(LAYERS.mapground.object, false);
+  const objects = [];
+  for (const name of ["mapground", "grid_terrain"]) {
+    const layer = LAYERS[name];
+    if (layer && layer.enabled && layer.object) objects.push(layer.object);
+  }
+  if (!objects.length) return null;
+  const hits = raycaster.intersectObjects(objects, false);
   return hits.length ? hits[0].point : null;
 }
 
 function selectionIntersection(event) {
   if (state.mode === "initial") return groundIntersection(event);
-  if (state.mode === "goal") return pointCloudIntersection(event);
+  if (state.mode === "goal") return goalSurfaceIntersection(event);
   return null;
 }
 
@@ -713,6 +737,46 @@ function makePointCloud(points, color, options = {}) {
   );
 }
 
+function makeTerrainMesh(points, colors, color) {
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(points.length * 3);
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const p = rosToThree(point[0], point[1], point[2]);
+    positions[index * 3] = p.x;
+    positions[index * 3 + 1] = p.y;
+    positions[index * 3 + 2] = p.z;
+  }
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  // The backend emits one RGB triple per vertex.  A partially missing colour
+  // buffer falls back to the flat layer colour instead of misaligning arrays.
+  const useVertexColors =
+    Array.isArray(colors) && points.length > 0 && colors.length === points.length;
+  if (useVertexColors) {
+    const vertexColors = new Float32Array(points.length * 3);
+    for (let index = 0; index < points.length; index += 1) {
+      const value = colors[index];
+      vertexColors[index * 3] = value[0];
+      vertexColors[index * 3 + 1] = value[1];
+      vertexColors[index * 3 + 2] = value[2];
+    }
+    geometry.setAttribute("color", new THREE.BufferAttribute(vertexColors, 3));
+  }
+  geometry.computeBoundingSphere();
+  return new THREE.Mesh(
+    geometry,
+    new THREE.MeshBasicMaterial({
+      color: useVertexColors ? 0xffffff : color,
+      vertexColors: useVertexColors,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.82,
+      depthWrite: false,
+    }),
+  );
+}
+
+
 // Point clouds and path meshes own the GPU buffers created for them.  Release
 // those resources when a refresh replaces the object.  Markers use a separate
 // ownership path because THREE r160 ArrowHelper shares its line/cone geometry
@@ -744,7 +808,10 @@ function updateLayerObject(name) {
     layerGroup.remove(layer.object);
     disposeObjectResources(layer.object);
   }
-  layer.object = makePointCloud(layer.points3d, layer.color, layer);
+  layer.object =
+    layer.format === "triangles"
+      ? makeTerrainMesh(layer.points3d, layer.colors, layer.color)
+      : makePointCloud(layer.points3d, layer.color, layer);
   layer.object.visible = layer.enabled;
   layerGroup.add(layer.object);
 }
@@ -776,13 +843,19 @@ function clearNavigationSceneState() {
 // pull the now-empty backend cache.  global_map/local_map are
 // localization-owned and stay until localization itself restarts.
 function clearNavigationLayers() {
-  ["mapcloud", "mapground", "obstacles"].forEach((name) => {
+  ["mapcloud", "mapground", "obstacles", "grid_terrain"].forEach((name) => {
     LAYERS[name].points3d = [];
+    if (Array.isArray(LAYERS[name].colors)) LAYERS[name].colors = [];
     LAYERS[name].lastFetch3d = 0;
     LAYERS[name].staticLoaded = false;
     updateLayerObject(name);
   });
-  refreshController.invalidateNavigationLayers(["mapcloud", "mapground", "obstacles"]);
+  refreshController.invalidateNavigationLayers([
+    "mapcloud",
+    "mapground",
+    "obstacles",
+    "grid_terrain",
+  ]);
 }
 
 // A real map selection/loading-mode change or localization runtime change makes
@@ -791,6 +864,7 @@ function clearNavigationLayers() {
 function invalidateNavigationMapCaches() {
   Object.keys(LAYERS).forEach((name) => {
     LAYERS[name].points3d = [];
+    if (Array.isArray(LAYERS[name].colors)) LAYERS[name].colors = [];
     LAYERS[name].lastFetch3d = 0;
     LAYERS[name].staticLoaded = false;
     updateLayerObject(name);
@@ -802,6 +876,7 @@ function clearMapSceneState() {
   if (state.mapSceneCleared) return;
   Object.keys(LAYERS).forEach((name) => {
     LAYERS[name].points3d = [];
+    if (Array.isArray(LAYERS[name].colors)) LAYERS[name].colors = [];
     LAYERS[name].lastFetch3d = 0;
     LAYERS[name].staticLoaded = false;
     updateLayerObject(name);
@@ -951,6 +1026,148 @@ function updateMappingVehicleMarker() {
   );
 }
 
+// --- Perception window overlay
+// The shared cloud preprocessor crops every scan in the robot body frame: a
+// disc of `window` metres around the body origin, between `min_height` and
+// `max_height` along the body z axis.  Those bounds are queried from that node
+// through /api/state, so this outlines the volume the running navigation stack
+// actually applies instead of a second copy of the launch-time numbers.
+const PERCEPTION_WINDOW_COLOR = 0x35c8ff;
+const PERCEPTION_WINDOW_RING_SEGMENTS = 96;
+const PERCEPTION_WINDOW_GENERATRICES = 8;
+let perceptionWindowKey = "";
+let perceptionWindowLabelKey = "";
+
+// Body-frame wire cylinder as a flat LineSegments vertex array.  Rings lie in
+// the body XY plane, which rosToThree maps to the Three.js XZ plane, so the
+// outline tilts with the vehicle once the group carries the body attitude.
+function perceptionWindowSegmentPositions(window, minHeight, maxHeight) {
+  const radius = Number(window);
+  const low = Number(minHeight);
+  const high = Number(maxHeight);
+  const positions = [];
+  for (let index = 0; index < PERCEPTION_WINDOW_RING_SEGMENTS; index += 1) {
+    const start = (index / PERCEPTION_WINDOW_RING_SEGMENTS) * Math.PI * 2;
+    const end = ((index + 1) / PERCEPTION_WINDOW_RING_SEGMENTS) * Math.PI * 2;
+    for (const height of [low, high]) {
+      positions.push(
+        Math.cos(start) * radius, height, Math.sin(start) * radius,
+        Math.cos(end) * radius, height, Math.sin(end) * radius,
+      );
+    }
+  }
+  for (let index = 0; index < PERCEPTION_WINDOW_GENERATRICES; index += 1) {
+    const angle = (index / PERCEPTION_WINDOW_GENERATRICES) * Math.PI * 2;
+    const x = Math.cos(angle) * radius;
+    const z = Math.sin(angle) * radius;
+    positions.push(x, low, z, x, high, z);
+  }
+  return positions;
+}
+
+// rosToThree maps (x, y, z) -> (x, z, -y).  That mapping is a proper rotation,
+// so the vector part of a quaternion transforms the same way: ROS yaw (about
+// z) becomes Three.js yaw (about y) and ROS pitch (about y) becomes a rotation
+// about -z.  Missing or degenerate components mean "no attitude": the caller
+// falls back to the yaw-only overlay.
+function rosPoseQuaternion(pose) {
+  if (!pose || typeof pose !== "object") return null;
+  const qx = Number(pose.qx);
+  const qy = Number(pose.qy);
+  const qz = Number(pose.qz);
+  const qw = Number(pose.qw);
+  if (![qx, qy, qz, qw].every(Number.isFinite)) return null;
+  const norm = Math.hypot(qx, qy, qz, qw);
+  if (!(norm > 1e-6)) return null;
+  return { x: qx / norm, y: qz / norm, z: -qy / norm, w: qw / norm };
+}
+
+function clearPerceptionWindowGeometry() {
+  perceptionWindowGroup.traverse((child) => {
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      materials.forEach((material) => material.dispose());
+    }
+  });
+  perceptionWindowGroup.clear();
+  perceptionWindowKey = "";
+}
+
+function buildPerceptionWindowGeometry(layer) {
+  const key = `${layer.window}|${layer.min_height}|${layer.max_height}`;
+  if (key === perceptionWindowKey) return;
+  clearPerceptionWindowGeometry();
+  perceptionWindowKey = key;
+  const positions = perceptionWindowSegmentPositions(
+    layer.window,
+    layer.min_height,
+    layer.max_height,
+  );
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  const material = new THREE.LineDashedMaterial({
+    color: PERCEPTION_WINDOW_COLOR,
+    dashSize: 0.8,
+    gapSize: 0.5,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false,
+  });
+  const edges = new THREE.LineSegments(geometry, material);
+  edges.computeLineDistances();
+  edges.name = "perception_window_edges";
+  perceptionWindowGroup.add(edges);
+}
+
+function updatePerceptionWindowLabel(layer) {
+  const label = document.getElementById("perceptionWindowSize");
+  if (!label) return;
+  if (!layer || !layer.available || !Number.isFinite(layer.window)) {
+    if (perceptionWindowLabelKey !== "") {
+      perceptionWindowLabelKey = "";
+      label.textContent = "";
+    }
+    return;
+  }
+  // Pose updates call this at sensor rate; only touch the DOM on a real change.
+  const key = `${layer.window}|${layer.min_height}|${layer.max_height}`;
+  if (key === perceptionWindowLabelKey) return;
+  perceptionWindowLabelKey = key;
+  label.textContent =
+    `r ${layer.window.toFixed(1)} m · z ${layer.min_height.toFixed(2)}…${layer.max_height.toFixed(2)} m`;
+}
+
+function updatePerceptionWindow() {
+  const layer = state.perceptionWindow;
+  updatePerceptionWindowLabel(layer);
+  const pose = state.odom && state.odom.pose ? state.odom.pose : null;
+  const visible = Boolean(
+    state.showPerceptionWindow &&
+    layer && layer.available && Number.isFinite(layer.window) &&
+    pose &&
+    state.view === "3d"
+  );
+  if (!visible) {
+    perceptionWindowGroup.visible = false;
+    return;
+  }
+  buildPerceptionWindowGeometry(layer);
+  perceptionWindowGroup.position.copy(rosToThree(pose.x, pose.y, pose.z || 0));
+  const quaternion = rosPoseQuaternion(pose);
+  if (quaternion) {
+    // The crop plane is perpendicular to the body z axis, so the outline must
+    // follow roll and pitch too, not just the heading.
+    perceptionWindowGroup.quaternion.set(
+      quaternion.x, quaternion.y, quaternion.z, quaternion.w,
+    );
+  } else {
+    perceptionWindowGroup.rotation.set(0, pose.yaw || 0, 0);
+  }
+  perceptionWindowGroup.visible = true;
+}
+// --- End perception window overlay
+
 function pathPointToThree(point) {
   const z = point.length > 2 && Number.isFinite(point[2]) ? point[2] : 0;
   return rosToThree(point[0], point[1], z + 0.08);
@@ -962,9 +1179,22 @@ function updatePaths() {
   // The predicted local trajectory shares this pipeline but has its own
   // checkbox and is drawn amber so it stays distinguishable from the blue
   // global planning path.
+  // Per-topic colours so the local reference path is distinguishable from the
+  // global one; both are nav_msgs/Path and would otherwise share one blue.
+  const pathColors = {
+    "/global_path": 0x0a84ff,
+    "/debug/local_pruned_path": 0xff2d95,
+  };
   const predictedColor = 0xff9f0a;
+  // The distance probe is the same prediction continued past the time rollout,
+  // so it shares the trajectory checkbox but is drawn green to show that it is
+  // a collision probe rather than planned travel.
+  const probeColor = 0x30d158;
   Object.entries(state.paths).forEach(([topic, path]) => {
-    const isPredicted = Boolean(
+    const isProbe = Boolean(
+      state.probeTrajectoryTopic && topic === state.probeTrajectoryTopic,
+    );
+    const isPredicted = isProbe || Boolean(
       state.trajectoryTopic && topic === state.trajectoryTopic,
     );
     if (isPredicted ? !state.showTrajectory : !state.showPaths) return;
@@ -972,13 +1202,18 @@ function updatePaths() {
     const points = path.map((point) => {
       const p = pathPointToThree(point);
       // Lift the predicted tube slightly so an overlap with the global path
-      // does not z-fight.
-      if (isPredicted) p.y += 0.04;
+      // does not z-fight. The probe sits just above it so the joint is visible.
+      if (isProbe) p.y += 0.06;
+      else if (isPredicted) p.y += 0.04;
       return p;
     });
     const pathCurve = new THREE.CatmullRomCurve3(points);
     const geometry = new THREE.TubeGeometry(pathCurve, Math.max(2, points.length * 2), 0.16, 8, false);
-    const color = isPredicted ? predictedColor : 0x0a84ff;
+    const color = isProbe
+      ? probeColor
+      : isPredicted
+        ? predictedColor
+        : pathColors[topic] || 0x0a84ff;
     const line = new THREE.Mesh(
       geometry,
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }),
@@ -1926,6 +2161,10 @@ function createRefreshController({
         }
         const points = Array.isArray(data.points) ? data.points : [];
         current.points3d = points;
+        // Triangle layers carry per-vertex colours; ordinary point clouds
+        // leave both fields unset and keep the existing renderer.
+        current.colors = Array.isArray(data.colors) ? data.colors : [];
+        current.format = data.format === "triangles" ? "triangles" : "points";
         current.lastFetch3d = now();
         if (task.group === "nav" && STATIC_NAVIGATION_LAYERS.has(task.name)) {
           current.staticLoaded = points.length > 0;
@@ -2059,6 +2298,12 @@ function createRefreshController({
       pose && typeof pose === "object" ? numeric(pose.z) : null,
       pose && typeof pose === "object" ? numeric(pose.yaw) : null,
       pose && typeof pose === "object" ? numeric(pose.stamp) : null,
+      // Body attitude drives the tilted perception-window outline, so a
+      // corrected orientation must count as a new pose at one version.
+      pose && typeof pose === "object" ? numeric(pose.qx) : null,
+      pose && typeof pose === "object" ? numeric(pose.qy) : null,
+      pose && typeof pose === "object" ? numeric(pose.qz) : null,
+      pose && typeof pose === "object" ? numeric(pose.qw) : null,
     ]);
   }
 
@@ -2117,8 +2362,20 @@ function createRefreshController({
     poseApplied[kind] = Math.max(poseApplied[kind], version);
     poseSignature[kind] = signature;
     poseCleared[kind] = false;
+    // The quaternion is optional: servers that only publish yaw keep the
+    // horizontal fallback outline instead of failing the whole pose.
+    const attitude = {};
+    for (const [key, value] of [
+      ["qx", pose.qx], ["qy", pose.qy], ["qz", pose.qz], ["qw", pose.qw],
+    ]) {
+      const parsed = numeric(value);
+      if (parsed !== null) attitude[key] = parsed;
+    }
+    const hasAttitude = ["qx", "qy", "qz", "qw"].every(
+      (key) => attitude[key] !== undefined,
+    );
     applyPose(kind, {
-      pose: { x, y, z, yaw },
+      pose: { x, y, z, yaw, ...(hasAttitude ? attitude : {}) },
       status: entry.status,
       frame_id: entry.frame_id,
       age: numeric(pose.age),
@@ -2528,6 +2785,8 @@ const refreshController = createRefreshController({
   pathsVisible: (topic) => {
     const isPredicted = Boolean(
       state.trajectoryTopic && topic === state.trajectoryTopic,
+    ) || Boolean(
+      state.probeTrajectoryTopic && topic === state.probeTrajectoryTopic,
     );
     const enabled = isPredicted ? state.showTrajectory : state.showPaths;
     return enabled && !state.hideCompletedPaths;
@@ -2544,6 +2803,8 @@ const refreshController = createRefreshController({
   applyPath(topic, points) {
     const isPredicted = Boolean(
       state.trajectoryTopic && topic === state.trajectoryTopic,
+    ) || Boolean(
+      state.probeTrajectoryTopic && topic === state.probeTrajectoryTopic,
     );
     const enabled = isPredicted ? state.showTrajectory : state.showPaths;
     if (!enabled || state.hideCompletedPaths || state.view !== "3d") return;
@@ -2581,7 +2842,8 @@ function desiredCloudStream() {
     // Like a layer checkbox, disabling the predicted trajectory removes it
     // from the stream so no path metadata or snapshot is requested.
     const paths = topics.filter((topic) =>
-      state.trajectoryTopic && topic === state.trajectoryTopic
+      (state.trajectoryTopic && topic === state.trajectoryTopic) ||
+      (state.probeTrajectoryTopic && topic === state.probeTrajectoryTopic)
         ? state.showTrajectory
         : true,
     );
@@ -2709,6 +2971,7 @@ function updateNavigationPose(odom) {
   rememberPoseAge("nav", state.odom);
   document.getElementById("odomAge").textContent = poseAgeText("nav");
   updateVehicleMarker();
+  updatePerceptionWindow();
 }
 
 function updateMappingPose(odom) {
@@ -2732,7 +2995,14 @@ function updateStatus(data) {
   // Pose is applied only from the SSE snapshot/event.  A slower /api/state poll
   // must never overwrite a newer pushed pose.
   state.navigationAction = data.navigation_action || null;
+  state.perceptionWindow = data.perception_window || null;
+  updatePerceptionWindow();
   updateNavigationReadiness(data.navigation_ready);
+  if (!state.navigationPlannerPending) {
+    state.navigationPlanner =
+      data.navigation_planner === "grid" ? "grid" : "original";
+  }
+  updateNavigationPlannerPicker();
   updateTargetPoseDisplay();
   maybeClearGoalFromActionStatus();
   updateNavigationControls(data.navigation_control);
@@ -2749,6 +3019,10 @@ function updateStatus(data) {
   // by metadata revisions.  A topic-list change only reconnects the stream.
   state.trajectoryTopic =
     typeof data.trajectory_topic === "string" ? data.trajectory_topic : "";
+  state.probeTrajectoryTopic =
+    typeof data.probe_trajectory_topic === "string"
+      ? data.probe_trajectory_topic
+      : "";
   const topics = Object.keys(data.paths || {});
   const topicsChanged = topics.join("|") !== (state.pathTopics || []).join("|");
   state.pathTopics = topics;
@@ -3445,6 +3719,43 @@ async function selectMap(name) {
   }
 }
 
+async function selectNavigationPlanner(planner) {
+  const select = document.getElementById("navigationPlanner");
+  if (planner !== "original" && planner !== "grid") {
+    updateNavigationPlannerPicker();
+    return;
+  }
+  // The server refuses this too; checking here avoids a round trip and keeps
+  // the displayed value authoritative while navigation is running.
+  if (
+    state.navigationPlannerPending ||
+    state.navigationRunning ||
+    Boolean(state.managedProcessPending.navigation)
+  ) {
+    updateNavigationPlannerPicker();
+    return;
+  }
+  if (planner === state.navigationPlanner) {
+    updateNavigationPlannerPicker();
+    return;
+  }
+  state.navigationPlannerPending = true;
+  updateNavigationPlannerPicker();
+  try {
+    const response = await postJson("/api/navigation/planner", { planner });
+    state.navigationPlanner =
+      response.planner === "grid" ? "grid" : "original";
+    setManagedActionStatus(
+      `${response.message} @ ${new Date(response.stamp * 1000).toLocaleTimeString()}`,
+    );
+  } catch (error) {
+    setManagedActionStatus(`Planner change failed: ${error.message}`);
+  } finally {
+    state.navigationPlannerPending = false;
+    updateNavigationPlannerPicker();
+  }
+}
+
 async function selectMapMode(mode) {
   const modeSelect = document.getElementById("mapMode");
   const status = document.getElementById("mapStatus");
@@ -3790,6 +4101,7 @@ function setManagedProcessRunning(target, running) {
     clearNavigationSceneState();
     clearNavigationLayers();
   }
+  if (target === "navigation") updateNavigationPlannerPicker();
 }
 
 function managedProcessRunning(target) {
@@ -3800,6 +4112,22 @@ function managedProcessRunning(target) {
   if (target === "lidar") return state.lidarRunning;
   if (target === "mapping") return state.mappingRunning;
   return false;
+}
+
+function updateNavigationPlannerPicker() {
+  const select = document.getElementById("navigationPlanner");
+  if (!select) return;
+  select.value = state.navigationPlanner;
+  // The backend refuses a change while the navigation launch is alive, so
+  // disable the picker here as well; that keeps two planners from being
+  // selected for the same start.
+  select.disabled =
+    state.navigationPlannerPending ||
+    state.navigationRunning ||
+    Boolean(state.managedProcessPending.navigation);
+  select.title = select.disabled
+    ? "停止导航后可切换全局规划器"
+    : "导航停止后可切换";
 }
 
 function managedProcessButtons(target) {
@@ -3832,6 +4160,7 @@ async function toggleManagedTarget(target) {
   const nextRunning = !running;
   state.managedProcessPending[target] = running ? "stop" : "start";
   updateManagedProcessButton(target);
+  if (target === "navigation") updateNavigationPlannerPicker();
   try {
     const succeeded = running ? await stopManagedTarget(target) : await startManagedTarget(target);
     if (succeeded) {
@@ -3843,6 +4172,7 @@ async function toggleManagedTarget(target) {
   } finally {
     state.managedProcessPending[target] = null;
     updateManagedProcessButton(target);
+    if (target === "navigation") updateNavigationPlannerPicker();
   }
 }
 
@@ -4889,17 +5219,29 @@ function syncSidebarToggle(toggle) {
   );
 }
 
-function applyEffectiveSidebar() {
+// Applies the effective sidebar collapse. options.snapGrid skips the CSS grid
+// slide for this one change: a live 3D view re-syncs its drawing buffer on every
+// frame of the slide (resizeAll -> renderer.setSize), which stalls weak GPUs
+// once the scene holds six figures of points.
+function applyEffectiveSidebar(options = {}) {
   const effective = sidebarState.collapsed || state.view === "system";
   const app = document.querySelector(".app");
   const panel = document.getElementById("controlPanel");
   const toggle = document.getElementById("sidebarToggle");
   if (appliedEffectiveCollapse === effective) {
     syncSidebarToggle(toggle);
-    return false;
+    return { changed: false, snapped: false };
   }
+  const snapped = Boolean(options.snapGrid) && Boolean(app) && !glassMotionReduced();
+  if (snapped) app.classList.add("grid-snap");
   appliedEffectiveCollapse = effective;
   if (app) app.classList.toggle("sidebar-collapsed", effective);
+  if (snapped) {
+    // Commit the snapped columns before restoring the transition, otherwise the
+    // browser would interpolate from the previous width.
+    void app.offsetWidth;
+    app.classList.remove("grid-snap");
+  }
   if (panel) {
     panel.inert = effective;
     panel.setAttribute("aria-hidden", String(effective));
@@ -4913,12 +5255,13 @@ function applyEffectiveSidebar() {
         : toggle;
     if (focusTarget) focusTarget.focus();
   }
-  return true;
+  return { changed: true, snapped };
 }
 
 function setSidebarCollapsed(collapsed) {
   sidebarState.collapsed = Boolean(collapsed);
-  if (applyEffectiveSidebar()) beginLayoutTransition({ gridChanged: true });
+  // Deliberate toggle: keep the slide, only tab switches snap.
+  if (applyEffectiveSidebar().changed) beginLayoutTransition({ gridChanged: true });
 }
 
 function toggleSidebar() {
@@ -4969,14 +5312,17 @@ function beginLayoutTransition(options = {}) {
   // a joystick reveal could measure mid-slide. settleLayoutTransition clears it.
   const existingGridInFlight =
     pageTransition.active && pageTransition.expectsGrid;
+  const snapped = Boolean(options.snapped) && !glassMotionReduced();
   pageTransition.token += 1;
   const token = pageTransition.token;
   pageTransition.active = true;
   pageTransition.pendingFlush = true;
+  // A snapped grid never moves, so nothing needs per-frame viewport sync; the
+  // next-frame settle resizes the drawing buffer once.
   pageTransition.expectsGrid =
-    existingGridInFlight || Boolean(options.gridChanged);
+    !snapped && (existingGridInFlight || Boolean(options.gridChanged));
   cancelLayoutFallback();
-  if (glassMotionReduced()) {
+  if (snapped || glassMotionReduced()) {
     pageTransition.fallbackFrameId = requestAnimationFrame(
       () => settleLayoutTransition(token),
     );
@@ -5194,16 +5540,21 @@ function setTab(tab) {
   mappingLayerGroup.visible = tab === "mapping";
   mappingPathGroup.visible = tab === "mapping";
   mappingVehicleGroup.visible = tab === "mapping";
+  updatePerceptionWindow();
 
   const viewChanged =
     view3d.classList.contains("active") !== previous3dActive ||
     viewSystem.classList.contains("active") !== previousSystemActive;
   const panelChanged = document.querySelector(".panel-view.active") !== previousPanel;
-  const sidebarChanged = applyEffectiveSidebar();
+  // Entering or leaving System changes the sidebar width. Snap that one grid
+  // change instead of sliding it: the resumed 3D render loop would otherwise
+  // rebuild the drawing buffer every frame of the 650ms slide.
+  const sidebar = applyEffectiveSidebar({ snapGrid: true });
+  const sidebarChanged = sidebar.changed;
 
   if (viewChanged || panelChanged || sidebarChanged) {
     if (previousTab !== tab) markGlassDrop(viewTabs);
-    beginLayoutTransition({ gridChanged: sidebarChanged });
+    beginLayoutTransition({ gridChanged: sidebarChanged, snapped: sidebar.snapped });
   }
 
   // Defer whenever the grid is still moving: either this click changed the
@@ -5456,6 +5807,10 @@ function attachEvents() {
     state.showVehicle = event.target.checked;
     updateVehicleMarker();
   });
+  document.getElementById("perceptionWindowLayer").addEventListener("change", (event) => {
+    state.showPerceptionWindow = event.target.checked;
+    updatePerceptionWindow();
+  });
   document.querySelectorAll("input[data-mapping-layer]").forEach((input) => {
     input.addEventListener("change", () => {
       MAPPING_LAYERS[input.dataset.mappingLayer].enabled = input.checked;
@@ -5491,6 +5846,7 @@ function attachEvents() {
   );
   document.getElementById("mapSelect").addEventListener("change", (event) => selectMap(event.target.value));
   document.getElementById("mapMode").addEventListener("change", (event) => selectMapMode(event.target.value));
+  document.getElementById("navigationPlanner").addEventListener("change", (event) => selectNavigationPlanner(event.target.value));
   document.getElementById("autoRelocalizationToggle").addEventListener("click", () => toggleAutoRelocalization());
   document.getElementById("refreshMaps").addEventListener("click", () => refreshMaps(true));
   document.getElementById("sidebarToggle").addEventListener("click", toggleSidebar);
