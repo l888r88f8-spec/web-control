@@ -36,7 +36,7 @@ web_control:
     # no second 2D cache is kept.  The latest-frame queue and cache eviction
     # bound memory without truncating received points or terrain vertices.
     cloud_demand_ttl_sec: 2.0             # Pause cloud decode after the last display request (s)
-    cloud_subscription_idle_sec: 5.0      # Release idle cloud subscriptions and their decoded cache (s); 0 keeps them until exit
+    cloud_subscription_idle_sec: 5.0      # Release idle cloud subscriptions, keeping decoded caches (s); 0 keeps them until exit
     stale_timeout_sec: 2.0                # Source stale timeout seconds
 
     localization_launch_package: "lio_sam_hesai"                  # Localization launch package

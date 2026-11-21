@@ -24,12 +24,16 @@ class CloudSubscriptionPlan:
     # "live" = BEST_EFFORT/VOLATILE (next publisher sample).
     qos: str
     callback: str
+    # One-shot map topics carry no idle traffic once their sample arrived, so
+    # releasing and re-subscribing them only costs a replay and a decode.
+    # Their subscription and decoded cache stay resident for the process.
+    release_when_idle: bool = True
 
 
 CLOUD_SUBSCRIPTION_PLANS: tuple[CloudSubscriptionPlan, ...] = (
     CloudSubscriptionPlan(
         "nav", "global_map", "global_map_topic", "PointCloud2", "latched",
-        "pointcloud_callback",
+        "pointcloud_callback", release_when_idle=False,
     ),
     CloudSubscriptionPlan(
         "nav", "local_map", "local_map_topic", "PointCloud2", "latched",
@@ -41,11 +45,11 @@ CLOUD_SUBSCRIPTION_PLANS: tuple[CloudSubscriptionPlan, ...] = (
     ),
     CloudSubscriptionPlan(
         "nav", "mapcloud", "mapcloud_topic", "PointCloud2", "latched",
-        "pointcloud_callback",
+        "pointcloud_callback", release_when_idle=False,
     ),
     CloudSubscriptionPlan(
         "nav", "mapground", "mapground_topic", "PointCloud2", "latched",
-        "pointcloud_callback",
+        "pointcloud_callback", release_when_idle=False,
     ),
     CloudSubscriptionPlan(
         "nav", "obstacles", "obstacle_topic", "PointCloud2", "live",
@@ -106,6 +110,7 @@ def reconcile(
         key
         for key in subscribed_set
         if key in PLAN_BY_KEY
+        and PLAN_BY_KEY[key].release_when_idle
         and (key not in last_demand or now - last_demand[key] > release_age)
     )
     return create, release

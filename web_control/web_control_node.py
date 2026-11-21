@@ -2196,30 +2196,30 @@ class WebControlNode(Node):
         return True
 
     def release_cloud_subscription(self, key: tuple[str, str]) -> bool:
-        """Destroy one idle subscription and release everything it produced."""
+        """Destroy one idle subscription, keeping its decoded cache.
+
+        The decoded points and their revision stay resident so returning to
+        the page paints immediately instead of waiting for a re-subscription,
+        replay and decode.  Only the live subscription, its pending raw frame
+        and the demand stamp are dropped; publishing a ``waiting`` revision
+        here would clear the browser geometry and defeat that head start.
+        """
         subscription = self.cloud_subscriptions.pop(key, None)
         self._cloud_subscription_failures.pop(key, None)
+        if subscription is None:
+            return False
         destroy = getattr(self, "destroy_subscription", None)
-        if subscription is not None and destroy is not None:
+        if destroy is not None:
             try:
                 destroy(subscription)
             except Exception as exc:
                 self.get_logger().warning(
                     f"cloud unsubscribe {key[0]}/{key[1]} failed: {exc}"
                 )
-        # Reject an in-flight decode, drop the pending raw frame and its
-        # serialized bodies, then release the decoded points themselves.
-        advance_cloud_generation(self, [key])
-        released = subscription is not None
-        with self.lock:
-            caches = self.layers if key[0] == "nav" else self.mapping_layers
-            cache = caches.get(key[1])
-            if cache is not None and cache.data is not None:
-                cache.clear()
-                released = True
-        if released:
-            publish_cloud_metadata_if_available(self)
-        return subscription is not None
+        worker = getattr(self, "cloud_worker", None)
+        if worker is not None:
+            worker.invalidate([key])
+        return True
 
     def release_all_cloud_subscriptions(self) -> None:
         """Destroy every cloud subscription without publishing revisions.
