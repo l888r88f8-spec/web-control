@@ -14,7 +14,7 @@ real world:
 No frame is ever dropped because a well-known root (such as ``map``) is
 missing. Edges that cannot be placed in the forest are returned in a separate
 ``detached`` list so the browser can still show them with a reason. Everything
-here is pure Python so it can be imported and tested without ROS.
+here is pure Python and imports no ROS modules.
 """
 
 from __future__ import annotations

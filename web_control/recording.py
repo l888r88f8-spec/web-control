@@ -120,10 +120,13 @@ def validate_topic_selection(
     return topics
 
 
-def browse_recording_directories(
-    path: str, root: str | os.PathLike[str]
+def browse_directories(
+    path: str,
+    root: str | os.PathLike[str],
+    *,
+    scope: str = "directory",
 ) -> dict[str, Any]:
-    """Return immediate subdirectories for the backend directory browser."""
+    """Return immediate subdirectories for a backend directory browser."""
     root_path = _root_path(root)
     if not isinstance(path, str):
         raise ValueError("browse path must be a string")
@@ -139,7 +142,7 @@ def browse_recording_directories(
     try:
         current.relative_to(root_path)
     except ValueError as exc:
-        raise ValueError("browse path is outside the allowed recording root") from exc
+        raise ValueError(f"browse path is outside the allowed {scope} root") from exc
     try:
         children = list(current.iterdir())
     except PermissionError as exc:
@@ -166,6 +169,13 @@ def browse_recording_directories(
         "writable": os.access(current, os.W_OK),
         "entries": entries,
     }
+
+
+def browse_recording_directories(
+    path: str, root: str | os.PathLike[str]
+) -> dict[str, Any]:
+    """Recording-specific wrapper around the shared directory browser."""
+    return browse_directories(path, root, scope="recording")
 
 
 class RosbagRecorder:

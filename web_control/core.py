@@ -195,68 +195,125 @@ def runtime_home_dir() -> str:
     return os.path.expanduser("~")
 
 
-def resolve_save_map_destination(destination: str, home: str) -> str:
-    """Resolve a web save-map destination to an absolute path under ``home``.
+def _path_within(root: str, path: str) -> bool:
+    root_real = os.path.realpath(root)
+    path_real = os.path.realpath(path)
+    try:
+        return os.path.commonpath((root_real, path_real)) == root_real
+    except ValueError:
+        return False
 
-    The web dialog sends a path starting with ``/`` that is relative to the web
-    node user's home directory (``/map`` or ``/map/site``), so the browser can
-    never pick an arbitrary robot directory. ``..`` components are rejected
-    instead of normalised, keeping the resolved path inside ``home``, and an
-    already home-prefixed destination (``/home/robot/map`` when the home is
-    ``/home/robot``) is rejected so the prefix is not applied twice.
+
+def _check_save_map_destination_filesystem(path: str) -> None:
+    """Reject dangerous destinations the save service would also refuse."""
+    if os.path.islink(path):
+        raise ValueError("destination must not be a symlink")
+    if os.path.exists(path):
+        if not os.path.isdir(path):
+            raise ValueError("destination exists and is not a directory")
+        return
+
+    # The map service creates missing directories, so a new destination is
+    # valid as long as its nearest existing ancestor is a directory. This keeps
+    # the picker's "parent + new folder" flow working without allowing a path
+    # through an existing file.
+    ancestor = path
+    while ancestor and not os.path.exists(ancestor):
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+    if ancestor and os.path.exists(ancestor) and not os.path.isdir(ancestor):
+        raise ValueError("destination parent is not a directory")
+
+
+def resolve_save_map_destination(
+    destination: str, home: str, *, root: str | None = None
+) -> str:
+    """Resolve a web save-map destination to the exact path sent to the service.
+
+    Absolute destinations are forwarded as given (apart from trimming
+    surrounding whitespace and normalising redundant separators). They are
+    never prefixed with ``home``: ``/map`` and ``/map/site`` are real absolute
+    paths, not home-relative pseudo-paths. ``home`` is used only to reject
+    saving into the home directory itself.
+
+    ``..`` components and NUL bytes are rejected instead of normalised. The
+    filesystem root and the home directory cannot be overwritten. When
+    ``root`` is supplied it is the same directory tree used by the directory
+    picker; a destination resolving outside it is rejected, as is a symlink
+    destination.
     """
     if not isinstance(destination, str):
         raise ValueError("destination must be a string path")
+    if "\x00" in destination:
+        raise ValueError("destination must not contain NUL bytes")
     destination = destination.strip()
     if not destination:
         raise ValueError("destination is required")
     if not destination.startswith("/"):
-        raise ValueError(
-            "destination must start with / and name a path under the home directory"
-        )
+        raise ValueError("destination must be an absolute path")
 
-    parts = PurePosixPath(destination).parts
-    if ".." in parts:
+    if ".." in PurePosixPath(destination).parts:
         raise ValueError("destination must not contain '..' path components")
-    relative_parts = parts[1:]
-    if not relative_parts:
+
+    resolved = os.path.normpath(destination)
+    if not resolved.strip("/"):
         raise ValueError("destination must not be the filesystem root /")
 
     if not isinstance(home, str) or not home.strip():
         raise ValueError("home directory is required")
-    home = home.strip()
+    home = os.path.normpath(home.strip())
     if not os.path.isabs(home):
         raise ValueError("home directory must be an absolute path")
 
-    home_path = PurePosixPath(home)
-    destination_path = PurePosixPath(destination)
-    if home_path != PurePosixPath("/") and (
-        destination_path == home_path or home_path in destination_path.parents
-    ):
+    _check_save_map_destination_filesystem(resolved)
+
+    if resolved == home or os.path.realpath(resolved) == os.path.realpath(home):
         raise ValueError(
-            "destination must be relative to the home directory; "
-            f"remove the {home} prefix (for example /map instead of {home}/map)"
+            "destination must not be the home directory; choose a subdirectory"
         )
 
-    return os.path.join(home, *relative_parts)
+    if root is not None:
+        if not isinstance(root, (str, os.PathLike)):
+            raise ValueError("save root must be an absolute directory")
+        root = os.fspath(root).strip()
+        if not root or not os.path.isabs(root):
+            raise ValueError("save root must be an absolute directory")
+        if not _path_within(root, resolved):
+            raise ValueError("destination is outside the allowed save root")
+
+    return resolved
 
 
 def validate_save_map_payload(
-    payload: dict[str, Any], *, home: str | None = None
+    payload: dict[str, Any],
+    *,
+    home: str | None = None,
+    root: str | None = None,
 ) -> dict[str, Any]:
     """Validate a web save-map payload against the SaveMapOptions service.
 
-    The web destination is relative to the web node user's home directory
-    (``/map``, ``/map/site``); it is resolved to an absolute path under ``home``
-    (default: the runtime user's home) before the service sees it. Omitted
-    toggles use the web dialog defaults (both artifacts enabled), and explicit
-    resolution values are forwarded unchanged.
+    Absolute destinations are forwarded exactly as selected and are never
+    rewritten under ``home`` (default: the runtime user's home), which only
+    prevents saving into the home directory itself. ``root`` optionally limits
+    the destination to the same tree the map directory picker can browse.
+    Omitted toggles use the web dialog defaults (both artifacts enabled) and
+    omitted resolutions inherit the mapping configuration. DUFOMap export is
+    controlled by the mapping config, not by this payload.
     """
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
+    for key in ("use_dufomap", "dufomap_mode"):
+        if key in payload:
+            raise ValueError(
+                f"{key} is no longer supported; DUFOMap is controlled by "
+                "the mapping config dufomap.enable"
+            )
     destination = resolve_save_map_destination(
         payload.get("destination"),
         runtime_home_dir() if home is None else home,
+        root=root,
     )
     return {
         "destination": destination,

@@ -7,6 +7,7 @@ import mimetypes
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -23,7 +24,12 @@ try:
         PackageNotFoundError,
         get_package_share_directory,
     )
-    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+    from geometry_msgs.msg import (
+        PoseArray,
+        PoseStamped,
+        PoseWithCovarianceStamped,
+        Twist,
+    )
     from nav_msgs.msg import Odometry, Path as PathMsg
     from rclpy.node import Node
     from rclpy.qos import (
@@ -40,6 +46,7 @@ except ModuleNotFoundError:
     PackageNotFoundError = Exception
     get_package_share_directory = None
     PoseStamped = None
+    PoseArray = None
     Twist = None
     PoseWithCovarianceStamped = None
     Odometry = None
@@ -60,10 +67,25 @@ try:
 except ModuleNotFoundError:
     Imu = None
 
+# LiDAR publish statistics use the standard diagnostic_msgs interface.  Keep
+# the import optional so an installation without it still starts the web node
+# in its honest publisher-only mode.
+try:
+    from diagnostic_msgs.msg import DiagnosticArray
+except ModuleNotFoundError:
+    DiagnosticArray = None
+
 try:
     from action_msgs.srv import CancelGoal
 except ModuleNotFoundError:
     CancelGoal = None
+
+# The grid planner's latched terrain display.  Keep this optional so a partial
+# installation without visualization_msgs still starts the rest of the web UI.
+try:
+    from visualization_msgs.msg import MarkerArray
+except ModuleNotFoundError:
+    MarkerArray = None
 
 try:
     from lio_sam_hesai.srv import SaveMapOptions
@@ -82,6 +104,7 @@ from web_control.diagnostics import (
     DIAGNOSTICS_TARGET,
     DiagnosticsLogWriter,
     DiagnosticsService,
+    LidarPublishStatsMonitor,
     MotionTracker,
     TopicRateMonitor,
     DEFAULT_TOPIC_SPECS,
@@ -113,14 +136,14 @@ from web_control.log_store import (
 from web_control.pointcloud_runtime import (
     DEFAULT_DEMAND_TTL_SEC,
     CloudResponseCache,
+    CloudRevisionHub,
     PointCloudIngestWorker,
     parse_pointcloud2,
     utf8_json_bytes,
 )
-from web_control.resource_diagnostics import (
-    DEFAULT_SAMPLE_PERIOD_SEC,
-    ResourceLoggingWorker,
-    ResourceSampler,
+from web_control.cloud_subscriptions import (
+    PLAN_BY_KEY,
+    reconcile as reconcile_cloud_demand,
 )
 from web_control.map_catalog import MapCatalog
 from web_control.map_selection import (
@@ -148,6 +171,7 @@ from web_control.recording import (
     RecordingConflictError,
     RecordingUnavailableError,
     RosbagRecorder,
+    browse_directories,
     browse_recording_directories,
     resolve_recording_output,
     validate_topic_selection,
@@ -155,7 +179,14 @@ from web_control.recording import (
 from web_control.teleop import TeleopController
 from web_control.tf_tree import TfTreeCache
 
-LAYER_NAMES = {"global_map", "local_map", "mapcloud", "mapground", "obstacles"}
+LAYER_NAMES = {
+    "global_map",
+    "local_map",
+    "current_lidar",
+    "mapcloud",
+    "mapground",
+    "obstacles",
+}
 MAPPING_LAYER_NAMES = {"global_map", "ground"}
 ACTION_STATUS_NAMES = {
     0: "unknown",
@@ -1043,12 +1074,55 @@ def normalize_mapping_layer_name(name: str) -> str:
 _ALL_CLOUD_KEYS = (
     ("nav", "global_map"),
     ("nav", "local_map"),
+    ("nav", "current_lidar"),
     ("nav", "mapcloud"),
     ("nav", "mapground"),
     ("nav", "obstacles"),
     ("mapping", "global_map"),
     ("mapping", "ground"),
 )
+
+_CLOUD_STREAM_LAYERS = {
+    "nav": frozenset(
+        {
+            "global_map",
+            "local_map",
+            "current_lidar",
+            "mapcloud",
+            "mapground",
+            "obstacles",
+        }
+    ),
+    "mapping": frozenset({"global_map", "ground"}),
+}
+
+
+def parse_cloud_stream_keys(group: Any, raw_layers: Any) -> tuple[tuple[str, str], ...]:
+    """Validate one browser's metadata subscription.
+
+    Only the known navigation/mapping cloud names are accepted.  Omitted
+    ``layers`` means every layer in that group, which keeps the stream useful
+    for a client that only knows the current mode.
+    """
+    group_name = str(group or "").strip()
+    allowed = _CLOUD_STREAM_LAYERS.get(group_name)
+    if allowed is None:
+        raise ValueError(f"unknown cloud group: {group_name}")
+    if isinstance(raw_layers, str):
+        names = [part.strip() for part in raw_layers.split(",")]
+    else:
+        names = [str(part).strip() for part in (raw_layers or ())]
+    names = [name for name in names if name]
+    if not names:
+        names = sorted(allowed)
+    if len(names) > len(allowed):
+        raise ValueError("too many cloud layers requested")
+    unique = set()
+    for name in names:
+        if name not in allowed:
+            raise ValueError(f"unknown cloud layer: {name}")
+        unique.add(name)
+    return tuple((group_name, name) for name in sorted(unique))
 
 
 def advance_cloud_generation(
@@ -1080,6 +1154,103 @@ def advance_cloud_generation(
     return owner._cloud_generation
 
 
+def _state_generation(owner: Any, key: tuple[str, str]) -> int:
+    generations = getattr(owner, "_state_generations", None) or {}
+    return int(generations.get(key, 0))
+
+
+def advance_state_generation(
+    owner: Any, keys: tuple[tuple[str, str], ...] | list[tuple[str, str]]
+) -> None:
+    """Invalidate in-flight path/pose snapshots for affected resources.
+
+    Integer cache versions alone are not a lifecycle identity: a clear and a
+    later update can reuse small counters after a restart or map change.  The
+    HTTP payloads expose this generation so the browser rejects a response that
+    belongs to an older lifecycle.
+    """
+    generations = getattr(owner, "_state_generations", None)
+    if generations is None:
+        generations = {}
+        owner._state_generations = generations
+    for key in keys:
+        generations[key] = generations.get(key, 0) + 1
+
+
+def _all_path_state_keys(owner: Any) -> list[tuple[str, str]]:
+    return [("path", topic) for topic in getattr(owner, "paths", {})]
+
+
+def _all_state_keys(owner: Any) -> list[tuple[str, str]]:
+    keys = _all_path_state_keys(owner)
+    keys.append(("path", "mapping_path"))
+    keys.extend((("pose", "nav"), ("pose", "mapping")))
+    return keys
+
+
+def parse_path_stream_keys(
+    owner: Any, raw_paths: Any
+) -> tuple[tuple[str, str], ...]:
+    """Validate browser-requested path resources against configured topics.
+
+    Path names are never used to create ROS subscriptions; only topics already
+    configured on this node may be streamed.
+    """
+    if isinstance(raw_paths, str):
+        names = [part.strip() for part in raw_paths.split(",")]
+    else:
+        names = [str(part).strip() for part in (raw_paths or ())]
+    names = [name for name in names if name]
+    if not names:
+        return ()
+    configured = set(getattr(owner, "paths", {}))
+    keys: list[tuple[str, str]] = []
+    for name in names:
+        if name == "mapping_path":
+            if not hasattr(owner, "mapping_path"):
+                raise ValueError("mapping path is unavailable")
+        elif name not in configured:
+            raise ValueError(f"unknown path topic: {name}")
+        key = ("path", name)
+        if key not in keys:
+            keys.append(key)
+    return tuple(keys)
+
+
+def parse_pose_stream_keys(raw_pose: Any) -> tuple[tuple[str, str], ...]:
+    if isinstance(raw_pose, str):
+        names = [part.strip() for part in raw_pose.split(",")]
+    else:
+        names = [str(part).strip() for part in (raw_pose or ())]
+    names = [name for name in names if name]
+    if not names or names == ["0"]:
+        return ()
+    keys: list[tuple[str, str]] = []
+    for name in names:
+        if name in ("1", "true", "both"):
+            requested = ("nav", "mapping")
+        elif name in ("nav", "mapping"):
+            requested = (name,)
+        else:
+            raise ValueError(f"unknown pose resource: {name}")
+        for layer in requested:
+            key = ("pose", layer)
+            if key not in keys:
+                keys.append(key)
+    return tuple(keys)
+
+
+def publish_cloud_metadata_if_available(owner: Any) -> None:
+    """Notify revision subscribers when this owner has a metadata hub.
+
+    Some callers bind individual node methods without constructing the
+    HTTP/SSE hub, so lifecycle helpers must stay optional.
+    """
+    publish = getattr(owner, "publish_cloud_metadata", None)
+    if publish is not None:
+        publish()
+
+
 def _layer_payload_snapshot(
     owner: Any, layer_name: str, mode: str
 ) -> tuple[dict[str, Any], int]:
@@ -1091,6 +1262,7 @@ def _layer_payload_snapshot(
     """
     layer = normalize_layer_name(layer_name)
     now = owner.now_sec()
+    key = ("nav", layer)
     with owner.lock:
         cache = owner.layers[layer]
         data = cache.data or {}
@@ -1098,7 +1270,11 @@ def _layer_payload_snapshot(
         frame_id = cache.frame_id
         count = cache.count
         version = cache.version
+        generations = getattr(owner, "_cloud_generations", None) or {}
+        generation = int(generations.get(key, 0))
         points_3d = data.get("points3d", [])
+    hub = getattr(owner, "cloud_hub", None)
+    epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
     if mode == "3d":
         points = points_3d
     else:
@@ -1113,6 +1289,9 @@ def _layer_payload_snapshot(
             "status": status,
             "frame_id": frame_id,
             "count": count,
+            "version": version,
+            "generation": generation,
+            "epoch": epoch,
             "points": points,
         },
         version,
@@ -1124,19 +1303,32 @@ def _mapping_layer_payload_snapshot(
 ) -> tuple[dict[str, Any], int]:
     layer = normalize_mapping_layer_name(layer_name)
     now = owner.now_sec()
+    key = ("mapping", layer)
     with owner.lock:
         cache = owner.mapping_layers[layer]
         data = cache.data or {}
-        return (
-            {
-                "layer": layer,
-                "status": cache.status(now),
-                "frame_id": cache.frame_id,
-                "count": cache.count,
-                "points": data.get("points3d", []),
-            },
-            cache.version,
-        )
+        status = cache.status(now)
+        frame_id = cache.frame_id
+        count = cache.count
+        version = cache.version
+        generations = getattr(owner, "_cloud_generations", None) or {}
+        generation = int(generations.get(key, 0))
+        points = data.get("points3d", [])
+    hub = getattr(owner, "cloud_hub", None)
+    epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
+    return (
+        {
+            "layer": layer,
+            "status": status,
+            "frame_id": frame_id,
+            "count": count,
+            "version": version,
+            "generation": generation,
+            "epoch": epoch,
+            "points": points,
+        },
+        version,
+    )
 
 
 def success_response(message: str, stamp: float) -> dict[str, Any]:
@@ -1147,6 +1339,18 @@ def action_status_name(status_values: list[int]) -> str:
     if not status_values:
         return "idle"
     return ACTION_STATUS_NAMES.get(int(status_values[-1]), "unknown")
+
+
+def effective_mapground_status(cache_status: str, seen: bool) -> str:
+    """Readiness follows the lifecycle flag, not the display cache.
+
+    Releasing an idle subscription clears the decoded map ground while the
+    navigation stack still owns a valid map, so a cache-derived status would
+    report "waiting for navigation" during normal operation.  ``seen`` is set
+    when a ground frame is applied and reset by the map/navigation lifecycle
+    clears.
+    """
+    return "loaded" if seen else cache_status
 
 
 def navigation_readiness(odom_status: str, mapground_status: str) -> dict[str, Any]:
@@ -1195,6 +1399,16 @@ def package_static_dir() -> Path:
         return Path(__file__).resolve().parents[1] / "static"
 
 
+# The reconciler runs on the ROS executor thread so subscription entities
+# are created and destroyed where their callbacks are dispatched.
+CLOUD_SUBSCRIPTION_TICK_SEC = 0.2
+CLOUD_SUBSCRIPTION_RETRY_SEC = 5.0
+DEFAULT_CLOUD_SUBSCRIPTION_IDLE_SEC = 5.0
+_CLOUD_LAYER_CALLBACKS = frozenset(
+    {"pointcloud_callback", "mapping_pointcloud_callback"}
+)
+
+
 class WebControlNode(Node):
     def __init__(self) -> None:
         if rclpy is None:
@@ -1206,6 +1420,9 @@ class WebControlNode(Node):
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("global_map_topic", "/lio_sam/localization/global_map")
         self.declare_parameter("local_map_topic", "/lio_sam/localization/local_map")
+        self.declare_parameter(
+            "current_lidar_topic", "/lio_sam/localization/current_lidar"
+        )
         self.declare_parameter("mapcloud_topic", "mapcloud")
         self.declare_parameter("mapground_topic", "mapground")
         self.declare_parameter("obstacle_topic", "/aggregated_pc")
@@ -1225,14 +1442,30 @@ class WebControlNode(Node):
         # mounted disks available; validation still resolves symlinks/writability.
         self.declare_parameter("recording_root", "/")
         self.declare_parameter("path_topics", "")
+        # Predicted local trajectory from the local planner, published as
+        # geometry_msgs/PoseArray (not nav_msgs/Path). It is exposed through
+        # the same path API/SSE pipeline but needs its own typed subscription.
+        # Empty disables it.
+        self.declare_parameter("trajectory_topic", "/best_trajectory")
+        self.trajectory_topic = str(
+            self.get_parameter("trajectory_topic").value
+        ).strip()
         # Legacy /api/map2d only: caps the on-request XY projection; point-cloud
         # ingestion never builds or stores a 2D cache.
         self.declare_parameter("max_2d_points_per_layer", 60000)
         self.declare_parameter("max_3d_points_per_layer", 40000)
-        # Dynamic and Mapping cloud decoding pauses this many seconds after
-        # the last map request for that layer. Only the three latched
-        # navigation maps are decoded once per new input without a client.
+        # Every cloud layer decodes only while a browser displays it (within
+        # cloud_demand_ttl_sec, default 2 s).  The three latched navigation
+        # maps keep a 1 Hz output ceiling; idle subscriptions are released
+        # after cloud_subscription_idle_sec.
         self.declare_parameter("cloud_demand_ttl_sec", DEFAULT_DEMAND_TTL_SEC)
+        # Seconds after the demand expires before an idle subscription and its
+        # decoded cache are released.  0 disables idle release only: creation
+        # stays demand-driven and existing subscriptions are kept until the
+        # process exits.
+        self.declare_parameter(
+            "cloud_subscription_idle_sec", DEFAULT_CLOUD_SUBSCRIPTION_IDLE_SEC
+        )
         self.declare_parameter("stale_timeout_sec", 2.0)
         self.declare_parameter("localization_launch_package", "lio_sam_hesai")
         self.declare_parameter(
@@ -1265,8 +1498,8 @@ class WebControlNode(Node):
         self.declare_parameter("viewer_timeout_sec", 10.0)
         self.declare_parameter("teleop_cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("teleop_max_linear_speed", 1.5)
-        self.declare_parameter("teleop_wheelbase", 0.65)
-        self.declare_parameter("teleop_max_steer_angle", 0.461)
+        self.declare_parameter("teleop_wheelbase", 0.550)
+        self.declare_parameter("teleop_max_steer_angle", 0.3270520925102273)
         self.declare_parameter("teleop_steering_exponent", 0.5)
         self.declare_parameter("teleop_deadzone", 0.08)
         self.declare_parameter("teleop_command_timeout", 0.4)
@@ -1274,6 +1507,11 @@ class WebControlNode(Node):
         self.declare_parameter("diagnostics_enabled", True)
         self.declare_parameter("diagnostics_imu_topic", "/imu")
         self.declare_parameter("diagnostics_lidar_topic", "/lidar_points")
+        self.declare_parameter(
+            "diagnostics_lidar_stats_topic", "/lidar_points/statistics"
+        )
+        self.declare_parameter("diagnostics_lidar_receive_enabled", False)
+        self.declare_parameter("diagnostics_lidar_stats_stale_timeout_sec", 3.0)
         self.declare_parameter("diagnostics_chassis_odom_topic", "/odom1")
         self.declare_parameter("diagnostics_window_sec", 5.0)
         self.declare_parameter("diagnostics_stale_timeout_sec", 2.0)
@@ -1283,10 +1521,6 @@ class WebControlNode(Node):
         self.declare_parameter("diagnostics_max_log_bytes", 10 * 1024 * 1024)
         self.declare_parameter("diagnostics_retain_days", 7)
         self.declare_parameter("diagnostics_retain_bytes", 100 * 1024 * 1024)
-        self.declare_parameter("resource_logging_enabled", True)
-        self.declare_parameter(
-            "resource_sample_period_sec", DEFAULT_SAMPLE_PERIOD_SEC
-        )
         self.declare_parameter("motion_start_threshold_mps", 0.05)
         self.declare_parameter("motion_stop_threshold_mps", 0.02)
         self.declare_parameter("motion_debounce_sec", 0.3)
@@ -1300,6 +1534,10 @@ class WebControlNode(Node):
         self.max_3d_points = int(self.get_parameter("max_3d_points_per_layer").value)
         self.cloud_demand_ttl = max(
             0.0, float(self.get_parameter("cloud_demand_ttl_sec").value)
+        )
+        self.cloud_subscription_idle = max(
+            0.0,
+            float(self.get_parameter("cloud_subscription_idle_sec").value),
         )
         self.stale_timeout = float(self.get_parameter("stale_timeout_sec").value)
         self.managed_log_lines = int(self.get_parameter("managed_log_lines").value)
@@ -1328,6 +1566,22 @@ class WebControlNode(Node):
         )
         self.diagnostics_enabled = bool(
             self.get_parameter("diagnostics_enabled").value
+        )
+        # Raw PointCloud2 receipt is opt-in because it copies every full cloud
+        # over DDS even with raw=True.  Presence-only monitoring stays enabled.
+        self.diagnostics_lidar_receive_enabled = bool(
+            self.get_parameter("diagnostics_lidar_receive_enabled").value
+        )
+        self.diagnostics_lidar_stats_topic = str(
+            self.get_parameter("diagnostics_lidar_stats_topic").value
+        )
+        self.diagnostics_lidar_stats_stale_timeout = max(
+            0.5,
+            float(
+                self.get_parameter(
+                    "diagnostics_lidar_stats_stale_timeout_sec"
+                ).value
+            ),
         )
         self.diagnostics_sample_period = max(
             0.1, float(self.get_parameter("diagnostics_sample_period_sec").value)
@@ -1362,6 +1616,11 @@ class WebControlNode(Node):
                 stale_timeout_sec=topic_stale,
                 enabled=self.diagnostics_enabled,
                 available=diagnostics_types[spec["key"]],
+                receive_enabled=(
+                    self.diagnostics_lidar_receive_enabled
+                    if spec["key"] == "lidar"
+                    else True
+                ),
             )
             for spec in DEFAULT_TOPIC_SPECS
         }
@@ -1384,6 +1643,13 @@ class WebControlNode(Node):
                 ),
                 stale_timeout_sec=topic_stale,
             ),
+            lidar_stats=LidarPublishStatsMonitor(
+                self.diagnostics_lidar_stats_topic,
+                diagnostics_topics["lidar"],
+                stale_timeout_sec=self.diagnostics_lidar_stats_stale_timeout,
+                enabled=self.diagnostics_enabled,
+                available=DiagnosticArray is not None,
+            ),
         )
         self.diagnostics_log = DiagnosticsLogWriter(
             self.log_store,
@@ -1404,20 +1670,6 @@ class WebControlNode(Node):
         # topic payload can be written after the POST reports success.
         self._diagnostics_lock = threading.RLock()
         self.topic_logging_enabled = True
-        # Resource logging is a separate background baseline and log stream.
-        # It deliberately does not use system_cpu_ticks or system_payload(), so
-        # browser polling cannot change the CPU values persisted here.
-        self.resource_logging_enabled = bool(
-            self.get_parameter("resource_logging_enabled").value
-        )
-        self.resource_sample_period = max(
-            0.01,
-            float(self.get_parameter("resource_sample_period_sec").value),
-        )
-        self.resource_sampler = ResourceSampler()
-        self.resource_worker: ResourceLoggingWorker | None = None
-        self._resource_logging_active = False
-        self._resource_logging_error: str | None = None
         self._diagnostics_closed = False
         self.tf_cache = TfTreeCache(
             max_edges=int(self.get_parameter("tf_cache_size").value),
@@ -1437,6 +1689,9 @@ class WebControlNode(Node):
         self.layers = {
             "global_map": SourceCache("global_map", self.stale_timeout, static_source=True),
             "local_map": SourceCache("local_map", self.stale_timeout, static_source=True),
+            # The localization current scan is a live, map-frame cloud.  It is
+            # dynamic: demand-gated and latest-frame coalesced like obstacles.
+            "current_lidar": SourceCache("current_lidar", self.stale_timeout),
             "mapcloud": SourceCache("mapcloud", self.stale_timeout, static_source=True),
             "mapground": SourceCache("mapground", self.stale_timeout, static_source=True),
             "obstacles": SourceCache("obstacles", self.stale_timeout, static_source=False),
@@ -1445,13 +1700,28 @@ class WebControlNode(Node):
             "global_map": SourceCache("mapping_global_map", self.stale_timeout, static_source=True),
             "ground": SourceCache("mapping_ground", self.stale_timeout, static_source=True),
         }
+        # Navigation readiness latch: set when a map-ground frame is applied,
+        # cleared by the navigation/map lifecycle resets.  Independent of the
+        # display cache so an idle release cannot report not-ready.
+        self.mapground_seen = False
         # One visualization worker for all cloud layers.  Subscription
         # callbacks only replace a pending reference; parsing, finite
         # filtering and downsampling happen here, outside self.lock and the
         # single-threaded ROS executor.
         self._cloud_generation = 0
         self._cloud_generations: dict[tuple[str, str], int] = {}
+        # Path/pose lifecycle generations are separate from cloud generations:
+        # a path update must not invalidate cloud geometry (or vice versa).
+        self._state_generations: dict[tuple[str, str], int] = {}
+        # Assigned under ``self.lock`` together with the cache reads, so the
+        # revision hub can reject a refresh that returns out of order.
+        self._cloud_metadata_order = 0
         self.cloud_responses = CloudResponseCache()
+        # Metadata-only revision fan-out for SSE viewers.  The reader never
+        # copies or serializes cloud points; the monitor thread notices
+        # time-based status transitions (for example active -> stale).
+        self.cloud_hub = CloudRevisionHub(self.cloud_metadata_snapshot)
+        self.cloud_hub.refresh()
         self.cloud_worker = PointCloudIngestWorker(
             self._apply_pointcloud_result,
             max_points=self.max_3d_points,
@@ -1562,54 +1832,10 @@ class WebControlNode(Node):
             state_qos,
         )
 
-        # Diagnostics are independent of open browser tabs: these subscribers
-        # and the 1 Hz timer always run while the node is alive.  LiDAR uses
-        # raw=True so rclpy does not deserialize PointCloud2 into Python points;
-        # this still incurs the DDS/network byte copy and is not zero-copy.
-        self.diagnostics_timer: Any | None = None
-        if self.diagnostics_enabled:
-            imu_monitor = self.diagnostics_service.monitors["imu"]
-            # Monitoring uses BEST_EFFORT/VOLATILE so it receives from both
-            # reliable and best-effort publishers.  Visualization/control
-            # subscriptions above keep their existing QoS unchanged.
-            diagnostics_qos = QoSProfile(
-                history=QoSHistoryPolicy.KEEP_LAST,
-                depth=10,
-                reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                durability=QoSDurabilityPolicy.VOLATILE,
-            )
-            if Imu is not None:
-                self.create_subscription(
-                    Imu,
-                    imu_monitor.topic,
-                    self.diagnostics_imu_callback,
-                    diagnostics_qos,
-                )
-            if PointCloud2 is not None:
-                lidar_qos = QoSProfile(
-                    history=QoSHistoryPolicy.KEEP_LAST,
-                    depth=1,
-                    reliability=QoSReliabilityPolicy.BEST_EFFORT,
-                    durability=QoSDurabilityPolicy.VOLATILE,
-                )
-                self.create_subscription(
-                    PointCloud2,
-                    self.diagnostics_service.monitors["lidar"].topic,
-                    self.diagnostics_lidar_callback,
-                    lidar_qos,
-                    raw=True,
-                )
-            if Odometry is not None:
-                self.create_subscription(
-                    Odometry,
-                    self.diagnostics_service.monitors["odom"].topic,
-                    self.diagnostics_odom_callback,
-                    diagnostics_qos,
-                )
-            self.diagnostics_timer = self.create_timer(
-                self.diagnostics_sample_period,
-                self.diagnostics_timer_callback,
-            )
+        # Diagnostics are independent of open browser tabs, but the raw LiDAR
+        # subscription is opt-in.  The default mode still checks publisher
+        # presence from the existing 1 Hz graph query without receiving clouds.
+        self.configure_diagnostics_subscriptions()
 
         # Real /tf + /tf_static subscriptions. /tf is best-effort so it matches
         # both best-effort and reliable publishers; /tf_static is TRANSIENT_LOCAL
@@ -1646,6 +1872,15 @@ class WebControlNode(Node):
 
         path_topics = parse_path_topics(self.get_parameter("path_topics").value)
         for topic in path_topics:
+            if self.trajectory_topic and topic == self.trajectory_topic:
+                # The dedicated parameter defines the message type, so a topic
+                # mistakenly listed in both is subscribed as a PoseArray below
+                # instead of a nav_msgs/Path that could never receive it.
+                self.get_logger().warning(
+                    f"'{topic}' is listed in path_topics and trajectory_topic; "
+                    "subscribing as geometry_msgs/PoseArray"
+                )
+                continue
             self.paths[topic] = SourceCache(topic, self.stale_timeout)
             self.create_subscription(
                 PathMsg,
@@ -1654,14 +1889,94 @@ class WebControlNode(Node):
                 state_qos,
             )
 
+        # The predicted trajectory is a PoseArray, so it cannot go through
+        # path_topics (a nav_msgs/Path subscription would never match it).
+        # Reuse the path cache/API/SSE pipeline once its points are extracted.
+        if self.trajectory_topic:
+            self.paths[self.trajectory_topic] = SourceCache(
+                self.trajectory_topic, self.stale_timeout
+            )
+            self.create_subscription(
+                PoseArray,
+                self.trajectory_topic,
+                partial(self.pose_array_path_callback, self.trajectory_topic),
+                state_qos,
+            )
+
         self.httpd: ThreadingHTTPServer | None = None
         self.http_thread: threading.Thread | None = None
         self.configure_managed_processes()
-        # Start only after managed launch objects exist, and before the HTTP
-        # server can serve requests.  The worker is independent of ROS timers,
-        # browser tabs and /api/system polling.
-        self.start_resource_logging()
         self.start_http_server()
+
+    def configure_diagnostics_subscriptions(self) -> None:
+        """Create diagnostics subscribers, keeping raw LiDAR receive opt-in.
+
+        IMU and chassis odometry use BEST_EFFORT/VOLATILE so they receive from
+        both reliable and best-effort publishers.  The driver's small
+        ``diagnostic_msgs/DiagnosticArray`` heartbeat is subscribed by default.
+        PointCloud2 is subscribed only when
+        ``diagnostics_lidar_receive_enabled`` is true, at depth 1 and
+        ``raw=True`` so rclpy does not deserialize it into Python points.  Even
+        then the DDS/network byte copy remains, so this is not zero-copy.
+        """
+        self.diagnostics_timer: Any | None = None
+        self.diagnostics_lidar_stats_subscription: Any | None = None
+        if not self.diagnostics_enabled:
+            return
+        imu_monitor = self.diagnostics_service.monitors["imu"]
+        diagnostics_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        if Imu is not None:
+            self.create_subscription(
+                Imu,
+                imu_monitor.topic,
+                self.diagnostics_imu_callback,
+                diagnostics_qos,
+            )
+        stats_monitor = self.diagnostics_service.lidar_stats
+        if DiagnosticArray is not None and stats_monitor is not None:
+            stats_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self.diagnostics_lidar_stats_subscription = self.create_subscription(
+                DiagnosticArray,
+                stats_monitor.topic,
+                self.diagnostics_lidar_stats_callback,
+                stats_qos,
+            )
+        lidar_monitor = self.diagnostics_service.monitors["lidar"]
+        if PointCloud2 is not None and lidar_monitor.receive_enabled:
+            lidar_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self.create_subscription(
+                PointCloud2,
+                lidar_monitor.topic,
+                self.diagnostics_lidar_callback,
+                lidar_qos,
+                raw=True,
+            )
+        if Odometry is not None:
+            self.create_subscription(
+                Odometry,
+                self.diagnostics_service.monitors["odom"].topic,
+                self.diagnostics_odom_callback,
+                diagnostics_qos,
+            )
+        self.diagnostics_timer = self.create_timer(
+            self.diagnostics_sample_period,
+            self.diagnostics_timer_callback,
+        )
 
     def now_sec(self) -> float:
         return time.time()
@@ -1670,56 +1985,174 @@ class WebControlNode(Node):
         return self.get_clock().now().to_msg()
 
     def configure_pointcloud_subscriptions(self) -> None:
-        """Subscribe to the navigation map/obstacle and mapping clouds.
+        """Arm demand-driven subscriptions for the browser cloud layers.
 
-        The localization global map is latched exactly like the existing
-        static map clouds.  The live obstacle aggregate is volatile and
-        best-effort: it matches both best-effort and reliable publishers and
-        never replays a stale transient sample after navigation restarts.
+        Nothing is subscribed at start-up.  The reconciler creates one
+        subscription per layer while a browser displays it, and teardown
+        follows with idle release.  Latched topics replay their last sample on
+        re-subscription, so a released map returns without any publisher
+        change.
         """
-        layer_topics = {
-            "global_map": str(self.get_parameter("global_map_topic").value),
-            "local_map": str(self.get_parameter("local_map_topic").value),
-            "mapcloud": str(self.get_parameter("mapcloud_topic").value),
-            "mapground": str(self.get_parameter("mapground_topic").value),
-        }
-        static_pointcloud_qos = QoSProfile(
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        self.cloud_subscriptions: dict[tuple[str, str], Any] = {}
+        self._cloud_subscription_failures: dict[tuple[str, str], float] = {}
+        self._cloud_subscription_timer = self.create_timer(
+            CLOUD_SUBSCRIPTION_TICK_SEC,
+            self.reconcile_cloud_subscriptions,
         )
-        pointcloud_qos = QoSProfile(
+
+    def reconcile_cloud_subscriptions(self) -> None:
+        """Match live subscriptions to the layers viewers currently display."""
+        worker = getattr(self, "cloud_worker", None)
+        if worker is None:
+            return
+        # Demand stamps use the worker clock (time.monotonic).  Mixing in
+        # self.now_sec() (wall clock) would make create never fire and release
+        # every tick.
+        try:
+            create_keys, release_keys = reconcile_cloud_demand(
+                worker.now(),
+                self.cloud_subscriptions.keys(),
+                worker.demand_stamps(),
+                demand_ttl_sec=self.cloud_demand_ttl,
+                # Fallback for nodes constructed before parameters are
+                # declared.
+                idle_sec=getattr(
+                    self,
+                    "cloud_subscription_idle",
+                    DEFAULT_CLOUD_SUBSCRIPTION_IDLE_SEC,
+                ),
+            )
+        except Exception as exc:
+            self.get_logger().warning(f"cloud reconcile failed: {exc}")
+            return
+        for key in release_keys:
+            try:
+                self.release_cloud_subscription(key)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"cloud release {key[0]}/{key[1]} failed: {exc}"
+                )
+        for key in create_keys:
+            try:
+                self.create_cloud_subscription(key)
+            except Exception as exc:
+                self._cloud_subscription_failures[key] = worker.now()
+                self.get_logger().warning(
+                    f"cloud subscription {key[0]}/{key[1]} failed: {exc}"
+                )
+
+    def cloud_layer_qos(self, qos_name: str) -> Any:
+        """QoS profile for one plan; ``latched`` must replay on re-subscribe."""
+        if qos_name == "latched":
+            return QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            )
+        return QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        for layer_name, topic in layer_topics.items():
-            self.create_subscription(
-                PointCloud2,
-                topic,
-                partial(self.pointcloud_callback, layer_name),
-                static_pointcloud_qos,
-            )
-        self.create_subscription(
-            PointCloud2,
-            str(self.get_parameter("obstacle_topic").value),
-            self.obstacle_callback,
-            pointcloud_qos,
-        )
 
-        mapping_layer_topics = {
-            "global_map": str(self.get_parameter("mapping_global_map_topic").value),
-            "ground": str(self.get_parameter("mapping_ground_topic").value),
-        }
-        for layer_name, topic in mapping_layer_topics.items():
-            self.create_subscription(
-                PointCloud2,
-                topic,
-                partial(self.mapping_pointcloud_callback, layer_name),
-                pointcloud_qos,
+    def create_cloud_subscription(self, key: tuple[str, str]) -> bool:
+        """Subscribe one cloud layer if a viewer still demands it."""
+        plan = PLAN_BY_KEY.get(key)
+        worker = getattr(self, "cloud_worker", None)
+        if plan is None or worker is None:
+            return False
+        if key in self.cloud_subscriptions:
+            return False
+        now = worker.now()
+        if not worker.demand_active(key, now=now):
+            return False
+        failed_at = self._cloud_subscription_failures.get(key)
+        if failed_at is not None and now - failed_at < CLOUD_SUBSCRIPTION_RETRY_SEC:
+            return False
+        message_type = {
+            "PointCloud2": PointCloud2,
+            "MarkerArray": MarkerArray,
+        }.get(plan.message_type)
+        if message_type is None:
+            return False
+        callback = getattr(self, plan.callback, None)
+        if callback is None:
+            return False
+        if plan.callback in _CLOUD_LAYER_CALLBACKS:
+            callback = partial(callback, plan.layer)
+        try:
+            topic_value = self.get_parameter(plan.topic_parameter).value
+        except Exception as exc:
+            self._cloud_subscription_failures[key] = now
+            self.get_logger().warning(
+                f"cloud subscription {key[0]}/{key[1]} failed: {exc}"
             )
+            return False
+        topic = str(topic_value or "").strip()
+        if not topic:
+            return False
+        try:
+            subscription = self.create_subscription(
+                message_type, topic, callback, self.cloud_layer_qos(plan.qos)
+            )
+        except Exception as exc:
+            self._cloud_subscription_failures[key] = now
+            self.get_logger().warning(
+                f"cloud subscription {key[0]}/{key[1]} failed: {exc}"
+            )
+            return False
+        self._cloud_subscription_failures.pop(key, None)
+        self.cloud_subscriptions[key] = subscription
+        return True
+
+    def release_cloud_subscription(self, key: tuple[str, str]) -> bool:
+        """Destroy one idle subscription and release everything it produced."""
+        subscription = self.cloud_subscriptions.pop(key, None)
+        self._cloud_subscription_failures.pop(key, None)
+        destroy = getattr(self, "destroy_subscription", None)
+        if subscription is not None and destroy is not None:
+            try:
+                destroy(subscription)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"cloud unsubscribe {key[0]}/{key[1]} failed: {exc}"
+                )
+        # Reject an in-flight decode, drop the pending raw frame and its
+        # serialized bodies, then release the decoded points themselves.
+        advance_cloud_generation(self, [key])
+        released = subscription is not None
+        with self.lock:
+            caches = self.layers if key[0] == "nav" else self.mapping_layers
+            cache = caches.get(key[1])
+            if cache is not None and cache.data is not None:
+                cache.clear()
+                released = True
+        if released:
+            publish_cloud_metadata_if_available(self)
+        return subscription is not None
+
+    def release_all_cloud_subscriptions(self) -> None:
+        """Destroy every cloud subscription without publishing revisions.
+
+        Called from ``destroy_node`` after the reconciler timer is cancelled
+        and before the global generation bump; it neither publishes revisions
+        nor clears decoded caches.
+        """
+        subscriptions = getattr(self, "cloud_subscriptions", None) or {}
+        failures = getattr(self, "_cloud_subscription_failures", None)
+        destroy = getattr(self, "destroy_subscription", None)
+        for key in list(subscriptions):
+            subscription = subscriptions.pop(key)
+            if destroy is None:
+                continue
+            try:
+                destroy(subscription)
+            except Exception:
+                pass
+        if failures is not None:
+            failures.clear()
 
     def configure_managed_processes(self) -> None:
         for target in self.managed_logs:
@@ -1815,6 +2248,7 @@ class WebControlNode(Node):
                 self,
                 [("nav", "mapcloud"), ("nav", "mapground"), ("nav", "obstacles")],
             )
+            advance_state_generation(self, _all_path_state_keys(self))
             self.action_status.clear()
             for cache in self.paths.values():
                 cache.clear()
@@ -1825,11 +2259,13 @@ class WebControlNode(Node):
             for name in ("mapcloud", "mapground", "obstacles"):
                 if name in self.layers:
                     self.layers[name].clear()
+            self.mapground_seen = False
             # Stop is not an operator command: settle the pause/resume state so
             # the browser stops advertising an active goal, while an
             # interrupted Pause or Resume keeps its saved destination paused.
             self.published_goal = None
             self.navigation_control.on_navigation_stopped(self.now_sec())
+        publish_cloud_metadata_if_available(self)
 
     def clear_map_runtime_state(self) -> None:
         with self.lock:
@@ -1837,16 +2273,21 @@ class WebControlNode(Node):
                 self,
                 [key for key in _ALL_CLOUD_KEYS if key[0] == "nav"],
             )
+            advance_state_generation(
+                self, _all_path_state_keys(self) + [("pose", "nav")]
+            )
             # Every navigation display cloud belongs to the localization or
             # navigation runtime.  A localization restart may load a different
             # map, so the directly-subscribed global map is dropped too rather
             # than leaving an obsolete scene behind.
             for cache in self.layers.values():
                 cache.clear()
+            self.mapground_seen = False
             self.odom.clear()
             self.action_status.clear()
             for cache in self.paths.values():
                 cache.clear()
+        publish_cloud_metadata_if_available(self)
 
     def clear_mapping_runtime_state(self) -> None:
         with self.lock:
@@ -1854,10 +2295,14 @@ class WebControlNode(Node):
                 self,
                 [key for key in _ALL_CLOUD_KEYS if key[0] == "mapping"],
             )
+            advance_state_generation(
+                self, [("path", "mapping_path"), ("pose", "mapping")]
+            )
             for cache in self.mapping_layers.values():
                 cache.clear()
             self.mapping_odom.clear()
             self.mapping_path.clear()
+        publish_cloud_metadata_if_available(self)
 
     def handle_managed_exit(self, target: str) -> None:
         if target == "chassis":
@@ -2078,9 +2523,21 @@ class WebControlNode(Node):
                     self,
                     [key for key in _ALL_CLOUD_KEYS if key[0] == "nav"],
                 )
+                advance_state_generation(
+                    self, _all_path_state_keys(self) + [("pose", "nav")]
+                )
                 global_cache = self.layers.get("global_map")
                 if global_cache is not None:
                     global_cache.clear()
+                # The live scan belongs to the previous map/session too.
+                current_lidar = self.layers.get("current_lidar")
+                if current_lidar is not None:
+                    current_lidar.clear()
+                odom = getattr(self, "odom", None)
+                if odom is not None:
+                    odom.clear()
+                for cache in getattr(self, "paths", {}).values():
+                    cache.clear()
             self.navigation_control.note_map_selected(name, self.now_sec())
             selection = {
                 "name": name,
@@ -2098,6 +2555,11 @@ class WebControlNode(Node):
                     "is unavailable",
                 ),
             }
+        if has_name:
+            # Never publish while node.lock is held: a monitor refresh takes
+            # node.lock to read metadata, so doing it here would invert the
+            # hub/reader lock order and can deadlock.
+            publish_cloud_metadata_if_available(self)
         response = success_response(f"selected map {name}", self.now_sec())
         response["selection"] = selection
         return response
@@ -2194,16 +2656,25 @@ class WebControlNode(Node):
             process.command = self.managed_start_command(target)
             if target == "localization":
                 # A restart is a new localization session: never carry the
-                # previous session's latched global map or queued map frames
-                # into the new one.
-                advance_cloud_generation(self, [("nav", "global_map")])
+                # previous session's latched global map, live scan or queued
+                # map frames into the new one.
+                advance_cloud_generation(
+                    self,
+                    [("nav", "global_map"), ("nav", "current_lidar")],
+                )
                 self.layers["global_map"].clear()
+                current_lidar = self.layers.get("current_lidar")
+                if current_lidar is not None:
+                    current_lidar.clear()
             self.managed_logs[target].set_process_state(
                 enabled=True,
                 running=process.is_running(),
                 returncode=None,
             )
             process.start()
+        if target == "localization":
+            # Publish after releasing node.lock; see select_map.
+            publish_cloud_metadata_if_available(self)
         response = success_response(f"{target} starting", self.now_sec())
         response["log_error"] = self.managed_logs[target].session_info().get(
             "persist_error"
@@ -2231,11 +2702,13 @@ class WebControlNode(Node):
         *,
         clear_on_empty: bool = False,
     ) -> None:
-        """Hand a cloud to the worker, or use the legacy path on a stub node.
+        """Hand a cloud to the worker, or use the legacy path when no worker
+        is attached.
 
         The production node always has ``cloud_worker``.  The synchronous
-        branch keeps ROS-free unit stubs (and direct callers of
-        ``update_pointcloud_cache``) working; it is never taken by a live node.
+        branch serves callers that construct the node without a worker,
+        including direct callers of ``update_pointcloud_cache``; a live node
+        never takes it.
         """
         worker = getattr(self, "cloud_worker", None)
         if worker is None:
@@ -2263,7 +2736,17 @@ class WebControlNode(Node):
         # O(1): replace the latest pending frame for this layer.  The decode
         # happens on the visualization worker, never on the ROS executor.
         enqueue = getattr(self, "_enqueue_pointcloud", None)
-        if enqueue is None:  # ROS-free stub bound only to the public callback
+        if layer_name == "current_lidar":
+            # A live scan is a replacement, including an empty scan. Static
+            # maps keep their existing empty-message handling below.
+            if enqueue is None:
+                self.update_pointcloud_cache(
+                    self.layers[layer_name], msg, clear_on_empty=True
+                )
+            else:
+                enqueue("nav", layer_name, msg, clear_on_empty=True)
+            return
+        if enqueue is None:  # bound only to the public callback, without a worker
             self.update_pointcloud_cache(self.layers[layer_name], msg)
             return
         enqueue("nav", layer_name, msg)
@@ -2311,6 +2794,7 @@ class WebControlNode(Node):
         Only this small cache update runs under ``self.lock``; the expensive
         decode and list materialization already happened on the worker.
         """
+        changed = False
         with self.lock:
             key = (group, layer_name)
             generations = getattr(self, "_cloud_generations", None)
@@ -2324,14 +2808,24 @@ class WebControlNode(Node):
             if not points:
                 if clear_on_empty:
                     cache.clear()
-                return True
-            cache.update(
-                {"points3d": points},
-                stamp=arrival_stamp,
-                frame_id=frame_id,
-                count=finite_count,
-            )
-            return True
+                    changed = True
+                else:
+                    return True
+            else:
+                cache.update(
+                    {"points3d": points},
+                    stamp=arrival_stamp,
+                    frame_id=frame_id,
+                    count=finite_count,
+                )
+                if group == "nav" and layer_name == "mapground":
+                    self.mapground_seen = True
+                changed = True
+        if changed:
+            publish = getattr(self, "publish_cloud_metadata", None)
+            if publish is not None:
+                publish()
+        return True
 
     def update_pointcloud_cache(
         self,
@@ -2351,6 +2845,9 @@ class WebControlNode(Node):
             if clear_on_empty:
                 with self.lock:
                     cache.clear()
+                publish = getattr(self, "publish_cloud_metadata", None)
+                if publish is not None:
+                    publish()
             return
 
         # Point-cloud ingestion only builds the 3D cache.  The legacy 2D view
@@ -2365,6 +2862,9 @@ class WebControlNode(Node):
                 frame_id=msg.header.frame_id,
                 count=len(points),
             )
+        publish = getattr(self, "publish_cloud_metadata", None)
+        if publish is not None:
+            publish()
 
     def odom_callback(self, msg: Odometry) -> None:
         pose = msg.pose.pose
@@ -2383,6 +2883,7 @@ class WebControlNode(Node):
         }
         with self.lock:
             self.odom.update(payload, stamp=self.now_sec(), frame_id=msg.header.frame_id)
+        publish_cloud_metadata_if_available(self)
 
     def mapping_odom_callback(self, msg: Odometry) -> None:
         pose = msg.pose.pose
@@ -2401,6 +2902,7 @@ class WebControlNode(Node):
         }
         with self.lock:
             self.mapping_odom.update(payload, stamp=self.now_sec(), frame_id=msg.header.frame_id)
+        publish_cloud_metadata_if_available(self)
 
     def path_callback(self, topic: str, msg: PathMsg) -> None:
         points = [
@@ -2418,6 +2920,27 @@ class WebControlNode(Node):
                 frame_id=msg.header.frame_id,
                 count=len(points),
             )
+        publish_cloud_metadata_if_available(self)
+
+    def pose_array_path_callback(self, topic: str, msg: PoseArray) -> None:
+        """Store a predicted trajectory (geometry_msgs/PoseArray) as a path.
+
+        The local planner publishes ``/best_trajectory`` as a PoseArray of
+        future vehicle poses. Only positions are needed, so it shares the same
+        points shape and API/SSE pipeline as nav_msgs/Path sources.
+        """
+        points = [
+            [pose.position.x, pose.position.y, pose.position.z]
+            for pose in msg.poses
+        ]
+        with self.lock:
+            self.paths[topic].update(
+                {"points": points},
+                stamp=self.now_sec(),
+                frame_id=msg.header.frame_id,
+                count=len(points),
+            )
+        publish_cloud_metadata_if_available(self)
 
     def mapping_path_callback(self, msg: PathMsg) -> None:
         points = [
@@ -2435,6 +2958,7 @@ class WebControlNode(Node):
                 frame_id=msg.header.frame_id,
                 count=len(points),
             )
+        publish_cloud_metadata_if_available(self)
 
     def action_status_callback(self, msg: GoalStatusArray) -> None:
         selected = select_action_status(msg.status_list)
@@ -2567,7 +3091,10 @@ class WebControlNode(Node):
         now = self.now_sec()
         with self.lock:
             odom_status = self.odom.status(now)
-            mapground_status = self.layers["mapground"].status(now)
+            mapground_status = effective_mapground_status(
+                self.layers["mapground"].status(now),
+                getattr(self, "mapground_seen", False),
+            )
             return {
                 "layers": {
                     name: cache.summary(now) for name, cache in self.layers.items()
@@ -2579,6 +3106,9 @@ class WebControlNode(Node):
                 "paths": {
                     topic: cache.summary(now) for topic, cache in self.paths.items()
                 },
+                # Lets the browser draw the predicted trajectory distinctly
+                # from the global planning path.
+                "trajectory_topic": getattr(self, "trajectory_topic", ""),
                 "navigation_action": {
                     **self.action_status.summary(now),
                     "data": self.action_status.data
@@ -2612,18 +3142,17 @@ class WebControlNode(Node):
             return False
 
     def start_save_map(self, payload: dict[str, Any]) -> dict[str, Any]:
-        # The web dialog sends a path relative to the web node user's home
-        # directory (/map); validation resolves it to an absolute path under
-        # that home before the job and the SaveMapOptions request use it.
-        options = validate_save_map_payload(payload)
+        # Absolute destinations are forwarded exactly as selected, including
+        # /map; the picker and destination validation share the recorder's
+        # root. The home directory is guarded, never prepended.
+        recorder = getattr(self, "recorder", None)
+        root = getattr(recorder, "root", None)
+        options = validate_save_map_payload(payload, root=root)
         if not self.save_map_available():
             raise SaveMapUnavailableError("save map service unavailable")
         client = self.save_map_client
         if client is None:
             raise SaveMapUnavailableError("save map service unavailable")
-        token = self.save_map_job.begin(options["destination"], self.now_sec())
-        if token is None:
-            raise SaveMapBusyError("save map already running")
 
         request = SaveMapOptions.Request()
         request.destination = options["destination"]
@@ -2631,6 +3160,11 @@ class WebControlNode(Node):
         request.ground_resolution = options["ground_resolution"]
         request.save_ground_map = options["save_ground_map"]
         request.save_tiled_map = options["save_tiled_map"]
+
+        token = self.save_map_job.begin(options["destination"], self.now_sec())
+        if token is None:
+            raise SaveMapBusyError("save map already running")
+
         try:
             # Async so neither the HTTP thread nor the ROS executor waits on
             # the export; the done callback only updates the job state.
@@ -2735,6 +3269,27 @@ class WebControlNode(Node):
             "default_directory": default_directory,
         }
 
+    def save_map_browse_payload(self, path: str) -> dict[str, Any]:
+        now = self.now_sec()
+        root = self.recorder.root
+        payload = browse_directories(path, root, scope="save map")
+        home = Path(os.path.expanduser("~")).resolve()
+        default_directory = root
+        for candidate in (home / "map", home, root):
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_dir():
+                default_directory = resolved
+                break
+        return {
+            **success_response("save map directories", now),
+            **payload,
+            "default_directory": str(default_directory),
+        }
+
     def start_recording(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = self.now_sec()
         if not isinstance(payload, dict):
@@ -2780,24 +3335,138 @@ class WebControlNode(Node):
     def pose_payload(self) -> dict[str, Any]:
         now = self.now_sec()
         with self.lock:
-            return {
+            nav_version = self.odom.version
+            mapping_version = self.mapping_odom.version
+            nav_generation = _state_generation(self, ("pose", "nav"))
+            mapping_generation = _state_generation(self, ("pose", "mapping"))
+            payload = {
                 "odom": {
                     **self.odom.summary(now),
                     "pose": self.odom.data,
+                    "version": nav_version,
+                    "generation": nav_generation,
                 },
                 "mapping_odom": {
                     **self.mapping_odom.summary(now),
                     "pose": self.mapping_odom.data,
+                    "version": mapping_version,
+                    "generation": mapping_generation,
                 },
                 "map_frame": self.map_frame,
                 "server_time": now,
             }
+        hub = getattr(self, "cloud_hub", None)
+        epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
+        payload["epoch"] = epoch
+        payload["odom"]["epoch"] = epoch
+        payload["mapping_odom"]["epoch"] = epoch
+        return payload
 
     def note_cloud_demand(self, group: str, layer_name: str) -> None:
         """Activate the short dynamic-demand window for one cloud layer."""
         worker = getattr(self, "cloud_worker", None)
         if worker is not None:
             worker.note_demand(group, layer_name)
+
+    def cloud_metadata_snapshot(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """Return metadata-only revisions for clouds, paths and pose.
+
+        Reads the existing caches under ``self.lock`` but never copies point
+        arrays, so this is safe from the SSE/notification paths and never
+        triggers JSON serialization.  Pose is a tiny dict carried inline to
+        avoid one HTTP request per odometry frame.
+        """
+        now = self.now_sec()
+        metadata: dict[tuple[str, str], dict[str, Any]] = {}
+        with self.lock:
+            self._cloud_metadata_order = (
+                int(getattr(self, "_cloud_metadata_order", 0)) + 1
+            )
+            snapshot_order = self._cloud_metadata_order
+            generations = getattr(self, "_cloud_generations", None) or {}
+            groups = (
+                ("nav", getattr(self, "layers", {})),
+                ("mapping", getattr(self, "mapping_layers", {})),
+            )
+            for group, caches in groups:
+                for layer_name, cache in caches.items():
+                    key = (group, layer_name)
+                    if key not in _ALL_CLOUD_KEYS:
+                        continue
+                    metadata[key] = {
+                        "group": group,
+                        "layer": layer_name,
+                        "version": int(cache.version),
+                        "generation": int(generations.get(key, 0)),
+                        "status": cache.status(now),
+                        "frame_id": cache.frame_id,
+                        "count": cache.count,
+                        "snapshot_order": snapshot_order,
+                    }
+
+            for topic, cache in getattr(self, "paths", {}).items():
+                key = ("path", topic)
+                metadata[key] = {
+                    "group": "path",
+                    "layer": topic,
+                    "version": int(cache.version),
+                    "generation": _state_generation(self, key),
+                    "status": cache.status(now),
+                    "frame_id": cache.frame_id,
+                    "count": cache.count,
+                    "snapshot_order": snapshot_order,
+                }
+            mapping_path = getattr(self, "mapping_path", None)
+            if mapping_path is not None:
+                key = ("path", "mapping_path")
+                metadata[key] = {
+                    "group": "path",
+                    "layer": "mapping_path",
+                    "version": int(mapping_path.version),
+                    "generation": _state_generation(self, key),
+                    "status": mapping_path.status(now),
+                    "frame_id": mapping_path.frame_id,
+                    "count": mapping_path.count,
+                    "snapshot_order": snapshot_order,
+                }
+
+            for kind, cache in (
+                ("nav", getattr(self, "odom", None)),
+                ("mapping", getattr(self, "mapping_odom", None)),
+            ):
+                if cache is None:
+                    continue
+                key = ("pose", kind)
+                pose = cache.data
+                entry = {
+                    "group": "pose",
+                    "layer": kind,
+                    "version": int(cache.version),
+                    "generation": _state_generation(self, key),
+                    "status": cache.status(now),
+                    "frame_id": cache.frame_id,
+                    "count": cache.count,
+                    "snapshot_order": snapshot_order,
+                }
+                if isinstance(pose, dict):
+                    entry["pose"] = {
+                        **pose,
+                        "stamp": cache.stamp,
+                        "age": (
+                            None
+                            if cache.stamp is None
+                            else max(0.0, now - cache.stamp)
+                        ),
+                    }
+                metadata[key] = entry
+        return metadata
+
+    def publish_cloud_metadata(self) -> list[dict[str, Any]]:
+        """Push changed revisions to connected browsers; metadata only."""
+        hub = getattr(self, "cloud_hub", None)
+        if hub is None:
+            return []
+        return hub.refresh()
 
     def layer_payload(self, layer_name: str, mode: str) -> dict[str, Any]:
         return _layer_payload_snapshot(self, layer_name, mode)[0]
@@ -2814,6 +3483,8 @@ class WebControlNode(Node):
         payload, version = _layer_payload_snapshot(self, layer_name, mode)
         signature = (
             version,
+            payload["generation"],
+            payload["epoch"],
             payload["status"],
             payload["frame_id"],
             payload["count"],
@@ -2838,6 +3509,8 @@ class WebControlNode(Node):
         payload, version = _mapping_layer_payload_snapshot(self, layer_name)
         signature = (
             version,
+            payload["generation"],
+            payload["epoch"],
             payload["status"],
             payload["frame_id"],
             payload["count"],
@@ -2856,25 +3529,39 @@ class WebControlNode(Node):
                 raise ValueError(f"unknown path topic: {topic}")
             cache = self.paths[topic]
             data = cache.data or {"points": []}
-            return {
+            version = cache.version
+            key = ("path", topic)
+            generation = _state_generation(self, key)
+            payload = {
                 "topic": topic,
                 "status": cache.status(now),
                 "frame_id": cache.frame_id,
                 "count": cache.count,
                 "points": data.get("points", []),
+                "version": version,
+                "generation": generation,
             }
+        hub = getattr(self, "cloud_hub", None)
+        payload["epoch"] = str(getattr(hub, "epoch", "")) if hub is not None else ""
+        return payload
 
     def mapping_path_payload(self) -> dict[str, Any]:
         now = self.now_sec()
         with self.lock:
             data = self.mapping_path.data or {"points": []}
-            return {
+            key = ("path", "mapping_path")
+            payload = {
                 "topic": "mapping_path",
                 "status": self.mapping_path.status(now),
                 "frame_id": self.mapping_path.frame_id,
                 "count": self.mapping_path.count,
                 "points": data.get("points", []),
+                "version": self.mapping_path.version,
+                "generation": _state_generation(self, key),
             }
+        hub = getattr(self, "cloud_hub", None)
+        payload["epoch"] = str(getattr(hub, "epoch", "")) if hub is not None else ""
+        return payload
 
     def terminal_logs_payload(self, cursors: dict[str, int] | None = None) -> dict[str, Any]:
         cursors = cursors or {}
@@ -2988,180 +3675,6 @@ class WebControlNode(Node):
             self.system_cpu_ticks = current_ticks
         return payload
 
-    # -- Periodic resource diagnostics ------------------------------------
-    def resource_scope_payload(self) -> list[dict[str, Any]]:
-        """Return only web-owned launch roots, never discovered ROS names."""
-        groups: list[dict[str, Any]] = [
-            {
-                "target": "web_control",
-                "kind": "web_process",
-                "root_pids": [os.getpid()],
-                "extra_pids": [],
-                "include_descendants": False,
-            }
-        ]
-        for target in (
-            "chassis",
-            "imu",
-            "lidar",
-            "localization",
-            "navigation",
-            "mapping",
-        ):
-            roots: list[int] = []
-            extras: list[int] = []
-            pgid: int | None = None
-            managed = self.managed_processes.get(target)
-            if managed is not None:
-                lock = getattr(managed, "lock", None)
-                try:
-                    if lock is not None:
-                        lock.acquire()
-                    process = getattr(managed, "process", None)
-                    if process is not None and process.poll() is None:
-                        roots = [int(process.pid)]
-                        raw_pgid = getattr(managed, "pgid", None)
-                        pgid = None if raw_pgid is None else int(raw_pgid)
-                        extras = sorted(
-                            int(pid)
-                            for pid in getattr(managed, "descendant_pids", set())
-                            if int(pid) != int(process.pid)
-                        )
-                except Exception:
-                    roots = []
-                    extras = []
-                    pgid = None
-                finally:
-                    if lock is not None:
-                        try:
-                            lock.release()
-                        except Exception:
-                            pass
-            groups.append(
-                {
-                    "target": target,
-                    "kind": "managed_ros_launch",
-                    "root_pids": roots,
-                    "extra_pids": extras,
-                    "pgid": pgid,
-                }
-            )
-
-        recorder = getattr(self, "recorder", None)
-        if recorder is not None:
-            lock = getattr(recorder, "_lock", None)
-            try:
-                if lock is not None:
-                    lock.acquire()
-                process = getattr(recorder, "_process", None)
-                if process is not None and process.poll() is None:
-                    groups.append(
-                        {
-                            "target": "rosbag",
-                            "kind": "rosbag_process",
-                            "root_pids": [int(process.pid)],
-                            "extra_pids": [],
-                        }
-                    )
-            except Exception:
-                pass
-            finally:
-                if lock is not None:
-                    try:
-                        lock.release()
-                    except Exception:
-                        pass
-        return groups
-
-    def start_resource_logging(self) -> bool:
-        """Start the single background resource worker after launch setup."""
-        if not getattr(self, "resource_logging_enabled", False):
-            return False
-        if not hasattr(self, "diagnostics_log"):
-            return False
-        if self.resource_worker is None:
-            self.resource_worker = ResourceLoggingWorker(
-                self.resource_sampler,
-                self.resource_scope_payload,
-                self._write_resources,
-                period_sec=self.resource_sample_period,
-                logger=self.get_logger(),
-            )
-        with self._diagnostics_lock:
-            if getattr(self, "_diagnostics_closed", False):
-                return False
-            self._resource_logging_active = True
-            self._resource_logging_error = None
-        try:
-            self.resource_worker.start()
-        except Exception as exc:  # pragma: no cover - defensive lifecycle guard
-            with self._diagnostics_lock:
-                self._resource_logging_active = False
-                self._resource_logging_error = (
-                    f"resource logging failed to start: {exc}"
-                )
-            self.get_logger().error(
-                f"resource diagnostics worker failed to start: {exc}"
-            )
-            return False
-        return True
-
-    def stop_resource_logging(self) -> None:
-        """Stop the worker before the diagnostics log is closed."""
-        worker = getattr(self, "resource_worker", None)
-        if worker is not None:
-            try:
-                worker.stop(timeout=2.0)
-            except Exception as exc:  # pragma: no cover - defensive shutdown guard
-                self._resource_logging_error = (
-                    f"resource logging failed to stop cleanly: {exc}"
-                )
-        with self._diagnostics_lock:
-            self._resource_logging_active = False
-        if worker is not None and getattr(worker, "error", None):
-            self._resource_logging_error = worker.error
-
-    def _write_resources(self, entry: dict[str, Any]) -> bool:
-        """Persist a resource row without the topic/IMU filter.
-
-        This intentionally bypasses ``filter_topic_logging_entry``: turning the
-        topic/IMU log button OFF must not stop resource diagnosis.  The same
-        diagnostics log lock still serializes shutdown and prevents writes
-        after the log session closes.
-        """
-        lock = getattr(self, "_diagnostics_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._diagnostics_lock = lock
-        with lock:
-            if getattr(self, "_diagnostics_closed", False):
-                return False
-            if not getattr(self, "_resource_logging_active", False):
-                return False
-            log = getattr(self, "diagnostics_log", None)
-            if log is None:
-                return False
-            record = dict(entry)
-            record.setdefault("kind", "resources")
-            record.setdefault("source", "resource_sampler")
-            record.setdefault("timestamp_unix", time.time())
-            try:
-                ok = log.write(
-                    record, now=float(record.get("timestamp_unix", time.time()))
-                )
-                error = log.error
-            except Exception as exc:  # pragma: no cover - disk failure guard
-                ok = False
-                error = f"resource log write failed: {exc}"
-        if not ok and error and error != getattr(
-            self, "_resource_logging_error", None
-        ):
-            self._resource_logging_error = error
-            self.get_logger().error(
-                f"resource diagnostics log write failed: {error}"
-            )
-        return bool(ok)
-
     # -- Topic and motion diagnostics -------------------------------------
     def diagnostics_imu_callback(self, msg: Any) -> None:
         try:
@@ -3172,6 +3685,16 @@ class WebControlNode(Node):
     def diagnostics_lidar_callback(self, _raw_msg: Any) -> None:
         # raw=True delivers bytes only; never inspect or deserialize here.
         self.diagnostics_service.record("lidar", time.monotonic())
+
+    def diagnostics_lidar_stats_callback(self, msg: Any) -> None:
+        # Small DiagnosticArray heartbeat only.  It never touches the raw
+        # point-cloud receive counter or its last-received stamp.
+        try:
+            self.diagnostics_service.record_lidar_stats(msg, time.monotonic())
+        except Exception as exc:  # pragma: no cover - defensive ROS guard
+            self.get_logger().warning(
+                f"LiDAR publish statistics callback failed: {exc}"
+            )
 
     def diagnostics_odom_callback(self, msg: Any) -> None:
         try:
@@ -3192,6 +3715,14 @@ class WebControlNode(Node):
                     counts[key] = int(self.count_publishers(monitor.topic))
                 except Exception:
                     counts[key] = None
+            stats_monitor = self.diagnostics_service.lidar_stats
+            if stats_monitor is not None:
+                try:
+                    counts["lidar_stats"] = int(
+                        self.count_publishers(stats_monitor.topic)
+                    )
+                except Exception:
+                    counts["lidar_stats"] = None
         payload, events = self.diagnostics_service.tick(now_mono, counts)
         topic_rows = {row["topic"]: row for row in payload["topics"]}
         if not self._diagnostics_started:
@@ -3201,6 +3732,9 @@ class WebControlNode(Node):
                     "kind": "startup",
                     "source": "diagnostics",
                     "enabled": self.diagnostics_enabled,
+                    "lidar_receive_enabled": getattr(
+                        self, "diagnostics_lidar_receive_enabled", True
+                    ),
                     "source_mode": payload["source_mode"],
                     "topics": payload["topics"],
                     "motion": payload["motion"],
@@ -3230,6 +3764,9 @@ class WebControlNode(Node):
                     "kind": "snapshot",
                     "source": "diagnostics",
                     **payload,
+                    "lidar_receive_enabled": getattr(
+                        self, "diagnostics_lidar_receive_enabled", True
+                    ),
                     "logging": self.diagnostics_log.status(),
                 },
                 now_mono,
@@ -3325,6 +3862,16 @@ class WebControlNode(Node):
             )
             payload["logging"] = self.diagnostics_log.status()
         payload["enabled"] = self.diagnostics_enabled
+        payload["lidar_receive_enabled"] = getattr(
+            self, "diagnostics_lidar_receive_enabled", True
+        )
+        payload["lidar_stats_topic"] = getattr(
+            self, "diagnostics_lidar_stats_topic", None
+        )
+        payload["lidar_stats_stale_timeout_sec"] = getattr(
+            self, "diagnostics_lidar_stats_stale_timeout", None
+        )
+        payload["lidar_stats_available"] = DiagnosticArray is not None
         payload["log_dir"] = self.log_store.display_root()
         payload["sample_period_sec"] = self.diagnostics_sample_period
         payload["snapshot_period_sec"] = self.diagnostics_snapshot_period
@@ -3333,14 +3880,6 @@ class WebControlNode(Node):
     def shutdown_diagnostics(self) -> None:
         if not hasattr(self, "diagnostics_log"):
             return
-        # The resource worker must be gone before the final topic/motion rows
-        # are drained and the shared diagnostics session is closed.
-        stop_resources = getattr(self, "stop_resource_logging", None)
-        if callable(stop_resources):
-            try:
-                stop_resources()
-            except Exception:
-                pass
         try:
             now_mono = time.monotonic()
             # tick() drains all motion events queued since the last periodic
@@ -3358,6 +3897,9 @@ class WebControlNode(Node):
                     "kind": "shutdown",
                     "source": "diagnostics",
                     **final,
+                    "lidar_receive_enabled": getattr(
+                        self, "diagnostics_lidar_receive_enabled", True
+                    ),
                     # Keep the final wheel-motion fields directly on the
                     # shutdown row as well as under "motion" for offline review.
                     "motion": motion,
@@ -3605,6 +4147,10 @@ class WebControlNode(Node):
         return response
 
     def start_http_server(self) -> None:
+        hub = getattr(self, "cloud_hub", None)
+        if hub is not None:
+            hub.refresh()
+            hub.start()
         handler = self.make_handler()
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self.httpd.daemon_threads = True
@@ -3617,6 +4163,11 @@ class WebControlNode(Node):
         )
 
     def stop_http_server(self) -> None:
+        # Wake blocked SSE writers before stopping the accept loop so their
+        # handler threads can notice shutdown instead of waiting for a client.
+        hub = getattr(self, "cloud_hub", None)
+        if hub is not None:
+            hub.stop()
         if self.httpd is not None:
             try:
                 self.httpd.shutdown()
@@ -3646,6 +4197,20 @@ class WebControlNode(Node):
                         self.send_json(node.ui_preferences_payload())
                     elif parsed.path == "/api/pose":
                         self.send_json(node.pose_payload())
+                    elif parsed.path == "/api/cloud/events":
+                        group = query.get("group", ["nav"])[0]
+                        layers = query.get("layers", [""])[0]
+                        paths = query.get("paths", [""])[0]
+                        pose = query.get("pose", [""])[0]
+                        clouds = query.get("clouds", ["1"])[0]
+                        self.stream_cloud_events(
+                            node,
+                            group,
+                            layers,
+                            paths=paths,
+                            pose=pose,
+                            clouds=clouds != "0",
+                        )
                     elif parsed.path == "/api/map2d":
                         layer = query.get("layer", ["local_map"])[0]
                         normalize_layer_name(layer)
@@ -3724,6 +4289,9 @@ class WebControlNode(Node):
                         self.send_json(node.mapping_path_payload())
                     elif parsed.path == "/api/mapping/save_map":
                         self.send_json(node.save_map_status_payload())
+                    elif parsed.path == "/api/mapping/save_map/browse":
+                        target = query.get("path", [""])[0]
+                        self.send_json(node.save_map_browse_payload(target))
                     elif parsed.path == "/api/mapping/record":
                         self.send_json(node.recording_status_payload())
                     elif parsed.path == "/api/mapping/record/topics":
@@ -3820,6 +4388,108 @@ class WebControlNode(Node):
                     node.get_logger().error(f"HTTP POST failed: {exc}")
                     self.send_json(error_response("internal server error", node.now_sec()), status=500)
 
+            def _write_sse(self, event: str, payload: dict[str, Any]) -> None:
+                body = (
+                    f"event: {event}\n"
+                    f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+                ).encode("utf-8")
+                self.wfile.write(body)
+                self.wfile.flush()
+
+            def stream_cloud_events(
+                self,
+                node: Any,
+                group: str,
+                raw_layers: str,
+                *,
+                paths: str = "",
+                pose: str = "",
+                clouds: bool = True,
+            ) -> None:
+                """Serve one metadata-only SSE subscription for one browser.
+
+                The stream never serializes cloud/path points.  It carries
+                cloud revisions, configured path revisions, and tiny pose
+                payloads.  Demand is renewed only for cloud keys; path/pose
+                resources must never create or drive ROS subscriptions.  A 1 s
+                idle heartbeat renews dynamic cloud demand and detects a closed
+                tab.
+                """
+                cloud_keys = (
+                    parse_cloud_stream_keys(group, raw_layers) if clouds else ()
+                )
+                keys = tuple(
+                    dict.fromkeys(
+                        cloud_keys
+                        + parse_path_stream_keys(node, paths)
+                        + parse_pose_stream_keys(pose)
+                    )
+                )
+                if not keys:
+                    raise ValueError("empty metadata subscription")
+                cloud_key_set = set(cloud_keys)
+                hub = getattr(node, "cloud_hub", None)
+                if hub is None:
+                    raise ValueError("cloud metadata stream is unavailable")
+                try:
+                    self.connection.settimeout(5.0)
+                except OSError:
+                    pass
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    snapshot = hub.snapshot(keys)
+                    seen: dict[tuple[str, str], int] = {}
+                    for entry in snapshot:
+                        seen[(entry["group"], entry["layer"])] = entry["seq"]
+                    self._write_sse(
+                        "snapshot",
+                        {
+                            "epoch": str(getattr(hub, "epoch", "")),
+                            "layers": snapshot,
+                        },
+                    )
+                    while not hub.stopped:
+                        note_demand = getattr(node, "note_cloud_demand", None)
+                        if note_demand is not None:
+                            for key in keys:
+                                if key in cloud_key_set:
+                                    note_demand(key[0], key[1])
+                        changes = hub.wait_for_changes(
+                            seen, timeout=1.0, keys=keys
+                        )
+                        if changes == []:
+                            break
+                        if changes:
+                            for entry in changes:
+                                seen[(entry["group"], entry["layer"])] = entry[
+                                    "seq"
+                                ]
+                            self._write_sse(
+                                "cloud",
+                                {
+                                    "epoch": str(getattr(hub, "epoch", "")),
+                                    "layers": changes,
+                                },
+                            )
+                        else:
+                            # The write detects a hidden/closed tab; demand is
+                            # not renewed again after it fails.
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                except (
+                    BrokenPipeError,
+                    ConnectionResetError,
+                    socket.timeout,
+                    OSError,
+                ):
+                    return
+
             def send_encoded_json(self, body: bytes, status: int = 200) -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -3908,7 +4578,12 @@ class WebControlNode(Node):
         # Reject queued/in-flight cloud results, release pending raw buffers
         # and serialized bodies, then join the worker within a bounded time
         # before any log or node teardown.
+        subscription_timer = getattr(self, "_cloud_subscription_timer", None)
+        if subscription_timer is not None:
+            subscription_timer.cancel()
+        self.release_all_cloud_subscriptions()
         advance_cloud_generation(self)
+        advance_state_generation(self, _all_state_keys(self))
         cloud_worker = getattr(self, "cloud_worker", None)
         if cloud_worker is not None:
             cloud_worker.stop()
@@ -3917,9 +4592,6 @@ class WebControlNode(Node):
         if recording is not None:
             recording.cleanup(self.now_sec())
         self.cleanup_save_map()
-        # Stop the independent resource thread first: no resource write may race
-        # with the diagnostics close performed by shutdown_diagnostics().
-        self.stop_resource_logging()
         # Stop managed processes while the diagnostics log is still open: their
         # chassis exit hook queues a lifecycle event that shutdown_diagnostics
         # drains into the saved JSONL. Do not close the log before this point.

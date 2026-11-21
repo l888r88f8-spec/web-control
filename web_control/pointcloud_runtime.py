@@ -2,19 +2,30 @@
 
 ROS subscription callbacks only replace one pending frame reference per layer.
 A single daemon worker performs the vectorised decode away from the executor and
-from ``WebControlNode.lock``.  Demand-aware layers (local map, live obstacles
-and Mapping map/ground) are decoded only while a map endpoint has recently
-requested them; the three latched navigation maps are decoded once per new
-input for an early cache.  Every layer releases its raw ROS buffer as soon as
-the bounded downsampled 3D cache exists.
+from ``WebControlNode.lock``.  Every layer is demand-gated: it decodes only
+while an HTTP/SSE viewer has requested it within the demand TTL.  The three
+latched navigation maps keep a 1 Hz output ceiling so a re-subscribed map is
+not decoded twice per publisher sample.  Every layer releases its raw ROS
+buffer as soon as its decoded 3D cache exists.  A layer that is never demanded
+keeps at most one raw frame (its single pending slot) until demand,
+invalidation or shutdown.  The web display calls the worker with
+``max_points=0``: every finite received point is retained.  The
+bounded sampling helper remains available for callers that explicitly
+request a limit.
 
-Mapping map/ground clouds run at their 1 Hz ceiling exactly like the live local
-map: without a recent view request the worker keeps only the latest raw frame
-and decodes it when a Mapping view resumes.
+Dynamic layers follow incoming publisher frames.  There is no fixed output
+ceiling: while the worker is busy, newer frames replace the single pending slot
+so a slow decode degrades to the latest frame instead of growing a backlog.
+The three latched navigation maps keep their one-new-input-per-second output
+ceiling because they are static until a real lifecycle reset.
 
-The module deliberately owns no ROS imports so it can be unit-tested without a
-ROS runtime.  Callers inject the message object, the result callback and,
-optionally, a legacy reader used only for formats NumPy cannot decode.
+``CloudRevisionHub`` publishes metadata-only revisions to the HTTP layer.  It
+never receives or serializes point arrays, so notification can happen outside
+the ROS executor and without rebuilding cloud JSON.
+
+The module deliberately owns no ROS imports.  Callers pass the message object,
+the result callback and, optionally, a legacy reader used only for formats
+NumPy cannot decode.
 """
 
 from __future__ import annotations
@@ -23,11 +34,13 @@ import json
 import math
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
-try:  # NumPy is a declared runtime dependency; keep the import guard for tests.
+try:  # NumPy is a declared runtime dependency; keep the import guard so a
+    # partial install can fall back to the legacy reader.
     import numpy as np
 except Exception:  # pragma: no cover - only on a broken installation
     np = None
@@ -247,8 +260,10 @@ def parse_pointcloud2(
     max_points: int,
     legacy_reader: Optional[Callable[[Any], Iterable[Sequence[float]]]] = None,
 ) -> tuple[list[list[float]], int]:
-    """Decode a PointCloud2 into ``(downsampled_xyz, finite_count)``.
+    """Decode a PointCloud2 into ``(xyz, finite_count)``.
 
+    ``max_points <= 0`` returns every finite point; a positive value retains
+    the historical bounded sampling for explicit unit/benchmark callers.
     ``legacy_reader`` is only consulted for unsupported field types.  Invalid
     layouts always raise so a bad cloud produces a logged error, not a silent
     partial or misaligned scene.
@@ -261,27 +276,27 @@ def parse_pointcloud2(
     return _parse_legacy(msg, max_points, legacy_reader)
 
 
-# Rates are deliberately fixed here: these are visualization output ceilings,
-# not control-loop rates.  The frontend polling policy is unchanged.
+# Only the static latched navigation maps retain an output ceiling.  Dynamic
+# layers are intentionally absent: they follow publisher frames and rely on the
+# single latest-frame slot, not a rate limiter, for bounded load.
 LAYER_RATES = {
-    ("nav", "local_map"): 1.0,
-    ("nav", "obstacles"): 5.0,
-    ("mapping", "global_map"): 1.0,
-    ("mapping", "ground"): 1.0,
+    ("nav", "global_map"): 1.0,
+    ("nav", "mapcloud"): 1.0,
+    ("nav", "mapground"): 1.0,
 }
 STATIC_LAYERS = frozenset(
     {
-        # Only the three latched navigation maps are decoded without demand so
-        # an early/late browser has data immediately.  Mapping map/ground are
-        # growing live clouds and follow the same demand TTL as local_map.
+        # The three latched navigation maps keep a 1 Hz output ceiling so a
+        # re-subscribed map is not decoded twice per publisher sample.  They
+        # are demand-gated like every other layer.
         ("nav", "global_map"),
         ("nav", "mapcloud"),
         ("nav", "mapground"),
     }
 )
 STATIC_RATE = 1.0
-# A request is considered active for a short window so a browser polling at
-# 1-2 Hz keeps the dynamic decoder alive without a heartbeat dependency.
+# A request is considered active for a short window so an SSE viewer can renew
+# demand about once per second without keeping every layer permanently active.
 DEFAULT_DEMAND_TTL_SEC = 2.0
 
 
@@ -390,6 +405,29 @@ class PointCloudIngestWorker:
             self._demand[key] = self._clock() if now is None else float(now)
             self._cond.notify()
 
+    def demand_active(
+        self, key: tuple[str, str], *, now: Optional[float] = None
+    ) -> bool:
+        """Return whether ``key`` was demanded within the TTL."""
+        with self._cond:
+            current = self._clock() if now is None else float(now)
+            return self._demand_active((str(key[0]), str(key[1])), current)
+
+    def demand_stamps(self) -> dict[tuple[str, str], float]:
+        """Copy of the last demand stamp per layer.
+
+        The reconciler reads this to decide which subscriptions to keep; the
+        worker owns the stamps so a released layer cannot keep decoding.
+        Stamps use this worker's clock (``time.monotonic`` by default), so the
+        reconciler must compare them with ``now()``, never a wall clock.
+        """
+        with self._cond:
+            return dict(self._demand)
+
+    def now(self) -> float:
+        """Current worker-clock time; the only clock demand stamps use."""
+        return self._clock()
+
     def invalidate(
         self, keys: Optional[Iterable[tuple[str, str]]] = None
     ) -> None:
@@ -461,12 +499,15 @@ class PointCloudIngestWorker:
             pass
 
     def _demand_active(self, key: tuple[str, str], now: float) -> bool:
-        if key in self._static_layers:
-            return True
         stamp = self._demand.get(key)
         return stamp is not None and (now - stamp) <= self._demand_ttl
 
     def _ready_at(self, key: tuple[str, str]) -> float:
+        # Dynamic layers have no output ceiling.  Their single pending slot is
+        # the backpressure mechanism, so any retained frame is immediately
+        # eligible once demand is active.
+        if key not in self._static_layers:
+            return float("-inf")
         last = self._last_output.get(key)
         if last is None:
             return float("-inf")
@@ -566,6 +607,243 @@ class PointCloudIngestWorker:
         finally:
             frame = None
             points = None
+
+
+class CloudRevisionHub:
+    """Metadata-only revision fan-out for browser cloud subscriptions.
+
+    Entries contain versions and status, never point arrays.  A subscriber
+    keeps its own ``seen`` sequence map, so one slow or disconnected client
+    cannot consume an event on behalf of another.  Duplicate metadata is
+    suppressed; a version or status change increments only that layer's
+    sequence.
+
+    ``metadata_reader`` is optional.  When supplied, a small monitor thread
+    periodically refreshes all metadata so time-based transitions (for example
+    ``active`` -> ``stale``) still reach subscribers without a new frame.  The
+    reader must return a mapping of ``(group, layer)`` to metadata dicts and
+    must not serialize geometry.
+    """
+
+    def __init__(
+        self,
+        metadata_reader: Optional[Callable[[], dict[Any, dict[str, Any]]]] = None,
+        *,
+        epoch: Optional[str] = None,
+        clock: Callable[[], float] = time.monotonic,
+        status_interval_sec: float = 1.0,
+    ) -> None:
+        self._reader = metadata_reader
+        self._clock = clock
+        # Immutable per-server-session identity.  A browser treats a change as
+        # a new web-service process and resets its version cursors.
+        self.epoch = str(epoch) if epoch is not None else uuid.uuid4().hex
+        self._status_interval = max(0.1, float(status_interval_sec))
+        self._cond = threading.Condition(threading.RLock())
+        self._metadata: dict[Any, dict[str, Any]] = {}
+        self._seq: dict[Any, int] = {}
+        # Highest snapshot order accepted per layer.  Snapshot orders are
+        # assigned while the node lock is held, so an older read that returns
+        # after a newer one can never roll metadata (or status) backwards.
+        self._order: dict[Any, int] = {}
+        self._stopped = False
+        self._thread: Optional[threading.Thread] = None
+        self._monitor_stop = threading.Event()
+
+    @property
+    def stopped(self) -> bool:
+        with self._cond:
+            return self._stopped
+
+    @staticmethod
+    def _comparable_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        """Return an entry with refresh-only pose age removed.
+
+        ``cloud_metadata_snapshot`` deliberately attaches a wall-time-derived
+        ``age`` to every pose entry so a late subscriber sees an accurate HUD.
+        That field changes on every monitor refresh, but it is not a new
+        revision: comparing it would emit a same-version event once per
+        status interval and make the browser re-apply an unchanged pose.
+        """
+        comparable = dict(entry)
+        pose = comparable.get("pose")
+        if isinstance(pose, dict) and "age" in pose:
+            pose = dict(pose)
+            pose.pop("age", None)
+            comparable["pose"] = pose
+        return comparable
+
+    @classmethod
+    def _revision_equal(
+        cls, current: Optional[dict[str, Any]], entry: dict[str, Any]
+    ) -> bool:
+        if current is None:
+            return False
+        return cls._comparable_entry(current) == cls._comparable_entry(entry)
+
+    def _entry(self, key: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        group, layer = key
+        entry = {
+            "group": str(payload.get("group", group)),
+            "layer": str(payload.get("layer", layer)),
+            "version": int(payload.get("version", 0)),
+            "generation": int(payload.get("generation", 0)),
+            "status": str(payload.get("status", "waiting")),
+            "frame_id": str(payload.get("frame_id", "")),
+            "count": int(payload.get("count", 0)),
+        }
+        # Pose is tiny and deliberately travels inline with its revision so the
+        # browser does not issue one HTTP request per odometry frame.  Large
+        # path/cloud arrays are never accepted here.
+        pose = payload.get("pose")
+        if isinstance(pose, dict):
+            entry["pose"] = dict(pose)
+        return entry
+
+    def publish_many(
+        self,
+        metadata: dict[Any, dict[str, Any]],
+        *,
+        snapshot_order: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Publish metadata and return only entries whose tuple changed.
+
+        ``snapshot_order`` (or a per-entry ``snapshot_order``) is assigned
+        under the node lock.  A lower order is an older read and is discarded
+        even when it arrives later, so concurrent refresh threads cannot roll
+        a newer version or a fresher same-version status back.
+        """
+        changed: list[dict[str, Any]] = []
+        with self._cond:
+            if self._stopped:
+                return []
+            for key, payload in metadata.items():
+                entry = self._entry(key, payload)
+                raw_order = payload.get("snapshot_order", snapshot_order)
+                order: Optional[int] = None
+                if raw_order is not None:
+                    try:
+                        order = int(raw_order)
+                    except (TypeError, ValueError):
+                        order = None
+                if order is not None:
+                    previous_order = self._order.get(key)
+                    if previous_order is not None and order < previous_order:
+                        continue
+                current = self._metadata.get(key)
+                if current is not None:
+                    if entry["version"] < current["version"]:
+                        continue
+                    if entry["generation"] < current["generation"]:
+                        continue
+                if order is not None:
+                    self._order[key] = order
+                if self._revision_equal(current, entry):
+                    # Refresh the stored HUD age without creating a revision;
+                    # status/frame/generation/version/pose changes still emit.
+                    self._metadata[key] = entry
+                    continue
+                self._metadata[key] = entry
+                self._seq[key] = self._seq.get(key, 0) + 1
+                changed.append({**entry, "seq": self._seq[key]})
+            if changed:
+                self._cond.notify_all()
+        changed.sort(key=lambda item: (item["group"], item["layer"]))
+        return changed
+
+    def snapshot(
+        self, keys: Optional[Iterable[Any]] = None
+    ) -> list[dict[str, Any]]:
+        """Return current metadata plus each layer's durable sequence."""
+        allowed = None if keys is None else set(keys)
+        with self._cond:
+            entries = []
+            for key, entry in self._metadata.items():
+                if allowed is not None and key not in allowed:
+                    continue
+                entries.append({**entry, "seq": self._seq.get(key, 0)})
+        entries.sort(key=lambda item: (item["group"], item["layer"]))
+        return entries
+
+    def wait_for_changes(
+        self,
+        seen: dict[Any, int],
+        *,
+        timeout: float,
+        keys: Optional[Iterable[Any]] = None,
+    ) -> Optional[list[dict[str, Any]]]:
+        """Wait for metadata newer than ``seen``.
+
+        Returns changed entries, ``[]`` when the hub stops, and ``None`` on a
+        timeout with no change.  ``seen`` is caller-owned, so each browser
+        keeps its own event cursor.
+        """
+        allowed = None if keys is None else set(keys)
+        deadline = self._clock() + max(0.0, float(timeout))
+        with self._cond:
+            while True:
+                if self._stopped:
+                    return []
+                changed = []
+                for key, entry in self._metadata.items():
+                    if allowed is not None and key not in allowed:
+                        continue
+                    seq = self._seq.get(key, 0)
+                    if seen.get(key) != seq:
+                        changed.append({**entry, "seq": seq})
+                if changed:
+                    changed.sort(key=lambda item: (item["group"], item["layer"]))
+                    return changed
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
+
+    def refresh(self) -> list[dict[str, Any]]:
+        """Read current metadata from the node and publish any changes."""
+        reader = self._reader
+        if reader is None:
+            return []
+        try:
+            metadata = reader()
+        except Exception:
+            return []
+        return self.publish_many(metadata)
+
+    def start(self) -> None:
+        reader = self._reader
+        with self._cond:
+            if self._stopped or reader is None or self._thread is not None:
+                return
+            self._monitor_stop.clear()
+            self._thread = threading.Thread(
+                target=self._monitor,
+                name="web_control_cloud_revisions",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _monitor(self) -> None:
+        while not self._monitor_stop.wait(self._status_interval):
+            if self.stopped:
+                return
+            self.refresh()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        with self._cond:
+            if not self._stopped:
+                self._stopped = True
+                self._cond.notify_all()
+            thread = self._thread
+        self._monitor_stop.set()
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(max(0.0, float(timeout)))
+        # The monitor may have published once more after ``_stopped`` was set;
+        # publish_many rejects that path, so no post-stop events are queued.
 
 
 class CloudResponseCache:

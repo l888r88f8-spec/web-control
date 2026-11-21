@@ -39,10 +39,14 @@ whether a map tab has requested the layer. When no cloud endpoint has requested
 `local_map`, `obstacles`, or either Mapping map/ground cloud for
 `cloud_demand_ttl_sec` (default 2 s), those decodes stop while at most the
 latest raw frame is retained. A later `/api/map3d` or `/api/mapping/map3d`
-request wakes the worker and decodes that latest frame. Only the three latched
-navigation maps (`global_map`, `mapcloud`, `mapground`) are decoded once per new
-input without a request for an early/late-browser cache. All layers retain only
-the bounded 3D cache, not the raw ROS buffer.
+request wakes the worker and decodes that latest frame. Every layer is
+demand-gated. The three latched navigation maps (`global_map`, `mapcloud`,
+`mapground`) keep a 1 Hz output ceiling; idle subscriptions are released (and
+their decoded caches dropped) after `cloud_subscription_idle_sec` (default
+5 s). A later request re-subscribes, with latched topics replaying their last
+sample and live topics waiting for a new one. Decoded layers retain only the 3D
+cache; a subscribed layer inside its idle grace keeps at most one pending raw
+frame.
 
 The ROS executor no longer performs the synchronous point-cloud decode. Measure
 the live node and machine after deployment with the existing resource logs;

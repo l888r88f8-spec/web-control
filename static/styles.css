@@ -676,7 +676,11 @@ input {
 }
 
 .diagnostics-state.state-stale,
+.diagnostics-state.state-stats_stale,
+.diagnostics-state.state-idle,
 .diagnostics-state.state-no_publisher,
+.diagnostics-state.state-publisher_only,
+.diagnostics-state.state-unknown,
 .diagnostics-state.state-unavailable {
   color: #ff9f0a;
 }
@@ -763,7 +767,11 @@ input {
 }
 
 .rate-chip[data-state="stale"],
+.rate-chip[data-state="stats_stale"],
+.rate-chip[data-state="idle"],
 .rate-chip[data-state="no_publisher"],
+.rate-chip[data-state="publisher_only"],
+.rate-chip[data-state="unknown"],
 .rate-chip[data-state="unavailable"] {
   border-color: rgba(255, 159, 10, 0.38);
   color: #ff9f0a;
@@ -2085,7 +2093,8 @@ button.stop-log:disabled:hover,
   margin: 0 0 4px;
 }
 
-#saveMapDestination,
+#saveMapDirectory,
+#saveMapName,
 #recordingDirectory,
 #recordingName {
   width: 100%;
@@ -2119,7 +2128,10 @@ button.stop-log:disabled:hover,
 .recording-dialog-head button,
 #browseRecordingDirectory,
 #recordingBrowserUp,
-#recordingBrowserUse {
+#recordingBrowserUse,
+#browseSaveMapDirectory,
+#saveMapBrowserUp,
+#saveMapBrowserUse {
   min-height: 32px;
   border: 1px solid var(--line);
   border-radius: 999px;

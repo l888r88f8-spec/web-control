@@ -20,7 +20,7 @@
         <div id="view3d" class="viewport active">
           <canvas id="mapCanvas3d"></canvas>
           <div class="hud" id="hud">3D map ready</div>
-          <div id="mappingJoystick" class="joystick" hidden>
+          <div id="mappingJoystick" class="joystick" hidden inert aria-hidden="true">
             <div id="throttleStick" class="joystick-stick" data-role="throttle">
               <button id="throttleMoveHandle" class="joystick-move-handle" type="button" aria-label="Move throttle joystick"></button>
               <div id="throttleBase" class="joystick-base">
@@ -88,7 +88,7 @@
                       <th scope="col">话题</th>
                       <th scope="col">类型</th>
                       <th scope="col">发布者</th>
-                      <th scope="col">接收 Hz</th>
+                      <th scope="col">频率（来源）</th>
                       <th scope="col">最后数据</th>
                       <th scope="col">状态</th>
                     </tr>
@@ -347,10 +347,12 @@
           <div class="collapse-body" hidden>
           <label><input type="checkbox" data-layer="global_map" checked> global map</label>
           <label><input type="checkbox" data-layer="local_map" checked> local map</label>
+          <label><input type="checkbox" data-layer="current_lidar" checked> current lidar</label>
           <label><input type="checkbox" data-layer="mapcloud" checked> navigation map</label>
           <label><input type="checkbox" data-layer="mapground" checked> ground map</label>
           <label><input type="checkbox" data-layer="obstacles" checked> obstacles</label>
           <label><input type="checkbox" id="pathLayer" checked> planning paths</label>
+          <label><input type="checkbox" id="trajectoryLayer" checked> best trajectory</label>
           <label><input type="checkbox" id="vehicleLayer" checked> vehicle</label>
           </div>
         </section>
@@ -375,6 +377,7 @@
             <button class="start-log" data-managed-target="lidar" type="button" aria-pressed="false">Start Lidar</button>
             <button id="mappingProcessToggle" class="start-log" data-managed-target="mapping" type="button" aria-pressed="false">Start Mapping</button>
             <button id="mappingTopicLoggingToggle" class="start-log topic-logging-toggle" data-topic-logging-toggle type="button" aria-pressed="false" disabled>开始记录话题</button>
+            <button id="mappingJoystickToggle" class="start-log" type="button" aria-pressed="false" aria-controls="mappingJoystick">显示轮盘</button>
           </div>
           <div class="startup-rate-row">
             <span class="rate-chip" data-diagnostics-chip="imu">IMU --</span>
@@ -482,11 +485,26 @@
     <dialog id="saveMapDialog" aria-labelledby="saveMapTitle">
       <form id="saveMapForm">
         <h2 id="saveMapTitle">Save Map</h2>
-        <label for="saveMapDestination">Destination path under the robot user's home directory</label>
-        <input id="saveMapDestination" name="destination" type="text" value="/map/hesai_outdoor" placeholder="/map/hesai_outdoor" autocomplete="off" required>
-        <p class="save-map-hint">Enter a path such as /map or /map/site. The web node resolves it under its user's home directory on the robot (usually /home/robot). Existing map files in that directory will be overwritten; unrelated files are preserved.</p>
+        <label for="saveMapDirectory">Parent directory (absolute path on robot)</label>
+        <div class="recording-dir-row">
+          <input id="saveMapDirectory" name="directory" type="text" placeholder="/home/robot/map" autocomplete="off" required>
+          <button id="browseSaveMapDirectory" type="button">Browse...</button>
+        </div>
+        <div id="saveMapBrowser" class="recording-browser" hidden>
+          <div class="recording-browser-head">
+            <button id="saveMapBrowserUp" type="button">Up</button>
+            <code id="saveMapBrowserPath" class="recording-path"></code>
+          </div>
+          <div id="saveMapBrowserList" class="recording-browser-list"></div>
+          <button id="saveMapBrowserUse" type="button">Use this directory</button>
+        </div>
+        <p id="saveMapBrowserError" class="recording-error" role="alert"></p>
+        <label for="saveMapName">Map folder name</label>
+        <input id="saveMapName" name="name" type="text" value="hesai_clean" autocomplete="off" required>
+        <p id="saveMapOutput" class="recording-path"></p>
         <label class="save-map-option"><input id="saveMapGround" type="checkbox" checked> Save ground map (GroundMap.pcd)</label>
         <label class="save-map-option"><input id="saveMapTiled" type="checkbox" checked> Save tiled map</label>
+        <p class="save-map-hint">Parent must exist and be writable. The map folder is created or overwritten.</p>
         <div class="save-map-dialog-actions">
           <button id="cancelSaveMap" type="button">Cancel</button>
           <button id="confirmSaveMap" type="submit">Save</button>

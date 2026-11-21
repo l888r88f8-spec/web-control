@@ -1,7 +1,7 @@
 """ROS-free topic-rate, wheel-odometry motion, and diagnostics logging core.
 
-The module deliberately never imports rclpy so the monitoring policy can be
-unit-tested with plain clocks and message-shaped objects.  Distance is derived
+The module deliberately never imports rclpy: the monitoring policy receives
+plain clocks and message-shaped objects.  Distance is derived
 only from measured chassis wheel odometry; IMU observations are auxiliary and
 never prove motion.
 """
@@ -24,6 +24,12 @@ from web_control.log_store import LogStorageError, ManagedLogStore
 DIAGNOSTICS_TARGET = "diagnostics"
 DEFAULT_WINDOW_SEC = 5.0
 DEFAULT_STALE_TIMEOUT_SEC = 2.0
+# The driver publishes one small DiagnosticArray per second.  Its status name
+# and source-topic value are both checked so unrelated diagnostic publishers
+# cannot overwrite the LiDAR row.
+LIDAR_PUBLISH_STATS_STATUS_NAME = "hesai_lidar_publish"
+DEFAULT_LIDAR_STATS_STALE_TIMEOUT_SEC = 3.0
+LIDAR_PUBLISH_STATS_STATES = frozenset({"waiting", "idle", "publishing"})
 DEFAULT_TOPIC_SPECS: tuple[dict[str, str], ...] = (
     {
         "key": "imu",
@@ -62,10 +68,39 @@ TOPIC_LOG_KEYS = frozenset(
         "last_age_sec",
         # Motion events copy the topic status as a bare ``status`` key.
         "status",
+        "receive_enabled",
+        "lidar_receive_enabled",
         "window_sec",
         "window_count",
         "received_count",
         "last_received_stamp",
+        # Driver-publish statistics are topic telemetry too.  OFF removes the
+        # flat aliases and the nested driver_stats block at the write boundary.
+        "publish_hz",
+        "publish_hz_source",
+        "last_publish_hz",
+        "received_hz",
+        "received_hz_source",
+        "hz_source",
+        "rate_source",
+        "stats_status",
+        "stats_age_sec",
+        # The top-level snapshot adds both a rate-source alias and the entire
+        # driver report; OFF must drop them together with the flat row fields.
+        "lidar_rate_source",
+        "lidar_publish_stats",
+        "driver_stats",
+        "driver_publish_hz",
+        "driver_window_sec",
+        "driver_window_count",
+        "driver_total_frames",
+        "driver_cloud_age_sec",
+        "driver_stats_age_sec",
+        "driver_session_id",
+        "driver_sequence",
+        "driver_state",
+        "driver_last_publish_hz",
+        "cloud_age_sec",
     }
 )
 
@@ -87,12 +122,72 @@ def filter_topic_logging_entry(
     return {key: value for key, value in entry.items() if key not in TOPIC_LOG_KEYS}
 
 
+# A topic transition must be self-contained for offline review: include the
+# bounded common row fields (sources, counters, window, session/sequence, and
+# ages) instead of duplicating an older subset in the timer callback.
+TOPIC_STATUS_EVENT_KEYS = (
+    "topic",
+    "message_type",
+    "status",
+    "receive_enabled",
+    "publisher_count",
+    "publisher_checked_age_sec",
+    "hz",
+    "hz_source",
+    "rate_source",
+    "publish_hz",
+    "publish_hz_source",
+    "last_publish_hz",
+    "received_hz",
+    "received_hz_source",
+    "received_count",
+    "last_received_stamp",
+    "last_age_sec",
+    "window_sec",
+    "window_count",
+    "stats_status",
+    "stats_age_sec",
+    "driver_stats",
+    "driver_publish_hz",
+    "driver_window_sec",
+    "driver_window_count",
+    "driver_total_frames",
+    "driver_cloud_age_sec",
+    "driver_stats_age_sec",
+    "driver_session_id",
+    "driver_sequence",
+    "driver_state",
+    "driver_last_publish_hz",
+    "cloud_age_sec",
+)
+
+
+def topic_status_event_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Copy the bounded transition fields from a snapshot row."""
+    return {key: row.get(key) for key in TOPIC_STATUS_EVENT_KEYS if key in row}
+
+
+
 def _finite(value: Any) -> Optional[float]:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _nonnegative_int(value: Any) -> Optional[int]:
+    """Parse a decimal counter exactly; reject signs, floats, bools and junk."""
+    if isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or not text.isdigit():
+        return None
+    try:
+        number = int(text, 10)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _iso_time(stamp: float) -> str:
@@ -160,6 +255,7 @@ class TopicRateMonitor:
         stale_timeout_sec: float = DEFAULT_STALE_TIMEOUT_SEC,
         enabled: bool = True,
         available: bool = True,
+        receive_enabled: bool = True,
     ) -> None:
         self.key = str(key)
         self.label = str(label)
@@ -169,6 +265,9 @@ class TopicRateMonitor:
         self.stale_timeout_sec = max(0.1, float(stale_timeout_sec))
         self.enabled = bool(enabled)
         self.available = bool(available)
+        # False means this monitor deliberately has no message subscription;
+        # publisher presence is still queried by the shared graph check.
+        self.receive_enabled = bool(receive_enabled)
         self._received: deque[float] = deque(maxlen=8192)
         self._total = 0
         self._last_received: Optional[float] = None
@@ -178,13 +277,17 @@ class TopicRateMonitor:
         self._lock = threading.RLock()
 
     def record(self, now_mono: float) -> None:
+        if not self.receive_enabled:
+            # No receive path exists in this mode, so a stray/old callback must
+            # not create fake frequency or an ``active`` state.
+            return
         now = _finite(now_mono)
         if now is None:
             return
         with self._lock:
             if self._last_received is not None and now < self._last_received:
                 # A caller only uses one monotonic source; keep the counter
-                # ordered if a test or clock reset hands us a smaller value.
+                # ordered if a clock reset hands us a smaller value.
                 now = self._last_received
             self._received.append(now)
             self._last_received = now
@@ -214,8 +317,16 @@ class TopicRateMonitor:
         now = _finite(now_mono) or 0.0
         with self._lock:
             self._trim(now)
-            age = None if self._last_received is None else max(0.0, now - self._last_received)
-            if len(self._received) >= 2:
+            age = (
+                None
+                if self._last_received is None or not self.receive_enabled
+                else max(0.0, now - self._last_received)
+            )
+            if not self.receive_enabled:
+                # There is no receive subscription in this mode.  A null rate
+                # is honest; converting it to 0 would claim a measured zero.
+                hz = None
+            elif len(self._received) >= 2:
                 span = self._received[-1] - self._received[0]
                 hz = (len(self._received) - 1) / span if span > 0.0 else 0.0
             else:
@@ -228,6 +339,7 @@ class TopicRateMonitor:
                 "message_type": self.message_type,
                 "enabled": self.enabled,
                 "available": self.available,
+                "receive_enabled": self.receive_enabled,
                 "status": status,
                 "publisher_count": self._publisher_count,
                 "publisher_checked_age_sec": (
@@ -235,7 +347,13 @@ class TopicRateMonitor:
                     if self._publisher_checked is None
                     else max(0.0, now - self._publisher_checked)
                 ),
-                "hz": round(float(hz), 3) if math.isfinite(hz) else 0.0,
+                "hz": (
+                    None
+                    if hz is None
+                    else round(float(hz), 3)
+                    if math.isfinite(hz)
+                    else 0.0
+                ),
                 "window_sec": self.window_sec,
                 "received_count": self._total,
                 "window_count": len(self._received),
@@ -247,6 +365,14 @@ class TopicRateMonitor:
     def _status_locked(self, age: Optional[float]) -> str:
         if not self.enabled or not self.available:
             return "unavailable"
+        if not self.receive_enabled:
+            # Publisher presence is checked independently from message receipt.
+            # Never call this intentionally unmeasured mode waiting/stale/active.
+            if self._publisher_count is None:
+                return "unknown"
+            if self._publisher_count == 0:
+                return "no_publisher"
+            return "publisher_only"
         if self._publisher_count == 0:
             return "no_publisher"
         if self._total <= 0:
@@ -257,8 +383,253 @@ class TopicRateMonitor:
 
     def status(self, now_mono: float) -> str:
         with self._lock:
-            age = None if self._last_received is None else max(0.0, now_mono - self._last_received)
+            age = (
+                None
+                if self._last_received is None or not self.receive_enabled
+                else max(0.0, now_mono - self._last_received)
+            )
             return self._status_locked(age)
+
+
+class LidarPublishStatsMonitor:
+    """Validate and track the driver's 1 Hz publish-statistics heartbeat.
+
+    This is deliberately independent from :class:`TopicRateMonitor`: receiving a
+    statistics message never increments the raw point-cloud receive counter or
+    sets its last-received stamp.  A fresh report may honestly say 0 Hz (the
+    driver is alive but is not publishing clouds); a stale or missing report
+    leaves the rate null instead of inventing a zero.
+    """
+
+    def __init__(
+        self,
+        topic: str,
+        source_topic: str,
+        *,
+        stale_timeout_sec: float = DEFAULT_LIDAR_STATS_STALE_TIMEOUT_SEC,
+        enabled: bool = True,
+        available: bool = True,
+    ) -> None:
+        self.topic = str(topic)
+        self.source_topic = str(source_topic)
+        self.stale_timeout_sec = max(0.5, float(stale_timeout_sec))
+        self.enabled = bool(enabled)
+        self.available = bool(available)
+        self._lock = threading.RLock()
+        self._publisher_count: Optional[int] = None
+        self._publisher_checked: Optional[float] = None
+        self._last_stats_mono: Optional[float] = None
+        self._last_report: Optional[dict[str, Any]] = None
+        self._last_publish_hz: Optional[float] = None
+        self._session_id: Optional[str] = None
+        self._sequence: Optional[int] = None
+        self._accepted = 0
+        self._invalid = 0
+        self._duplicates = 0
+        self._session_changes = 0
+
+    @classmethod
+    def parse(
+        cls, msg: Any, expected_source_topic: str
+    ) -> Optional[dict[str, Any]]:
+        """Return a validated report, or ``None`` for unrelated/bad input."""
+        statuses = getattr(msg, "status", None)
+        if not isinstance(statuses, (list, tuple)):
+            return None
+        target = None
+        for status in statuses:
+            if (
+                str(getattr(status, "name", "") or "")
+                == LIDAR_PUBLISH_STATS_STATUS_NAME
+            ):
+                target = status
+                break
+        if target is None:
+            return None
+        hardware_id = str(getattr(target, "hardware_id", "") or "")
+        raw_values = getattr(target, "values", None)
+        if not isinstance(raw_values, (list, tuple)):
+            return None
+        values: dict[str, str] = {}
+        for item in raw_values:
+            key = getattr(item, "key", None)
+            value = getattr(item, "value", None)
+            if key is None or value is None:
+                continue
+            values[str(key)] = str(value)
+
+        source_topic = values.get("source_topic", "").strip()
+        if not source_topic or source_topic != str(expected_source_topic):
+            return None
+        if hardware_id and hardware_id != source_topic:
+            return None
+
+        publish_hz = _finite(values.get("publish_rate_hz"))
+        window_sec = _finite(values.get("window_sec"))
+        last_age = _finite(values.get("last_publish_age_sec"))
+        if (
+            publish_hz is None
+            or publish_hz < 0.0
+            or publish_hz > 1000.0
+            or window_sec is None
+            or window_sec <= 0.0
+            or last_age is None
+        ):
+            return None
+        window_count = _nonnegative_int(values.get("frames_in_window"))
+        total_frames = _nonnegative_int(values.get("total_frames"))
+        sequence = _nonnegative_int(values.get("sequence"))
+        if window_count is None or total_frames is None or sequence is None:
+            return None
+        if window_count > total_frames:
+            return None
+        # -1 is the only accepted negative sentinel, and only while no frame
+        # has ever been published.  Values such as -0.5 are not a documented
+        # sentinel and must not create freshness.
+        if last_age < 0.0 and (last_age != -1.0 or total_frames != 0):
+            return None
+
+        session_id = values.get("session_id", "").strip()
+        if not session_id or len(session_id) > 128:
+            return None
+        state = values.get("state", "").strip()
+        if state and state not in LIDAR_PUBLISH_STATS_STATES:
+            return None
+        if not state:
+            state = (
+                "waiting"
+                if total_frames == 0
+                else ("idle" if window_count == 0 else "publishing")
+            )
+        return {
+            "publish_rate_hz": publish_hz,
+            "window_sec": window_sec,
+            "frames_in_window": window_count,
+            "total_frames": total_frames,
+            "last_publish_age_sec": last_age,
+            "source_topic": source_topic,
+            "session_id": session_id,
+            "sequence": sequence,
+            "state": state,
+        }
+
+    def record(self, msg: Any, now_mono: float) -> bool:
+        parsed = self.parse(msg, self.source_topic)
+        now = _finite(now_mono)
+        if parsed is None or now is None:
+            with self._lock:
+                self._invalid = min(self._invalid + 1, 2**63 - 1)
+            return False
+        with self._lock:
+            same_session = parsed["session_id"] == self._session_id
+            if (
+                same_session
+                and self._sequence is not None
+                and parsed["sequence"] <= self._sequence
+            ):
+                # Duplicate/out-of-order report from the same driver session.
+                self._duplicates = min(self._duplicates + 1, 2**63 - 1)
+                return False
+            if not same_session:
+                if self._session_id is not None:
+                    self._session_changes = min(
+                        self._session_changes + 1, 2**63 - 1
+                    )
+            self._session_id = parsed["session_id"]
+            self._sequence = parsed["sequence"]
+            self._last_stats_mono = now
+            self._last_report = parsed
+            self._last_publish_hz = parsed["publish_rate_hz"]
+            self._accepted = min(self._accepted + 1, 2**63 - 1)
+            return True
+
+    def set_publisher_count(
+        self, count: Any, now_mono: Optional[float] = None
+    ) -> None:
+        try:
+            value = max(0, int(count))
+        except (TypeError, ValueError):
+            value = None
+        with self._lock:
+            self._publisher_count = value
+            if now_mono is not None:
+                self._publisher_checked = _finite(now_mono)
+
+    def snapshot(self, now_mono: float) -> dict[str, Any]:
+        now = _finite(now_mono) or 0.0
+        with self._lock:
+            age = (
+                None
+                if self._last_stats_mono is None
+                else max(0.0, now - self._last_stats_mono)
+            )
+            report = dict(self._last_report) if self._last_report else None
+            publisher_count = self._publisher_count
+            publisher_checked = self._publisher_checked
+            last_publish_hz = self._last_publish_hz
+            accepted = self._accepted
+            invalid = self._invalid
+            duplicates = self._duplicates
+            session_changes = self._session_changes
+
+            if not self.enabled or not self.available:
+                status = "unavailable"
+            elif report is None:
+                if publisher_count is None:
+                    status = "unknown"
+                elif publisher_count == 0:
+                    status = "no_publisher"
+                else:
+                    status = "waiting"
+            elif age is not None and age > self.stale_timeout_sec:
+                status = "stale"
+            else:
+                status = "fresh"
+
+            fresh = status == "fresh"
+            hz = report["publish_rate_hz"] if fresh and report else None
+            cloud_age = None
+            if fresh and report is not None:
+                reported_age = report["last_publish_age_sec"]
+                if reported_age >= 0.0:
+                    cloud_age = reported_age + (age or 0.0)
+            return {
+                "status": status,
+                "enabled": self.enabled,
+                "available": self.available,
+                "stats_topic": self.topic,
+                "source_topic": self.source_topic,
+                "hz": None if hz is None else round(float(hz), 3),
+                "hz_source": "driver_publish" if fresh else None,
+                "last_publish_hz": (
+                    None
+                    if last_publish_hz is None
+                    else round(float(last_publish_hz), 3)
+                ),
+                "window_sec": report["window_sec"] if report else None,
+                "window_count": report["frames_in_window"] if report else None,
+                "total_frames": report["total_frames"] if report else None,
+                "last_publish_age_sec": (
+                    None if cloud_age is None else round(float(cloud_age), 3)
+                ),
+                "cloud_age_sec": (
+                    None if cloud_age is None else round(float(cloud_age), 3)
+                ),
+                "stats_age_sec": None if age is None else round(float(age), 3),
+                "state": report["state"] if report else None,
+                "session_id": report["session_id"] if report else None,
+                "sequence": report["sequence"] if report else None,
+                "publisher_count": publisher_count,
+                "publisher_checked_age_sec": (
+                    None
+                    if publisher_checked is None
+                    else max(0.0, now - publisher_checked)
+                ),
+                "accepted_count": accepted,
+                "invalid_count": invalid,
+                "duplicate_count": duplicates,
+                "session_changes": session_changes,
+            }
 
 
 class MotionTracker:
@@ -655,6 +1026,7 @@ class DiagnosticsService:
 
     monitors: dict[str, TopicRateMonitor]
     motion: MotionTracker
+    lidar_stats: Optional[LidarPublishStatsMonitor] = None
     imu_observation: Optional[dict[str, Any]] = None
     _previous_status: dict[str, str] = field(default_factory=dict)
     _events: deque[dict[str, Any]] = field(default_factory=deque)
@@ -705,17 +1077,95 @@ class DiagnosticsService:
             now_mono,
         )
 
+    def record_lidar_stats(self, msg: Any, now_mono: float) -> bool:
+        """Handle one driver statistics sample without touching raw counters."""
+        if self.lidar_stats is None:
+            return False
+        return self.lidar_stats.record(msg, now_mono)
+
     def update_publisher_counts(self, counts: dict[str, Any], now_mono: float) -> None:
         for key, count in counts.items():
+            if key == "lidar_stats":
+                if self.lidar_stats is not None:
+                    self.lidar_stats.set_publisher_count(count, now_mono)
+                continue
             monitor = self.monitors.get(key)
             if monitor is not None:
                 monitor.set_publisher_count(count, now_mono)
 
+    @staticmethod
+    def _merge_lidar_stats(
+        row: dict[str, Any], stats: Optional[dict[str, Any]]
+    ) -> None:
+        """Attach the driver-report block while preserving raw receive fields."""
+        row["driver_stats"] = stats
+        row["stats_status"] = stats["status"] if stats else "unavailable"
+        row["stats_age_sec"] = stats["stats_age_sec"] if stats else None
+        row["cloud_age_sec"] = stats["cloud_age_sec"] if stats else None
+        row["last_publish_hz"] = stats["last_publish_hz"] if stats else None
+        received_hz = row["hz"] if row.get("receive_enabled") else None
+        row["received_hz"] = received_hz
+        row["received_hz_source"] = "received" if received_hz is not None else None
+
+        for source_key, target_key in (
+            ("window_sec", "driver_window_sec"),
+            ("window_count", "driver_window_count"),
+            ("total_frames", "driver_total_frames"),
+            ("last_publish_age_sec", "driver_cloud_age_sec"),
+            ("stats_age_sec", "driver_stats_age_sec"),
+            ("session_id", "driver_session_id"),
+            ("sequence", "driver_sequence"),
+            ("state", "driver_state"),
+            ("last_publish_hz", "driver_last_publish_hz"),
+        ):
+            row[target_key] = stats.get(source_key) if stats else None
+
+        if stats is not None and stats["status"] == "fresh":
+            hz = stats["hz"]
+            row["publish_hz"] = hz
+            row["publish_hz_source"] = "driver_publish"
+            row["driver_publish_hz"] = hz
+            row["hz"] = hz
+            row["hz_source"] = "driver_publish"
+            row["rate_source"] = "driver_publish"
+            # A fresh driver report with zero frames is a measured zero, not a
+            # missing measurement; keep it distinct from publisher_only/stale.
+            row["status"] = "idle" if hz is not None and hz <= 0.0 else "active"
+            row["last_age_sec"] = stats["last_publish_age_sec"]
+        elif stats is not None and stats["status"] == "stale":
+            row["publish_hz"] = None
+            row["publish_hz_source"] = None
+            row["driver_publish_hz"] = None
+            row["hz"] = None
+            row["hz_source"] = None
+            row["rate_source"] = None
+            row["status"] = "stats_stale"
+            row["last_age_sec"] = None
+        else:
+            # Old driver / no statistics: fall back to the raw receive monitor
+            # only when it is actually enabled and measured something.
+            row["publish_hz"] = None
+            row["publish_hz_source"] = None
+            row["driver_publish_hz"] = None
+            row["hz_source"] = "received" if received_hz is not None else None
+            row["rate_source"] = row["hz_source"]
+
     def snapshot(self, now_mono: float) -> dict[str, Any]:
+        stats = (
+            self.lidar_stats.snapshot(now_mono)
+            if self.lidar_stats is not None
+            else None
+        )
         with self._lock:
             topics = [
                 monitor.snapshot(now_mono) for monitor in self.monitors.values()
             ]
+            lidar_rate_source = None
+            for row in topics:
+                if row.get("key") == "lidar":
+                    self._merge_lidar_stats(row, stats)
+                    lidar_rate_source = row.get("rate_source")
+                    break
             observation = self.imu_observation
             if observation is not None and "imu" in self.monitors:
                 imu = self.monitors["imu"].snapshot(now_mono)
@@ -727,6 +1177,8 @@ class DiagnosticsService:
         return {
             "ok": True,
             "source_mode": "wheel_odometry_primary_imu_auxiliary",
+            "lidar_rate_source": lidar_rate_source,
+            "lidar_publish_stats": stats,
             "topics": topics,
             "imu_observation": observation,
             "motion": self.motion.snapshot(now_mono),
@@ -746,20 +1198,16 @@ class DiagnosticsService:
                 previous = self._previous_status.get(key)
                 if previous != row["status"]:
                     self._previous_status[key] = row["status"]
+                    wall = time.time()
                     events.append(
                         {
                             "kind": "topic_status",
                             "event": "status_change",
-                            "at": time.time(),
-                            "at_iso": _iso_time(time.time()),
+                            "at": wall,
+                            "at_iso": _iso_time(wall),
                             "source": row["topic"],
-                            "topic": row["topic"],
+                            **topic_status_event_fields(row),
                             "previous_status": previous,
-                            "status": row["status"],
-                            "publisher_count": row["publisher_count"],
-                            "hz": row["hz"],
-                            "last_age_sec": row["last_age_sec"],
-                            "message_type": row["message_type"],
                         }
                     )
             events.extend(self.motion.take_events())

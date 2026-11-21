@@ -11,6 +11,7 @@
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>action_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>lio_sam_hesai</exec_depend>
   <exec_depend>nav_msgs</exec_depend>

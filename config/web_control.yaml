@@ -6,6 +6,7 @@ web_control:
 
     global_map_topic: "/lio_sam/localization/global_map"  # Localization global map (latched)
     local_map_topic: "/lio_sam/localization/local_map"   # Localization local map
+    current_lidar_topic: "/lio_sam/localization/current_lidar"  # Localization current scan (map frame)
     mapcloud_topic: "mapcloud"                         # Navigation point cloud
     mapground_topic: "/weighted_ground"                 # Goal selection ground cloud
     obstacle_topic: "/aggregated_pc"                    # Live navigation obstacle cloud
@@ -20,13 +21,15 @@ web_control:
     goal_topic: "goal_pose_3d"                  # Goal pose output
     action_status_topic: "/p2p_move_base/_action/status"  # Navigation action status
     cancel_goal_service: "/p2p_move_base/_action/cancel_goal"  # Cancel goal service
-    path_topics: "/global_path"                 # Comma-separated path topics
+    path_topics: "/global_path"                 # Comma-separated nav_msgs/Path topics
+    trajectory_topic: "/best_trajectory"        # Predicted local trajectory (geometry_msgs/PoseArray); empty disables
 
     # Point clouds are cached once in 3D. max_2d_points_per_layer only caps the
     # legacy /api/map2d XY projection computed on request; no 2D cache is kept.
     max_2d_points_per_layer: 60000        # Lazy /api/map2d output cap, not a second cache
     max_3d_points_per_layer: 60000        # Max retained/sent 3D points per layer
-    cloud_demand_ttl_sec: 2.0             # Pause non-latched cloud decode after last map request (s)
+    cloud_demand_ttl_sec: 2.0             # Pause cloud decode after the last display request (s)
+    cloud_subscription_idle_sec: 5.0      # Release idle cloud subscriptions and their decoded cache (s); 0 keeps them until exit
     stale_timeout_sec: 2.0                # Source stale timeout seconds
 
     localization_launch_package: "lio_sam_hesai"                  # Localization launch package
@@ -38,7 +41,7 @@ web_control:
     mapping_launch_package: "lio_sam_hesai"                       # Mapping launch package
     mapping_launch_file: "mapping.launch.py"                      # Mapping launch file
     mapping_launch_args: ""                                       # Extra mapping launch args
-    recording_root: "/"                                           # Absolute root for rosbag directory browsing
+    recording_root: "/"                                           # Absolute root for rosbag/map directory browsing and saves
     chassis_launch_package: "hunter_base"                         # Chassis launch package
     chassis_launch_file: "hunter_base.launch.py"                  # Chassis launch file
     chassis_launch_args: ""                                       # Extra chassis launch args
@@ -57,17 +60,20 @@ web_control:
     viewer_timeout_sec: 10.0             # Viewer heartbeat timeout seconds
     teleop_cmd_vel_topic: "/cmd_vel"           # Hunter velocity command topic
     teleop_max_linear_speed: 1.0              # Max forward/reverse speed (m/s)
-    teleop_wheelbase: 0.65                    # Hunter wheelbase (m)
-    teleop_max_steer_angle: 0.461             # Max central steering angle (rad)
+    teleop_wheelbase: 0.550                   # Hunter SE wheelbase (m)
+    teleop_max_steer_angle: 0.3270520925102273 # Hunter SE max central angle (rad; 0.3839724354387525 inner)
     teleop_steering_exponent: 0.5             # Steering curve exponent
     teleop_deadzone: 0.08                     # Normalized center dead zone
     teleop_command_timeout: 0.4               # Watchdog timeout (s)
     teleop_publish_rate: 20.0                 # Active command publish rate (Hz)
-    diagnostics_enabled: true               # Always-on topic/motion monitoring timer
+    diagnostics_enabled: true               # IMU/odom monitoring + LiDAR publish stats/presence
     diagnostics_imu_topic: "/imu"            # FDI IMU (sensor_msgs/Imu)
-    diagnostics_lidar_topic: "/lidar_points" # Hesai raw cloud (raw receive counter only)
-    diagnostics_chassis_odom_topic: "/odom1" # Hunter wheel odometry
-    diagnostics_window_sec: 5.0              # Sliding window for received Hz
+    diagnostics_lidar_topic: "/lidar_points" # Hesai raw cloud (presence-only by default)
+    diagnostics_lidar_stats_topic: "/lidar_points/statistics" # Hesai 1 Hz publish-stats heartbeat
+    diagnostics_lidar_receive_enabled: false # Opt-in raw cloud receive for manual received-Hz diagnosis
+    diagnostics_lidar_stats_stale_timeout_sec: 3.0 # Driver stats older than this are stale
+    diagnostics_chassis_odom_topic: "/odom1"  # Hunter chassis wheel odometry
+    diagnostics_window_sec: 5.0              # Sliding window for raw received Hz (opt-in)
     diagnostics_stale_timeout_sec: 2.0       # Topic/motion age treated as stale
     diagnostics_sample_period_sec: 1.0       # Background sample and log flush
     diagnostics_snapshot_period_sec: 5.0     # Periodic JSONL snapshot interval
@@ -75,8 +81,6 @@ web_control:
     diagnostics_max_log_bytes: 10485760      # Rotate diagnostics log at 10 MiB
     diagnostics_retain_days: 7               # Completed diagnostics log age limit
     diagnostics_retain_bytes: 104857600      # Completed diagnostics total size limit
-    resource_logging_enabled: true           # Backend-only periodic resource JSONL (no UI)
-    resource_sample_period_sec: 1.0          # Resource sample/persist interval (seconds)
     motion_start_threshold_mps: 0.05         # Moving entry threshold
     motion_stop_threshold_mps: 0.02          # Moving exit threshold (hysteresis)
     motion_debounce_sec: 0.3                 # Start/stop debounce

@@ -2,8 +2,8 @@
 
 The controller owns input validation, the Ackermann mapping, the latest
 accepted command, and the one-shot stop transitions.  It performs no ROS I/O
-and reads time through an injected clock, so its behavior is unit-testable
-without ROS.  ``WebControlNode`` adapts the returned command into a
+and reads time through an injected clock, so it needs no ROS runtime.
+``WebControlNode`` adapts the returned command into a
 ``geometry_msgs/msg/Twist``.
 """
 

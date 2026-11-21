@@ -50,11 +50,17 @@ function attachGlassStrengthControl() {
 }
 // --- End glass strength preference
 
+// Map clouds use automatic height colouring by default.  Dedicated ground
+// layers opt into flat colours so ground stays visually distinct from the
+// navigation/mapping height field.
 const LAYERS = {
   global_map: { color: 0x6f8fb0, points3d: [], enabled: true, object: null, lastFetch3d: 0, staticLoaded: false, opacity: 0.72 },
   local_map: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
+  // Localization already publishes this live scan in the map frame.  It uses
+  // the normal height-coloured cloud style and follows every new frame.
+  current_lidar: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
   mapcloud: { color: 0x49b59f, points3d: [], enabled: true, object: null, lastFetch3d: 0, staticLoaded: false },
-  mapground: { color: 0xd9a441, points3d: [], enabled: true, object: null, lastFetch3d: 0, staticLoaded: false },
+  mapground: { color: 0xd9a441, points3d: [], enabled: true, object: null, lastFetch3d: 0, staticLoaded: false, flatColor: true },
   // The live navigation obstacle aggregate is a flat, deliberately larger red
   // overlay.  No height/intensity attribute is consumed, so its colour cannot
   // be tinted away by the map cloud pipeline.
@@ -63,7 +69,7 @@ const LAYERS = {
 
 const MAPPING_LAYERS = {
   global_map: { color: 0x8ea4b8, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
-  ground: { color: 0xd9a441, points3d: [], enabled: true, object: null, lastFetch3d: 0 },
+  ground: { color: 0xd9a441, points3d: [], enabled: true, object: null, lastFetch3d: 0, flatColor: true },
 };
 
 const TARGET_MARKER_COLOR = 0x0a84ff;
@@ -79,6 +85,7 @@ const state = {
   navigationControl: null,
   paths: {},
   pathTopics: [],
+  trajectoryTopic: "",
   mappingOdom: null,
   mappingPath: [],
   mapSceneCleared: false,
@@ -102,6 +109,14 @@ const state = {
     mapping: null,
   },
   saveMapState: null,
+  saveMapBrowsePath: "",
+  saveMapBrowserParent: null,
+  saveMapBrowserWritable: false,
+  saveMapBrowserEntries: [],
+  saveMapBrowserError: null,
+  saveMapBrowseSeq: 0,
+  saveMapDialogSeq: 0,
+  saveMapDefaultDirectory: "",
   recording: null,
   recordingTopics: [],
   recordingTopicsError: null,
@@ -114,6 +129,7 @@ const state = {
   recordingPending: false,
   hideCompletedPaths: false,
   showPaths: true,
+  showTrajectory: true,
   showVehicle: true,
   showMappingPath: true,
   showMappingVehicle: true,
@@ -607,34 +623,100 @@ function handleTouchPanZoom(event) {
   state.pointer.touchStart = { ...gesture, cameraDistance: state.camera.distance };
 }
 
+// --- Height colour palette
+// RViz-style axis-Z colouring over the current cloud's finite ROS-z min/max.
+// The low band is deliberately compressed: 0-1.5% of the normalized range is
+// blue, saturated yellow arrives by 3%, then orange/red and finally magenta.
+// That makes small relative height changes just above the lowest displayed
+// points decisively warm instead of another shade of blue.  "Low" refers only
+// to this cloud's height range; it is not a terrain/ground estimate.
+// Stops are [normalized z, red, green, blue] and are module-level so the
+// per-point path allocates only the final RGB buffer.
+const HEIGHT_COLOR_STOPS = [
+  [0.000, 0.00, 0.15, 1.00], // low-height blue band
+  [0.015, 0.00, 0.30, 1.00], // end of the blue band
+  [0.030, 1.00, 1.00, 0.00], // saturated yellow by 3%
+  [0.200, 1.00, 0.55, 0.00], // orange
+  [0.450, 1.00, 0.10, 0.00], // red-orange
+  [0.750, 1.00, 0.00, 0.35], // red-magenta
+  [1.000, 1.00, 0.00, 1.00], // high magenta
+];
+
+function writeHeightColor(target, offset, height, minHeight, maxHeight) {
+  // A cloud with no finite height span still needs a valid colour.  Use the
+  // low-band blue as a deterministic fallback; it does not imply that the
+  // points are actually on the ground.
+  let ratio = 0;
+  if (Number.isFinite(height) && Number.isFinite(minHeight) && maxHeight > minHeight) {
+    ratio = (height - minHeight) / (maxHeight - minHeight);
+    ratio = Math.max(0, Math.min(1, ratio));
+  }
+  let index = 0;
+  while (index < HEIGHT_COLOR_STOPS.length - 2 && ratio > HEIGHT_COLOR_STOPS[index + 1][0]) {
+    index += 1;
+  }
+  const low = HEIGHT_COLOR_STOPS[index];
+  const high = HEIGHT_COLOR_STOPS[index + 1];
+  const mix = (ratio - low[0]) / (high[0] - low[0]);
+  target[offset] = low[1] + (high[1] - low[1]) * mix;
+  target[offset + 1] = low[2] + (high[2] - low[2]) * mix;
+  target[offset + 2] = low[3] + (high[3] - low[3]) * mix;
+}
+// --- End height colour palette
+
 function makePointCloud(points, color, options = {}) {
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(points.length * 3);
-  points.forEach((point, index) => {
-    const p = rosToThree(point[0], point[1], point[2] || 0);
+  const heightColored = !options.flatColor;
+  let minHeight = Infinity;
+  let maxHeight = -Infinity;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const rawHeight = point[2];
+    const height = Number.isFinite(rawHeight) ? rawHeight : 0;
+    if (Number.isFinite(rawHeight)) {
+      if (rawHeight < minHeight) minHeight = rawHeight;
+      if (rawHeight > maxHeight) maxHeight = rawHeight;
+    }
+    const p = rosToThree(point[0], point[1], height);
     positions[index * 3] = p.x;
     positions[index * 3 + 1] = p.y;
     positions[index * 3 + 2] = p.z;
-  });
+  }
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const useVertexColors = heightColored && points.length > 0;
+  if (useVertexColors) {
+    const colors = new Float32Array(points.length * 3);
+    for (let index = 0; index < points.length; index += 1) {
+      writeHeightColor(
+        colors,
+        index * 3,
+        points[index][2],
+        minHeight,
+        maxHeight,
+      );
+    }
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  }
   const pointSize = Number.isFinite(options.pointSize) ? options.pointSize : 2;
   const opacity = Number.isFinite(options.opacity) ? options.opacity : 0.86;
   return new THREE.Points(
     geometry,
     new THREE.PointsMaterial({
-      color,
+      color: heightColored ? 0xffffff : color,
       size: pointSize,
       sizeAttenuation: false,
       transparent: true,
       opacity,
-      vertexColors: false,
+      vertexColors: useVertexColors,
     }),
   );
 }
 
 // Point clouds and path meshes own the GPU buffers created for them.  Release
-// those resources when a refresh replaces the object; marker/vehicle groups are
-// deliberately left alone because their cleanup is separate.
+// those resources when a refresh replaces the object.  Markers use a separate
+// ownership path because THREE r160 ArrowHelper shares its line/cone geometry
+// module-wide; that geometry must never be disposed per marker.
 function disposeObjectResources(object) {
   if (!object) return;
   if (object.geometry && typeof object.geometry.dispose === "function") {
@@ -740,8 +822,57 @@ function mapSourcesAreWaiting(layers) {
   });
 }
 
+// Markers are persistent slots: an odometry/frame update only moves the
+// existing Group and turns its ArrowHelper.  Rebuilding a Group, ArrowHelper
+// and TorusGeometry for every pose update leaked one torus per frame.
+function disposeMarkerResources(marker) {
+  const owned = marker && marker.userData && marker.userData.markerOwnedResources;
+  if (!owned) return;
+  owned.forEach((resource) => {
+    if (resource && typeof resource.dispose === "function") resource.dispose();
+  });
+  marker.userData.markerOwnedResources = [];
+}
+
 function clearGroup(group) {
-  while (group.children.length) group.remove(group.children[0]);
+  while (group.children.length) {
+    const object = group.children[0];
+    group.remove(object);
+    disposeMarkerResources(object);
+  }
+  const slots = group.userData.markerSlots;
+  if (slots) Object.keys(slots).forEach((key) => delete slots[key]);
+}
+
+function markerPoseIsFinite(pose) {
+  return !!pose && Number.isFinite(Number(pose.x)) && Number.isFinite(Number(pose.y));
+}
+
+function updateMarkerSlot(group, key, factory, pose) {
+  const slots =
+    group.userData.markerSlots ||
+    (group.userData.markerSlots = Object.create(null));
+  if (!markerPoseIsFinite(pose)) {
+    if (slots[key]) slots[key].visible = false;
+    return;
+  }
+  let marker = slots[key];
+  if (!marker) {
+    marker = factory();
+    slots[key] = marker;
+    group.add(marker);
+  }
+  const x = Number(pose.x);
+  const y = Number(pose.y);
+  const z = Number.isFinite(Number(pose.z)) ? Number(pose.z) : 0;
+  const yaw = Number.isFinite(Number(pose.yaw)) ? Number(pose.yaw) : 0;
+  marker.position.copy(rosToThree(x, y, z + 0.1));
+  const direction =
+    marker.userData.markerDirection ||
+    (marker.userData.markerDirection = new THREE.Vector3());
+  direction.set(Math.cos(yaw), 0, -Math.sin(yaw)).normalize();
+  marker.userData.markerArrow.setDirection(direction);
+  marker.visible = true;
 }
 
 function makeArrowMarker(pose, color) {
@@ -749,37 +880,75 @@ function makeArrowMarker(pose, color) {
   group.position.copy(rosToThree(pose.x, pose.y, (pose.z || 0) + 0.1));
   const yaw = pose.yaw || 0;
   const dir = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw)).normalize();
-  group.add(new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0.15, 0), 3.2, color, 0.9, 0.45));
-  const ring = new THREE.Mesh(
-    new THREE.TorusGeometry(0.9, 0.035, 10, 48),
-    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }),
+  const arrow = new THREE.ArrowHelper(
+    dir,
+    new THREE.Vector3(0, 0.15, 0),
+    3.2,
+    color,
+    0.9,
+    0.45,
   );
+  group.add(arrow);
+  const ringGeometry = new THREE.TorusGeometry(0.9, 0.035, 10, 48);
+  const ringMaterial = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity: 0.9,
+  });
+  const ring = new THREE.Mesh(ringGeometry, ringMaterial);
   ring.rotation.x = Math.PI / 2;
   group.add(ring);
+  // ArrowHelper's line/cone geometries are module-shared in THREE r160.  Own
+  // the ring and the per-helper materials, never the shared arrow geometries.
+  group.userData.markerArrow = arrow;
+  group.userData.markerDirection = dir;
+  group.userData.markerOwnedResources = [
+    ringGeometry,
+    ringMaterial,
+    arrow.line && arrow.line.material,
+    arrow.cone && arrow.cone.material,
+  ].filter(Boolean);
   return group;
 }
 
 function updateTargetMarkers() {
-  clearGroup(markerGroup);
-  if (state.selection && state.mode !== "view") {
-    markerGroup.add(makeArrowMarker(state.selection, TARGET_MARKER_COLOR));
-  }
+  updateMarkerSlot(
+    markerGroup,
+    "selection",
+    () => makeArrowMarker(state.selection, TARGET_MARKER_COLOR),
+    state.selection && state.mode !== "view" ? state.selection : null,
+  );
   const goal = state.activeGoal || state.lastGoal;
-  if (goal) {
-    markerGroup.add(makeArrowMarker(goal, TARGET_MARKER_COLOR));
-  }
+  updateMarkerSlot(
+    markerGroup,
+    "goal",
+    () => makeArrowMarker(goal, TARGET_MARKER_COLOR),
+    goal,
+  );
 }
 
 function updateVehicleMarker() {
-  clearGroup(vehicleGroup);
-  if (!state.showVehicle || !state.odom || !state.odom.pose) return;
-  vehicleGroup.add(makeArrowMarker({ ...state.odom.pose, layer: "mapcloud" }, 0x32d74b));
+  const pose =
+    state.showVehicle && state.odom && state.odom.pose ? state.odom.pose : null;
+  updateMarkerSlot(
+    vehicleGroup,
+    "vehicle",
+    () => makeArrowMarker({ ...state.odom.pose, layer: "mapcloud" }, 0x32d74b),
+    pose,
+  );
 }
 
 function updateMappingVehicleMarker() {
-  clearGroup(mappingVehicleGroup);
-  if (!state.showMappingVehicle || !state.mappingOdom || !state.mappingOdom.pose) return;
-  mappingVehicleGroup.add(makeArrowMarker(state.mappingOdom.pose, 0x32d74b));
+  const pose =
+    state.showMappingVehicle && state.mappingOdom && state.mappingOdom.pose
+      ? state.mappingOdom.pose
+      : null;
+  updateMarkerSlot(
+    mappingVehicleGroup,
+    "mapping-vehicle",
+    () => makeArrowMarker(state.mappingOdom.pose, 0x32d74b),
+    pose,
+  );
 }
 
 function pathPointToThree(point) {
@@ -789,16 +958,30 @@ function pathPointToThree(point) {
 
 function updatePaths() {
   disposeGroupResources(pathGroup);
-  if (!state.showPaths) return;
   if (state.hideCompletedPaths) return;
+  // The predicted local trajectory shares this pipeline but has its own
+  // checkbox and is drawn amber so it stays distinguishable from the blue
+  // global planning path.
+  const predictedColor = 0xff9f0a;
   Object.entries(state.paths).forEach(([topic, path]) => {
+    const isPredicted = Boolean(
+      state.trajectoryTopic && topic === state.trajectoryTopic,
+    );
+    if (isPredicted ? !state.showTrajectory : !state.showPaths) return;
     if (!path || path.length < 2) return;
-    const points = path.map((point) => pathPointToThree(point));
+    const points = path.map((point) => {
+      const p = pathPointToThree(point);
+      // Lift the predicted tube slightly so an overlap with the global path
+      // does not z-fight.
+      if (isPredicted) p.y += 0.04;
+      return p;
+    });
     const pathCurve = new THREE.CatmullRomCurve3(points);
     const geometry = new THREE.TubeGeometry(pathCurve, Math.max(2, points.length * 2), 0.16, 8, false);
+    const color = isPredicted ? predictedColor : 0x0a84ff;
     const line = new THREE.Mesh(
       geometry,
-      new THREE.MeshBasicMaterial({ color: 0x0a84ff, transparent: true, opacity: 0.9 }),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }),
     );
     line.name = topic;
     pathGroup.add(line);
@@ -820,6 +1003,7 @@ function updateMappingPath() {
 }
 
 async function pollState() {
+  refreshPoseAgeDisplay();
   try {
     const data = await timedGetJson("/api/state");
     updateStatus(data);
@@ -866,9 +1050,13 @@ async function pollSystem() {
 // Mapping, while the backend timer and persistent log run regardless of UI.
 const DIAGNOSTICS_STATUS_LABELS = {
   active: "正常",
+  idle: "发布暂停",
+  stats_stale: "统计过期",
   stale: "数据过期",
   waiting: "等待数据",
   no_publisher: "无发布者",
+  publisher_only: "未测频（有发布者）",
+  unknown: "发布者待确认",
   unavailable: "不可用",
 };
 
@@ -895,12 +1083,47 @@ function formatDiagnosticsAge(age) {
   return `${Math.round(age)}s`;
 }
 
+function diagnosticsPublisherPresence(row) {
+  const count = row && row.publisher_count;
+  if (Number.isInteger(count) && count > 0) return `${count} 个发布者`;
+  if (count === 0) return "无发布者";
+  return "发布者待确认";
+}
+
+function formatRateValue(hz) {
+  if (!Number.isFinite(hz) || hz < 0) return "--";
+  return `${hz.toFixed(hz >= 10 ? 1 : 2)} Hz`;
+}
+
+function diagnosticsSourceLabel(source) {
+  if (source === "driver_publish") return "驱动发布";
+  if (source === "received") return "网页接收";
+  return "";
+}
+
 function formatDiagnosticsHz(row) {
-  // A rate from the last active window is historical once the feed becomes
-  // stale; never present it as a current measurement.
-  if (!row || row.status !== "active") return "--";
-  if (!Number.isFinite(row.hz) || row.hz <= 0) return "--";
-  return `${row.hz.toFixed(row.hz >= 10 ? 1 : 2)} Hz`;
+  if (!row) return "--";
+  // Publisher presence is not a rate measurement.  Keep the disabled-receive
+  // mode explicitly unmeasured instead of letting a null rate become 0 Hz,
+  // but do not mask a globally unavailable diagnostics service.  A missing
+  // publisher or an unconfirmed graph query stays "--"; only the confirmed
+  // presence-without-receipt state is labelled "未测频".
+  if (row.status === "unavailable") return "--";
+  if (row.status === "publisher_only") return "未测频";
+  if (row.status === "stats_stale") return "--";
+  if (row.status !== "active" && row.status !== "idle") return "--";
+  if (row.receive_enabled === false && row.hz_source !== "driver_publish") {
+    return "未测频";
+  }
+  const value = formatRateValue(row.hz);
+  if (value === "--") return "--";
+  const source = diagnosticsSourceLabel(row.hz_source || row.rate_source);
+  if (row.status === "idle" && row.hz_source === "driver_publish") {
+    // A fresh driver report with 0 Hz is a measured idle state, not missing
+    // telemetry: show 0 explicitly instead of turning it into "--".
+    return `${value} · ${source || "驱动发布"}（当前无发布）`;
+  }
+  return source ? `${value} · ${source}` : value;
 }
 
 function updateRateChips(data) {
@@ -916,8 +1139,33 @@ function updateRateChips(data) {
       return;
     }
     chip.dataset.state = row.status;
-    if (row.status === "active") {
-      chip.textContent = `${name} ${formatDiagnosticsHz(row)}`;
+    if (row.status === "unavailable") {
+      chip.textContent = `${name} ${diagnosticsStatusLabel(row.status)}`;
+    } else if (row.status === "no_publisher") {
+      // A real absence of publishers is more useful than "unmeasured", and it
+      // is not a spurious warning caused by intentionally skipping receipt.
+      chip.textContent = `${name} ${diagnosticsStatusLabel(row.status)}`;
+    } else if (row.status === "publisher_only") {
+      chip.textContent = `${name} 未测频 · ${diagnosticsPublisherPresence(row)}`;
+    } else if (row.status === "unknown") {
+      chip.textContent = `${name} ${diagnosticsPublisherPresence(row)}`;
+    } else if (row.status === "stats_stale") {
+      chip.textContent = `${name} 统计过期`;
+    } else if (row.receive_enabled === false && row.hz_source !== "driver_publish") {
+      // Defensive fallback for an unexpected state while receipt is disabled:
+      // never imply a measured rate.
+      chip.textContent = `${name} 未测频 · ${diagnosticsPublisherPresence(row)}`;
+    } else if (row.status === "idle" && row.hz_source === "driver_publish") {
+      chip.textContent = `${name} 发布 ${formatRateValue(row.hz)}`;
+    } else if (row.status === "active") {
+      const source = row.hz_source || row.rate_source;
+      if (source === "driver_publish") {
+        chip.textContent = `${name} 发布 ${formatRateValue(row.hz)}`;
+      } else if (source === "received") {
+        chip.textContent = `${name} 接收 ${formatRateValue(row.hz)}`;
+      } else {
+        chip.textContent = `${name} ${formatRateValue(row.hz)}`;
+      }
     } else {
       chip.textContent = `${name} ${diagnosticsStatusLabel(row.status)}`;
     }
@@ -1395,27 +1643,20 @@ async function viewSavedLogTail() {
 }
 
 // --- Data refresh scheduler
-// Every resource below has its own deadline.  A task is eligible only when the
-// current view exposes it, the layer is enabled, its own deadline has passed,
-// and no request for that same resource is still in flight.  There is no queue:
-// a slow global cloud can never delay obstacles, local_map, or paths.
+// Every resource below is revision-driven.  A cloud/path task starts only when
+// a newer metadata revision arrives (or when a hidden layer becomes visible
+// again), and each resource has at most one request in flight.  There is no
+// queue: a slow request can never delay another resource.  The 50 ms scheduler
+// tick only drains pending revisions; it is not a path/pose download cadence.
+// Pose travels inline in the SSE revision so no per-odometry HTTP request is
+// needed.  Static navigation clouds still load once per lifecycle.
 const REFRESH_RATES_MS = Object.freeze({
-  navigationLayers: Object.freeze({
-    global_map: 1000, // retry cadence until the first nonempty cloud is cached
-    local_map: 1000,
-    mapcloud: 1000, // retry cadence until the first nonempty cloud is cached
-    mapground: 1000, // retry cadence until the first nonempty cloud is cached
-    obstacles: 200,
-  }),
-  mappingLayers: 1000,
-  paths: 200,
-  mappingPath: 200,
   schedulerTick: 50,
 });
 
 // These navigation clouds are static after their first valid nonempty load.
-// The mapping overview intentionally keeps refreshing at 1 Hz while Mapping is
-// active because it grows during a mapping run.
+// Their revisions only change on a real map/lifecycle reset, so an unchanged
+// revision never re-downloads them.
 const STATIC_NAVIGATION_LAYERS = new Set(["global_map", "mapcloud", "mapground"]);
 
 function createRefreshController({
@@ -1431,20 +1672,43 @@ function createRefreshController({
   applyMappingLayer = () => {},
   applyPath = () => {},
   applyMappingPath = () => {},
+  applyPose = () => {},
+  clearPath = () => {},
+  clearMappingPath = () => {},
+  clearPose = () => {},
+  isHidden = () => false,
 }) {
-  const navigationTasks = new Map();
-  const mappingTasks = new Map();
   const pathTasks = new Map();
-  const mappingPathTask = { key: "mappingPath", interval: REFRESH_RATES_MS.mappingPath, due: 0, inFlight: false, generation: 0 };
+  const mappingPathTask = makePathTask("mapping_path");
+  const cloudTasks = new Map();
+  const poseApplied = { nav: -1, mapping: -1 };
+  const poseGeneration = { nav: null, mapping: null };
+  const poseCleared = { nav: false, mapping: false };
+  // Meaningful revision identity for an applied pose.  The server's pose dict
+  // carries a wall-time-derived "age" on every metadata refresh; age-only
+  // churn must not re-apply the same pose.  Version, status, frame, generation
+  // and the actual pose/stamp stay in the signature.
+  const poseSignature = { nav: null, mapping: null };
+  // Immutable per-web-service epoch.  A change means the server process was
+  // replaced, so old version counters and in-flight responses are retired.
+  let activeEpoch = null;
+  const retiredEpochs = new Set();
 
   function makeTask(key, interval) {
     return { key, interval, due: 0, inFlight: false, generation: 0 };
   }
-  for (const name of Object.keys(navigationLayers)) {
-    navigationTasks.set(name, makeTask(name, REFRESH_RATES_MS.navigationLayers[name] || REFRESH_RATES_MS.navigationLayers.obstacles));
-  }
-  for (const name of Object.keys(mappingLayers)) {
-    mappingTasks.set(name, makeTask(name, REFRESH_RATES_MS.mappingLayers));
+
+  function makePathTask(key) {
+    return {
+      key,
+      latestVersion: -1,
+      appliedVersion: -1,
+      serverGeneration: null,
+      latestCleared: false,
+      inFlight: false,
+      generation: 0,
+      retryAt: 0,
+    };
   }
 
   function invalidateTask(task) {
@@ -1455,117 +1719,572 @@ function createRefreshController({
   function syncPathTasks() {
     const topics = Array.from(new Set(getPathTopics() || []));
     for (const topic of topics) {
-      if (!pathTasks.has(topic)) pathTasks.set(topic, makeTask(topic, REFRESH_RATES_MS.paths));
+      if (topic !== "mapping_path" && !pathTasks.has(topic)) {
+        pathTasks.set(topic, makePathTask(topic));
+      }
     }
     for (const topic of Array.from(pathTasks.keys())) {
-      if (!topics.includes(topic)) pathTasks.delete(topic);
+      if (!topics.includes(topic)) {
+        pathTasks.delete(topic);
+        clearPath(topic);
+      }
     }
   }
 
-  function navigationEligible(name, task, at) {
-    const layer = navigationLayers[name];
-    if (!layer || !layer.enabled || task.inFlight || at < task.due) return false;
-    return !(STATIC_NAVIGATION_LAYERS.has(name) && layer.staticLoaded);
+  function ensurePathTask(topic) {
+    if (topic === "mapping_path") return mappingPathTask;
+    let task = pathTasks.get(topic);
+    if (!task) {
+      task = makePathTask(topic);
+      pathTasks.set(topic, task);
+    }
+    return task;
   }
 
-  async function requestNavigationLayer(name, task, at) {
+  function pathTaskVisible(task) {
+    if (task.key === "mapping_path") {
+      return getView() === "mapping" && mappingPathVisible();
+    }
+    return getView() === "3d" && pathsVisible(task.key);
+  }
+
+  function resetPathTaskLifecycle(task) {
+    task.generation += 1;
+    task.latestVersion = -1;
+    task.appliedVersion = -1;
+    task.latestCleared = false;
+    task.serverGeneration = null;
+    task.retryAt = 0;
+    if (task.key === "mapping_path") clearMappingPath();
+    else clearPath(task.key);
+  }
+
+  function resetAllPathTasks() {
+    for (const task of pathTasks.values()) resetPathTaskLifecycle(task);
+    resetPathTaskLifecycle(mappingPathTask);
+  }
+
+  function resetPose(kind) {
+    poseApplied[kind] = -1;
+    poseGeneration[kind] = null;
+    poseCleared[kind] = true;
+    poseSignature[kind] = null;
+    clearPose(kind);
+  }
+
+  function resetAllPoses() {
+    resetPose("nav");
+    resetPose("mapping");
+  }
+
+  function cloudKey(group, name) {
+    return `${group}:${name}`;
+  }
+
+  function cloudLayer(task) {
+    return task.group === "nav" ? navigationLayers[task.name] : mappingLayers[task.name];
+  }
+
+  function cloudViewVisible(group) {
+    const view = getView();
+    return group === "nav" ? view === "3d" : view === "mapping";
+  }
+
+  function ensureCloudTask(group, name) {
+    const key = cloudKey(group, name);
+    let task = cloudTasks.get(key);
+    if (!task) {
+      task = {
+        key,
+        group,
+        name,
+        latestVersion: -1,
+        appliedVersion: -1,
+        requestedVersion: -1,
+        serverGeneration: null,
+        latestCleared: false,
+        inFlight: false,
+        generation: 0,
+        retryAt: 0,
+      };
+      cloudTasks.set(key, task);
+    }
+    return task;
+  }
+
+  function numeric(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function observeEpoch(rawEpoch) {
+    const epoch = typeof rawEpoch === "string" ? rawEpoch.trim() : "";
+    if (!epoch) return "none";
+    if (retiredEpochs.has(epoch)) return "stale";
+    if (activeEpoch === epoch) return "current";
+    if (activeEpoch === null) {
+      activeEpoch = epoch;
+      return "current";
+    }
+    // A new immutable server epoch means a new web-service process.  Retire
+    // the old one so delayed events/responses from it cannot come back.
+    retiredEpochs.add(activeEpoch);
+    activeEpoch = epoch;
+    return "new";
+  }
+
+  function resetCloudTaskLifecycle(task) {
+    const layer = cloudLayer(task);
+    const hadGeometry = Boolean(layer && Array.isArray(layer.points3d) && layer.points3d.length);
+    if (layer) {
+      layer.points3d = [];
+      layer.lastFetch3d = 0;
+      layer.staticLoaded = false;
+    }
+    // Bump the client epoch so a response already in flight is ignored, but
+    // keep ``inFlight`` set: the next revision starts only after it settles.
+    task.generation += 1;
+    task.latestVersion = -1;
+    task.appliedVersion = -1;
+    task.requestedVersion = -1;
+    task.retryAt = 0;
+    task.latestCleared = false;
+    task.serverGeneration = null;
+    if (hadGeometry) {
+      if (task.group === "nav") applyNavigationLayer(task.name, layer);
+      else applyMappingLayer(task.name, layer);
+    }
+  }
+
+  function resetAllCloudTasks() {
+    for (const task of cloudTasks.values()) resetCloudTaskLifecycle(task);
+  }
+
+  function resetAllResources() {
+    resetAllCloudTasks();
+    resetAllPathTasks();
+    resetAllPoses();
+  }
+
+  function requestCloudLayer(task, { force = false } = {}) {
+    if (task.inFlight) return null;
+    if (isHidden()) return null;
+    const layer = cloudLayer(task);
+    if (!layer || !layer.enabled || !cloudViewVisible(task.group)) return null;
+    if (
+      task.group === "nav" &&
+      STATIC_NAVIGATION_LAYERS.has(task.name) &&
+      layer.staticLoaded
+    ) {
+      return null;
+    }
+    if (!force && task.latestVersion <= task.appliedVersion) return null;
+    if (task.retryAt && now() < task.retryAt) return null;
+    task.retryAt = 0;
     task.inFlight = true;
-    task.due = at + task.interval;
     const generation = task.generation;
-    try {
-      const data = await getJson(`/api/map3d?layer=${encodeURIComponent(name)}`);
-      if (task.generation !== generation) return;
-      const points = Array.isArray(data.points) ? data.points : [];
-      const layer = navigationLayers[name];
-      layer.points3d = points;
-      layer.lastFetch3d = now();
-      if (STATIC_NAVIGATION_LAYERS.has(name)) layer.staticLoaded = points.length > 0;
-      applyNavigationLayer(name, layer);
-    } catch (_error) {
-      // Never cache an error.  The next deadline retries normally.
-    } finally {
-      task.inFlight = false;
+    const requestedVersion = task.latestVersion;
+    task.requestedVersion = requestedVersion;
+    const url = task.group === "nav"
+      ? `/api/map3d?layer=${encodeURIComponent(task.name)}`
+      : `/api/mapping/map3d?layer=${encodeURIComponent(task.name)}`;
+    return (async () => {
+      try {
+        const data = await getJson(url);
+        const epochState = observeEpoch(data && data.epoch);
+        if (epochState === "stale") return;
+        if (epochState === "new") {
+          resetAllResources();
+          // The new server reset every task and cleared its geometry.  This
+          // response belongs to the new epoch, so adopt its counters instead
+          // of discarding the request that discovered the restart.
+          const adoptedVersion = numeric(data && data.version);
+          const adoptedGeneration = numeric(data && data.generation);
+          if (adoptedGeneration !== null) task.serverGeneration = adoptedGeneration;
+          if (adoptedVersion !== null) {
+            task.latestVersion = Math.max(task.latestVersion, adoptedVersion);
+          }
+        } else if (task.generation !== generation) {
+          return; // lifecycle/epoch reset while this response was in flight
+        }
+        if (!cloudViewVisible(task.group)) return;
+        const current = cloudLayer(task);
+        if (!current || !current.enabled) return;
+        const responseGeneration = numeric(data && data.generation);
+        if (
+          responseGeneration !== null &&
+          task.serverGeneration !== null &&
+          responseGeneration !== task.serverGeneration
+        ) {
+          return; // response from an older per-layer generation
+        }
+        const responseVersion = numeric(data && data.version);
+        // A newer clear revision invalidates this request even when the old
+        // response has no version/generation metadata of its own.
+        if (task.latestCleared && requestedVersion < task.latestVersion) {
+          return;
+        }
+        const points = Array.isArray(data.points) ? data.points : [];
+        current.points3d = points;
+        current.lastFetch3d = now();
+        if (task.group === "nav" && STATIC_NAVIGATION_LAYERS.has(task.name)) {
+          current.staticLoaded = points.length > 0;
+        }
+        if (task.group === "nav") applyNavigationLayer(task.name, current);
+        else applyMappingLayer(task.name, current);
+        // Mark the requested revision handled only after its geometry was
+        // applied.  A newer event that raced this fetch stays pending below.
+        task.retryAt = 0;
+        if (responseVersion !== null) {
+          task.latestVersion = Math.max(task.latestVersion, responseVersion);
+        }
+        const appliedVersion = epochState === "new"
+          ? (responseVersion === null ? -1 : responseVersion)
+          : (responseVersion === null ? requestedVersion : Math.max(requestedVersion, responseVersion));
+        if (task.appliedVersion < appliedVersion) {
+          task.appliedVersion = appliedVersion;
+        }
+      } catch (_error) {
+        // Never mark a failed revision as applied and never spin: the scheduler
+        // retries this layer after a bounded one-second delay.
+        if (task.generation === generation) task.retryAt = now() + 1000;
+      } finally {
+        task.inFlight = false;
+        // Catch up after any lifecycle reset too; a newer revision is pending
+        // even though this response belonged to the retired generation.
+        if (task.latestVersion > task.appliedVersion) {
+          if (!task.retryAt || now() >= task.retryAt) requestCloudLayer(task);
+        }
+      }
+    })();
+  }
+
+  function noteCloudEntry(entry) {
+    const version = Number(entry.version);
+    if (!Number.isFinite(version)) return;
+    const layers = entry.group === "nav" ? navigationLayers : mappingLayers;
+    if (!layers || !Object.prototype.hasOwnProperty.call(layers, entry.layer)) return;
+    const task = ensureCloudTask(entry.group, entry.layer);
+    const serverGeneration = numeric(entry.generation);
+    let lifecycleReset = false;
+    if (serverGeneration !== null) {
+      if (
+        task.serverGeneration !== null &&
+        serverGeneration !== task.serverGeneration
+      ) {
+        // A lifecycle clear bumps the per-layer generation.  Clear the layer
+        // immediately and invalidate any response from its old generation.
+        resetCloudTaskLifecycle(task);
+        lifecycleReset = true;
+      }
+      task.serverGeneration = serverGeneration;
+    }
+    if (version < task.latestVersion) return; // out-of-order/stale generation
+    const count = numeric(entry.count);
+    const isClear = entry.status === "waiting" || (count !== null && count === 0);
+    if (version > task.latestVersion && isClear && !lifecycleReset) {
+      // Clear revisions also invalidate in-flight nonempty geometry when an
+      // older/alternate server does not send a generation field.
+      resetCloudTaskLifecycle(task);
+      if (serverGeneration !== null) task.serverGeneration = serverGeneration;
+    }
+    const advanced = version > task.latestVersion;
+    if (advanced) task.latestVersion = version;
+    task.status = typeof entry.status === "string" ? entry.status : task.status;
+    if (advanced) task.latestCleared = isClear;
+    // A duplicate revision is a no-op.  The second condition still lets a
+    // layer that was disabled/other-view catch up when it becomes visible.
+    if (!advanced && task.latestVersion <= task.appliedVersion) return;
+    if (!task.inFlight) requestCloudLayer(task);
+  }
+
+  function notePathEntry(entry) {
+    const topic = typeof entry.layer === "string" ? entry.layer : "";
+    if (!topic) return;
+    if (
+      topic !== "mapping_path" &&
+      !(getPathTopics() || []).includes(topic)
+    ) {
+      // Never create an arbitrary path resource from an event.
+      return;
+    }
+    const version = Number(entry.version);
+    if (!Number.isFinite(version)) return;
+    const task = ensurePathTask(topic);
+    const serverGeneration = numeric(entry.generation);
+    let lifecycleReset = false;
+    if (serverGeneration !== null) {
+      if (
+        task.serverGeneration !== null &&
+        serverGeneration !== task.serverGeneration
+      ) {
+        resetPathTaskLifecycle(task);
+        lifecycleReset = true;
+      }
+      task.serverGeneration = serverGeneration;
+    }
+    if (version < task.latestVersion && !lifecycleReset) return;
+    const count = numeric(entry.count);
+    const isClear = entry.status === "waiting" || (count !== null && count === 0);
+    if (version > task.latestVersion && isClear && !lifecycleReset) {
+      resetPathTaskLifecycle(task);
+      if (serverGeneration !== null) task.serverGeneration = serverGeneration;
+      lifecycleReset = true;
+    }
+    const advanced = version > task.latestVersion || lifecycleReset;
+    if (advanced) task.latestVersion = version;
+    if (advanced && isClear) {
+      // The clear metadata is authoritative and immediate: no geometry fetch
+      // can win a race with it.  A lifecycle reset above already cleared.
+      task.appliedVersion = Math.max(task.appliedVersion, version);
+      task.latestCleared = true;
+      if (!lifecycleReset) {
+        if (task.key === "mapping_path") clearMappingPath();
+        else clearPath(task.key);
+      }
+      return;
+    }
+    task.latestCleared = false;
+    if (!task.inFlight) requestPath(task.key, task);
+  }
+
+  function poseRevision(entry, pose) {
+    return JSON.stringify([
+      Number(entry.version),
+      numeric(entry.generation),
+      entry.status === undefined ? null : entry.status,
+      entry.frame_id === undefined ? null : entry.frame_id,
+      pose && typeof pose === "object" ? numeric(pose.x) : null,
+      pose && typeof pose === "object" ? numeric(pose.y) : null,
+      pose && typeof pose === "object" ? numeric(pose.z) : null,
+      pose && typeof pose === "object" ? numeric(pose.yaw) : null,
+      pose && typeof pose === "object" ? numeric(pose.stamp) : null,
+    ]);
+  }
+
+  function notePoseEntry(entry) {
+    const kind = entry.layer === "mapping" ? "mapping" : "nav";
+    const version = Number(entry.version);
+    const serverGeneration = numeric(entry.generation);
+    let lifecycleReset = false;
+    if (serverGeneration !== null) {
+      if (poseGeneration[kind] !== null && serverGeneration < poseGeneration[kind]) return;
+      if (
+        poseGeneration[kind] !== null &&
+        serverGeneration !== poseGeneration[kind]
+      ) {
+        poseApplied[kind] = -1;
+        poseCleared[kind] = true;
+        poseSignature[kind] = null;
+        clearPose(kind);
+        lifecycleReset = true;
+      }
+      poseGeneration[kind] = serverGeneration;
+    }
+    if (!Number.isFinite(version)) return;
+    if (version < poseApplied[kind] && !lifecycleReset) return;
+    const pose = entry.pose && typeof entry.pose === "object" ? entry.pose : null;
+    const signature = poseRevision(entry, pose);
+    if (
+      !lifecycleReset &&
+      version === poseApplied[kind] &&
+      signature === poseSignature[kind]
+    ) {
+      // The server refreshes "age" on every metadata snapshot.  An equal
+      // version with no meaningful change is not a new pose and must not
+      // re-apply the transform or clear a waiting/cleared state.
+      return;
+    }
+    if (entry.status === "waiting" || !pose) {
+      poseApplied[kind] = Math.max(poseApplied[kind], version);
+      poseSignature[kind] = signature;
+      if (!poseCleared[kind]) clearPose(kind);
+      poseCleared[kind] = true;
+      return;
+    }
+    const x = numeric(pose.x);
+    const y = numeric(pose.y);
+    const z = numeric(pose.z);
+    const yaw = numeric(pose.yaw);
+    if (x === null || y === null || z === null || yaw === null) {
+      // Never turn missing odometry into a fake origin.
+      poseApplied[kind] = Math.max(poseApplied[kind], version);
+      poseSignature[kind] = signature;
+      if (!poseCleared[kind]) clearPose(kind);
+      poseCleared[kind] = true;
+      return;
+    }
+    poseApplied[kind] = Math.max(poseApplied[kind], version);
+    poseSignature[kind] = signature;
+    poseCleared[kind] = false;
+    applyPose(kind, {
+      pose: { x, y, z, yaw },
+      status: entry.status,
+      frame_id: entry.frame_id,
+      age: numeric(pose.age),
+      stamp: numeric(pose.stamp),
+    });
+  }
+
+  function noteCloudMetadata(entries, epoch) {
+    const epochState = observeEpoch(epoch);
+    if (epochState === "stale") return;
+    if (epochState === "new") resetAllResources();
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      if (!entry) continue;
+      if (entry.group === "nav" || entry.group === "mapping") {
+        noteCloudEntry(entry);
+      } else if (entry.group === "path") {
+        notePathEntry(entry);
+      } else if (entry.group === "pose") {
+        notePoseEntry(entry);
+      }
     }
   }
 
-  function mappingEligible(name, task, at) {
-    const layer = mappingLayers[name];
-    return Boolean(layer && layer.enabled && !task.inFlight && at >= task.due);
+  function drainCloudTasks(at, started) {
+    for (const task of cloudTasks.values()) {
+      if (task.inFlight || task.latestVersion <= task.appliedVersion) continue;
+      if (task.retryAt && at < task.retryAt) continue;
+      const request = requestCloudLayer(task);
+      if (request) started.push(request);
+    }
   }
 
-  async function requestMappingLayer(name, task, at) {
+  function pollCloudFallback(group, names) {
+    const started = [];
+    for (const name of Array.from(new Set(names || []))) {
+      const layers = group === "nav" ? navigationLayers : mappingLayers;
+      const layer = layers && layers[name];
+      if (!layer || !layer.enabled) continue;
+      if (group === "nav" && STATIC_NAVIGATION_LAYERS.has(name) && layer.staticLoaded) continue;
+      const task = ensureCloudTask(group, name);
+      if (task.inFlight) continue;
+      task.retryAt = 0;
+      const request = requestCloudLayer(task, { force: true });
+      if (request) started.push(request);
+    }
+    return started;
+  }
+
+  function requestPath(topic, task, { force = false } = {}) {
+    if (topic !== "mapping_path" && pathTasks.get(topic) !== task) return null;
+    if (task.inFlight || isHidden()) return null;
+    if (!pathTaskVisible(task)) return null;
+    if (!force && task.latestVersion <= task.appliedVersion) return null;
+    if (task.retryAt && now() < task.retryAt) return null;
+    task.retryAt = 0;
     task.inFlight = true;
-    task.due = at + task.interval;
     const generation = task.generation;
-    try {
-      const data = await getJson(`/api/mapping/map3d?layer=${encodeURIComponent(name)}`);
-      if (task.generation !== generation) return;
-      const layer = mappingLayers[name];
-      layer.points3d = Array.isArray(data.points) ? data.points : [];
-      layer.lastFetch3d = now();
-      applyMappingLayer(name, layer);
-    } catch (_error) {
-      // Keep the last good mapping cloud and retry at the next deadline.
-    } finally {
-      task.inFlight = false;
+    const requestedVersion = task.latestVersion;
+    const url = topic === "mapping_path"
+      ? "/api/mapping/path"
+      : `/api/path?topic=${encodeURIComponent(topic)}`;
+    return (async () => {
+      try {
+        const data = await getJson(url);
+        if (topic !== "mapping_path" && pathTasks.get(topic) !== task) return;
+        const epochState = observeEpoch(data && data.epoch);
+        if (epochState === "stale") return;
+        if (epochState === "new") {
+          resetAllResources();
+          const adoptedVersion = numeric(data && data.version);
+          const adoptedGeneration = numeric(data && data.generation);
+          if (adoptedGeneration !== null) task.serverGeneration = adoptedGeneration;
+          if (adoptedVersion !== null) {
+            task.latestVersion = Math.max(task.latestVersion, adoptedVersion);
+          }
+        } else if (task.generation !== generation) {
+          return; // lifecycle reset while this response was in flight
+        }
+        if (!pathTaskVisible(task)) return;
+        const responseGeneration = numeric(data && data.generation);
+        if (
+          responseGeneration !== null &&
+          task.serverGeneration !== null &&
+          responseGeneration !== task.serverGeneration
+        ) {
+          return; // response from an older lifecycle generation
+        }
+        const responseVersion = numeric(data && data.version);
+        if (task.latestCleared && requestedVersion < task.latestVersion) {
+          return;
+        }
+        const points = Array.isArray(data.points) ? data.points : [];
+        if (topic === "mapping_path") applyMappingPath(points);
+        else applyPath(topic, points);
+        task.retryAt = 0;
+        if (responseVersion !== null) {
+          task.latestVersion = Math.max(task.latestVersion, responseVersion);
+        }
+        const appliedVersion = epochState === "new"
+          ? (responseVersion === null ? -1 : responseVersion)
+          : (responseVersion === null ? requestedVersion : Math.max(requestedVersion, responseVersion));
+        if (task.appliedVersion < appliedVersion) {
+          task.appliedVersion = appliedVersion;
+        }
+      } catch (_error) {
+        // Keep the last path but retry a failed revision only after a bounded
+        // delay; no spinner and no request loop.
+        if (task.generation === generation) task.retryAt = now() + 1000;
+      } finally {
+        task.inFlight = false;
+        if (task.latestVersion > task.appliedVersion) {
+          if (!task.retryAt || now() >= task.retryAt) requestPath(topic, task);
+        }
+      }
+    })();
+  }
+
+  function drainPathTasks(at, started) {
+    if (isHidden()) return;
+    if (getView() === "3d") syncPathTasks();
+    for (const task of pathTasks.values()) {
+      if (task.inFlight || task.latestVersion <= task.appliedVersion) continue;
+      if (task.retryAt && at < task.retryAt) continue;
+      const request = requestPath(task.key, task);
+      if (request) started.push(request);
+    }
+    if (
+      !mappingPathTask.inFlight &&
+      mappingPathTask.latestVersion > mappingPathTask.appliedVersion &&
+      (!mappingPathTask.retryAt || at >= mappingPathTask.retryAt)
+    ) {
+      const request = requestPath("mapping_path", mappingPathTask);
+      if (request) started.push(request);
     }
   }
 
-  function pathEligible(task, at) {
-    return !task.inFlight && at >= task.due;
+  function pollPathFallback(names) {
+    const started = [];
+    const topics = Array.from(new Set(names || getPathTopics() || []));
+    for (const topic of topics) {
+      const task = ensurePathTask(topic);
+      if (task.inFlight || !pathTaskVisible(task)) continue;
+      task.retryAt = 0;
+      const request = requestPath(topic, task, { force: true });
+      if (request) started.push(request);
+    }
+    return started;
   }
 
-  async function requestPath(topic, task, at) {
-    task.inFlight = true;
-    task.due = at + task.interval;
-    const generation = task.generation;
-    try {
-      const data = await getJson(`/api/path?topic=${encodeURIComponent(topic)}`);
-      if (pathTasks.get(topic) !== task || task.generation !== generation) return;
-      applyPath(topic, Array.isArray(data.points) ? data.points : []);
-    } catch (_error) {
-      // Keep the last path and retry at the next deadline.
-    } finally {
-      task.inFlight = false;
+  function pollFallback(desired) {
+    const started = [];
+    if (desired && desired.group && Array.isArray(desired.layers)) {
+      started.push(...pollCloudFallback(desired.group, desired.layers));
     }
-  }
-
-  async function requestMappingPath(at) {
-    mappingPathTask.inFlight = true;
-    mappingPathTask.due = at + mappingPathTask.interval;
-    const generation = mappingPathTask.generation;
-    try {
-      const data = await getJson("/api/mapping/path");
-      if (mappingPathTask.generation !== generation) return;
-      applyMappingPath(Array.isArray(data.points) ? data.points : []);
-    } catch (_error) {
-      // Keep the last trajectory and retry at the next deadline.
-    } finally {
-      mappingPathTask.inFlight = false;
-    }
+    started.push(...pollPathFallback(desired && desired.paths));
+    return started;
   }
 
   function tick(at = now()) {
     const started = [];
-    const view = getView();
-    if (view === "3d") {
-      for (const [name, task] of navigationTasks) {
-        if (navigationEligible(name, task, at)) started.push(requestNavigationLayer(name, task, at));
-      }
-      if (pathsVisible()) {
-        syncPathTasks();
-        for (const [topic, task] of pathTasks) {
-          if (pathEligible(task, at)) started.push(requestPath(topic, task, at));
-        }
-      }
-    } else if (view === "mapping") {
-      for (const [name, task] of mappingTasks) {
-        if (mappingEligible(name, task, at)) started.push(requestMappingLayer(name, task, at));
-      }
-      if (mappingPathVisible() && pathEligible(mappingPathTask, at)) {
-        started.push(requestMappingPath(at));
-      }
-    }
+    // Catch up any revision that arrived while a previous fetch was in flight.
+    // This does not impose a cadence: each loop only starts a fetch when a
+    // newer revision is actually pending and the resource has no request open.
+    drainCloudTasks(at, started);
+    drainPathTasks(at, started);
     return started;
   }
 
@@ -1576,8 +2295,14 @@ function createRefreshController({
       layer.lastFetch3d = 0;
       layer.staticLoaded = false;
     }
-    const task = navigationTasks.get(name);
-    if (task) invalidateTask(task);
+    const task = cloudTasks.get(cloudKey("nav", name));
+    if (task) {
+      task.generation += 1;
+      task.latestVersion = -1;
+      task.appliedVersion = -1;
+      task.requestedVersion = -1;
+      task.retryAt = 0;
+    }
   }
 
   function invalidateNavigationLayers(names = Object.keys(navigationLayers)) {
@@ -1585,14 +2310,210 @@ function createRefreshController({
   }
 
   function invalidatePaths() {
-    for (const task of pathTasks.values()) invalidateTask(task);
+    syncPathTasks();
+    for (const [topic, task] of pathTasks) {
+      invalidateTask(task);
+      task.latestVersion = -1;
+      task.appliedVersion = -1;
+      task.serverGeneration = null;
+      clearPath(topic);
+    }
   }
 
   return {
     tick,
+    noteCloudMetadata,
+    pollCloudFallback,
+    pollFallback,
     invalidateNavigationLayer,
     invalidateNavigationLayers,
     invalidatePaths,
+  };
+}
+
+function createCloudStreamController({
+  EventSourceCtor = (typeof EventSource === "function" ? EventSource : null),
+  getDesired,
+  onMetadata = () => {},
+  onFallback = () => {},
+  documentHidden = () => false,
+  fallbackIntervalMs = 1000,
+  reconnectDelayMs = 1000,
+  maxReconnectDelayMs = 10000,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (id) => clearTimeout(id),
+  setIntervalFn = (fn, ms) => setInterval(fn, ms),
+  clearIntervalFn = (id) => clearInterval(id),
+} = {}) {
+  let current = null;
+  let activeSignature = "";
+  let reconnectTimer = null;
+  let fallbackTimer = null;
+  let fallbackSignature = "";
+  let failures = 0;
+
+  function desiredSignature(desired) {
+    if (!desired) return "";
+    const layers = Array.isArray(desired.layers) ? desired.layers : [];
+    const paths = Array.isArray(desired.paths)
+      ? desired.paths.slice().sort()
+      : [];
+    return JSON.stringify([
+      desired.group || "",
+      layers,
+      paths,
+      desired.pose || false,
+    ]);
+  }
+
+  function streamUrl(desired) {
+    const layers = Array.isArray(desired.layers) ? desired.layers : [];
+    const paths = Array.isArray(desired.paths) ? desired.paths : [];
+    const params = new URLSearchParams();
+    params.set("group", desired.group || "nav");
+    if (layers.length) params.set("layers", layers.join(","));
+    else params.set("clouds", "0");
+    if (paths.length) params.set("paths", paths.join(","));
+    if (desired.pose) params.set("pose", desired.pose === true ? "1" : String(desired.pose));
+    return `/api/cloud/events?${params.toString()}`;
+  }
+
+  function hasResources(desired) {
+    if (!desired) return false;
+    return Boolean(
+      (Array.isArray(desired.layers) && desired.layers.length) ||
+      (Array.isArray(desired.paths) && desired.paths.length) ||
+      desired.pose,
+    );
+  }
+
+  function parse(event, record) {
+    // Ignore a callback queued on a closed/replaced EventSource.  Without this
+    // guard an old server session could still mutate the current task cursors.
+    if (current !== record) return;
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload && Array.isArray(payload.layers)) {
+        const epoch = typeof payload.epoch === "string" ? payload.epoch : "";
+        onMetadata(payload.layers, epoch);
+      }
+    } catch (_error) {
+      // A malformed metadata event is ignored; the next snapshot/reconnect is
+      // authoritative and no stale geometry is marked as handled.
+    }
+  }
+
+  function stopFallback() {
+    if (fallbackTimer !== null) {
+      clearIntervalFn(fallbackTimer);
+      fallbackTimer = null;
+    }
+    fallbackSignature = "";
+  }
+
+  function startFallback(desired) {
+    if (fallbackTimer !== null || !desired) return;
+    fallbackSignature = desiredSignature(desired);
+    onFallback(desired);
+    fallbackTimer = setIntervalFn(() => {
+      const latest = documentHidden() ? null : getDesired();
+      if (!latest || desiredSignature(latest) !== fallbackSignature) return;
+      onFallback(latest);
+    }, fallbackIntervalMs);
+  }
+
+  function clearReconnect() {
+    if (reconnectTimer !== null) {
+      clearTimer(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function close() {
+    clearReconnect();
+    stopFallback();
+    const previous = current;
+    current = null;
+    activeSignature = "";
+    if (previous) {
+      try {
+        previous.source.close();
+      } catch (_error) {
+        // Already closed.
+      }
+    }
+  }
+
+  function connect(desired) {
+    const signature = desiredSignature(desired);
+    if (!EventSourceCtor) {
+      startFallback(desired);
+      return;
+    }
+    const source = new EventSourceCtor(streamUrl(desired));
+    const record = { source, signature, group: desired.group, layers: desired.layers };
+    current = record;
+    source.addEventListener("snapshot", (event) => parse(event, record));
+    source.addEventListener("cloud", (event) => parse(event, record));
+    source.onopen = () => {
+      if (current !== record) return;
+      failures = 0;
+      stopFallback();
+    };
+    source.onerror = () => {
+      if (current !== record) return;
+      failures += 1;
+      // Even while the native EventSource is still CONNECTING, repeated errors
+      // activate the bounded fallback.  A successful onopen stops it again.
+      if (failures >= 2) startFallback(desired);
+      const closedState = typeof EventSourceCtor.CLOSED === "number" ? EventSourceCtor.CLOSED : 2;
+      if (source.readyState !== closedState) return; // EventSource reconnects itself
+      current = null;
+      try {
+        source.close();
+      } catch (_error) {
+        // Already closed.
+      }
+      const delay = Math.min(maxReconnectDelayMs, reconnectDelayMs * Math.max(1, failures));
+      reconnectTimer = setTimer(() => {
+        reconnectTimer = null;
+        const latest = documentHidden() ? null : getDesired();
+        if (!latest) {
+          close();
+          return;
+        }
+        if (desiredSignature(latest) !== signature) {
+          sync();
+          return;
+        }
+        connect(latest);
+      }, delay);
+    };
+  }
+
+  function sync() {
+    const desired = documentHidden() ? null : getDesired();
+    if (!hasResources(desired)) {
+      close();
+      return;
+    }
+    const signature = desiredSignature(desired);
+    if (
+      signature === activeSignature &&
+      (current !== null || reconnectTimer !== null || fallbackTimer !== null)
+    ) {
+      return;
+    }
+    close();
+    activeSignature = signature;
+    connect(desired);
+  }
+
+  return {
+    sync,
+    close,
+    isOpen: () => current !== null,
+    get signature() { return activeSignature; },
   };
 }
 // --- End data refresh scheduler
@@ -1604,8 +2525,15 @@ const refreshController = createRefreshController({
   navigationLayers: LAYERS,
   mappingLayers: MAPPING_LAYERS,
   getPathTopics: () => state.pathTopics,
-  pathsVisible: () => state.showPaths && !state.hideCompletedPaths,
+  pathsVisible: (topic) => {
+    const isPredicted = Boolean(
+      state.trajectoryTopic && topic === state.trajectoryTopic,
+    );
+    const enabled = isPredicted ? state.showTrajectory : state.showPaths;
+    return enabled && !state.hideCompletedPaths;
+  },
   mappingPathVisible: () => state.showMappingPath,
+  isHidden: () => document.hidden,
   applyNavigationLayer(name, layer) {
     if (layer.points3d.length) state.mapSceneCleared = false;
     updateLayerObject(name);
@@ -1614,7 +2542,11 @@ const refreshController = createRefreshController({
     updateMappingLayerObject(name);
   },
   applyPath(topic, points) {
-    if (!state.showPaths || state.hideCompletedPaths || state.view !== "3d") return;
+    const isPredicted = Boolean(
+      state.trajectoryTopic && topic === state.trajectoryTopic,
+    );
+    const enabled = isPredicted ? state.showTrajectory : state.showPaths;
+    if (!enabled || state.hideCompletedPaths || state.view !== "3d") return;
     state.paths[topic] = points;
     updatePaths();
   },
@@ -1623,7 +2555,69 @@ const refreshController = createRefreshController({
     state.mappingPath = points;
     updateMappingPath();
   },
+  applyPose(kind, odom) {
+    if (kind === "mapping") updateMappingPose(odom);
+    else updateNavigationPose(odom);
+  },
+  clearPath(topic) {
+    delete state.paths[topic];
+    updatePaths();
+  },
+  clearMappingPath() {
+    state.mappingPath = [];
+    updateMappingPath();
+  },
+  clearPose(kind) {
+    if (kind === "mapping") updateMappingPose(null);
+    else updateNavigationPose(null);
+  },
 });
+
+function desiredCloudStream() {
+  if (document.hidden) return null;
+  if (state.view === "3d") {
+    const layers = Object.keys(LAYERS).filter((name) => LAYERS[name].enabled);
+    const topics = Array.isArray(state.pathTopics) ? state.pathTopics : [];
+    // Like a layer checkbox, disabling the predicted trajectory removes it
+    // from the stream so no path metadata or snapshot is requested.
+    const paths = topics.filter((topic) =>
+      state.trajectoryTopic && topic === state.trajectoryTopic
+        ? state.showTrajectory
+        : true,
+    );
+    return {
+      group: "nav",
+      layers,
+      paths,
+      pose: "nav",
+    };
+  }
+  if (state.view === "mapping") {
+    const layers = Object.keys(MAPPING_LAYERS).filter((name) => MAPPING_LAYERS[name].enabled);
+    return {
+      group: "mapping",
+      layers,
+      paths: ["mapping_path"],
+      pose: "mapping",
+    };
+  }
+  return null;
+}
+
+const cloudStreamController = createCloudStreamController({
+  getDesired: desiredCloudStream,
+  documentHidden: () => document.hidden,
+  onMetadata: (entries, epoch) => refreshController.noteCloudMetadata(entries, epoch),
+  onFallback: (desired) => {
+    void refreshController.pollFallback(desired);
+    // Pose is inline in SSE; only the no-EventSource fallback needs the GET.
+    void pollPose();
+  },
+});
+
+function syncCloudStream() {
+  cloudStreamController.sync();
+}
 
 async function pollMappingState() {
   if (state.view !== "mapping") return;
@@ -1639,13 +2633,70 @@ async function pollMappingState() {
   }
 }
 
+let poseFallbackInFlight = false;
+
 async function pollPose() {
-  if (state.view === "system") return;
+  // Fallback only when EventSource is unavailable; never a normal timer.
+  if (poseFallbackInFlight || state.view === "system" || document.hidden) return;
+  poseFallbackInFlight = true;
+  const previousNav = state.odom;
+  const previousMapping = state.mappingOdom;
   try {
-    updateLivePose(await timedGetJson("/api/pose"));
+    const data = await timedGetJson("/api/pose");
+    if (state.view === "system" || document.hidden) return;
+    const entries = [];
+    for (const [kind, field] of [["nav", "odom"], ["mapping", "mapping_odom"]]) {
+      const odom = data && data[field];
+      if (!odom) continue;
+      entries.push({
+        group: "pose", layer: kind,
+        version: odom.version, generation: odom.generation,
+        status: odom.status, frame_id: odom.frame_id,
+        pose: odom.pose ? { ...odom.pose, age: odom.age, stamp: odom.stamp } : null,
+      });
+    }
+    refreshController.noteCloudMetadata(entries, data && data.epoch);
   } catch (_error) {
-    updateLivePose(null);
+    if (!document.hidden && state.view !== "system" && state.odom === previousNav && state.mappingOdom === previousMapping) {
+      updateLivePose(null);
+    }
+  } finally {
+    poseFallbackInFlight = false;
   }
+}
+
+// Pose metadata suppresses age-only refreshes, so the received age is anchored
+// to a browser-monotonic instant.  The quiet HUD tick can then keep the age
+// advancing without applying the pose or touching any marker/geometry.  Using
+// a browser-only duration also makes this independent of server/browser clock
+// skew.
+const poseAgeAnchors = { nav: null, mapping: null };
+
+function poseAgeNow() {
+  if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function poseAgeText(kind, now = poseAgeNow()) {
+  const anchor = poseAgeAnchors[kind];
+  if (!anchor) return "--";
+  return `${fmt(anchor.age + Math.max(0, now - anchor.at) / 1000, 1)} s`;
+}
+
+function rememberPoseAge(kind, odom) {
+  const age =
+    odom && typeof odom.age === "number" && Number.isFinite(odom.age)
+      ? Math.max(0, odom.age)
+      : null;
+  poseAgeAnchors[kind] = age === null ? null : { age, at: poseAgeNow() };
+}
+
+function refreshPoseAgeDisplay(now = poseAgeNow()) {
+  if (document.hidden || state.view === "system") return;
+  document.getElementById("odomAge").textContent = poseAgeText("nav", now);
+  document.getElementById("mappingOdomAge").textContent = poseAgeText("mapping", now);
 }
 
 function updateNavigationPose(odom) {
@@ -1655,7 +2706,8 @@ function updateNavigationPose(odom) {
   document.getElementById("poseY").textContent = pose ? fmt(pose.y) : "--";
   document.getElementById("poseZ").textContent = pose ? fmt(pose.z) : "--";
   document.getElementById("poseYaw").textContent = pose ? fmt(pose.yaw, 3) : "--";
-  document.getElementById("odomAge").textContent = state.odom && state.odom.age != null ? `${fmt(state.odom.age, 1)} s` : "--";
+  rememberPoseAge("nav", state.odom);
+  document.getElementById("odomAge").textContent = poseAgeText("nav");
   updateVehicleMarker();
 }
 
@@ -1666,7 +2718,8 @@ function updateMappingPose(odom) {
   document.getElementById("mappingPoseY").textContent = pose ? fmt(pose.y) : "--";
   document.getElementById("mappingPoseZ").textContent = pose ? fmt(pose.z) : "--";
   document.getElementById("mappingPoseYaw").textContent = pose ? fmt(pose.yaw, 3) : "--";
-  document.getElementById("mappingOdomAge").textContent = state.mappingOdom && state.mappingOdom.age != null ? `${fmt(state.mappingOdom.age, 1)} s` : "--";
+  rememberPoseAge("mapping", state.mappingOdom);
+  document.getElementById("mappingOdomAge").textContent = poseAgeText("mapping");
   updateMappingVehicleMarker();
 }
 
@@ -1676,7 +2729,8 @@ function updateLivePose(data) {
 }
 
 function updateStatus(data) {
-  updateNavigationPose(data.odom);
+  // Pose is applied only from the SSE snapshot/event.  A slower /api/state poll
+  // must never overwrite a newer pushed pose.
   state.navigationAction = data.navigation_action || null;
   updateNavigationReadiness(data.navigation_ready);
   updateTargetPoseDisplay();
@@ -1691,14 +2745,19 @@ function updateStatus(data) {
   if (mapSourcesAreWaiting(data.layers || {})) {
     clearMapSceneState();
   }
-  // Store the current topic list here; the 5 Hz path scheduler reads it on its
-  // own cadence so status polling never drives path downloads.
-  state.pathTopics = Object.keys(data.paths || {});
+  // Topic names still come from status polling, but path downloads are driven
+  // by metadata revisions.  A topic-list change only reconnects the stream.
+  state.trajectoryTopic =
+    typeof data.trajectory_topic === "string" ? data.trajectory_topic : "";
+  const topics = Object.keys(data.paths || {});
+  const topicsChanged = topics.join("|") !== (state.pathTopics || []).join("|");
+  state.pathTopics = topics;
+  if (topicsChanged) syncCloudStream();
 }
 
 function updateMappingStatus(data) {
-  updateMappingPose(data && data.odom);
-
+  // Mapping pose is pushed through the same revision stream; do not apply the
+  // stale pose carried by this slower status payload.
   const sources = document.getElementById("mappingSources");
   sources.innerHTML = "";
   if (!data) {
@@ -1735,28 +2794,160 @@ function updateSaveMapStatus(status) {
   }
 }
 
+function saveMapDestination(parent, name) {
+  const base = parent === "/" ? "" : parent.replace(/\/+$/, "");
+  return `${base}/${name}`;
+}
+
+function invalidateSaveMapDialog() {
+  state.saveMapDialogSeq += 1;
+  state.saveMapBrowseSeq += 1;
+  state.saveMapBrowserWritable = false;
+  const use = document.getElementById("saveMapBrowserUse");
+  if (use) use.disabled = true;
+}
+
+function useSaveMapDirectory() {
+  const directory = document.getElementById("saveMapDirectory");
+  if (!directory) return;
+  directory.value = state.saveMapBrowsePath || "";
+  directory.setCustomValidity("");
+  const browser = document.getElementById("saveMapBrowser");
+  if (browser) browser.hidden = true;
+  updateSaveMapOutput();
+}
+
+function updateSaveMapOutput() {
+  const directory = document.getElementById("saveMapDirectory");
+  const name = document.getElementById("saveMapName");
+  const output = document.getElementById("saveMapOutput");
+  if (!directory || !name || !output) return;
+  const parent = directory.value.trim();
+  const folder = name.value.trim();
+  output.textContent = parent && folder ? `Output: ${saveMapDestination(parent, folder)}` : "";
+}
+
+function renderSaveMapBrowser() {
+  const list = document.getElementById("saveMapBrowserList");
+  const path = document.getElementById("saveMapBrowserPath");
+  const up = document.getElementById("saveMapBrowserUp");
+  const use = document.getElementById("saveMapBrowserUse");
+  if (!list || !path || !up || !use) return;
+  path.textContent = state.saveMapBrowsePath || "";
+  list.replaceChildren();
+  for (const entry of state.saveMapBrowserEntries || []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recording-browser-entry";
+    button.textContent = entry.writable ? entry.name : `${entry.name} (not writable)`;
+    button.addEventListener("click", () => loadSaveMapDirectory(entry.path));
+    list.appendChild(button);
+  }
+  if (!(state.saveMapBrowserEntries || []).length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No subdirectories.";
+    list.appendChild(empty);
+  }
+  up.disabled = !state.saveMapBrowserParent;
+  use.disabled = !state.saveMapBrowserWritable;
+}
+
+async function loadSaveMapDirectory(path, show = true) {
+  const seq = ++state.saveMapBrowseSeq;
+  const browser = document.getElementById("saveMapBrowser");
+  const errorBox = document.getElementById("saveMapBrowserError");
+  if (show && browser) browser.hidden = false;
+  if (errorBox) errorBox.textContent = "";
+  state.saveMapBrowserError = null;
+  // A previously selected directory must not remain selectable while this
+  // request is in flight. It is re-enabled only for the fresh response.
+  state.saveMapBrowserWritable = false;
+  const use = document.getElementById("saveMapBrowserUse");
+  if (use) use.disabled = true;
+  try {
+    const data = await getJson(`/api/mapping/save_map/browse?path=${encodeURIComponent(path || "")}`);
+    if (seq !== state.saveMapBrowseSeq) return;
+    state.saveMapBrowsePath = data.path || "";
+    state.saveMapBrowserParent = data.parent || null;
+    state.saveMapBrowserWritable = Boolean(data.writable);
+    state.saveMapBrowserEntries = data.entries || [];
+    state.saveMapDefaultDirectory = data.default_directory || data.path || "";
+    renderSaveMapBrowser();
+  } catch (error) {
+    if (seq !== state.saveMapBrowseSeq) return;
+    state.saveMapBrowsePath = "";
+    state.saveMapBrowserParent = null;
+    state.saveMapBrowserWritable = false;
+    state.saveMapBrowserEntries = [];
+    state.saveMapBrowserError = `Cannot read directory: ${error.message}`;
+    if (errorBox) errorBox.textContent = state.saveMapBrowserError;
+    renderSaveMapBrowser();
+  }
+}
+
+async function openSaveMapDialog() {
+  saveMapSubmissionError = null;
+  const dialog = document.getElementById("saveMapDialog");
+  const directory = document.getElementById("saveMapDirectory");
+  const browser = document.getElementById("saveMapBrowser");
+  const errorBox = document.getElementById("saveMapBrowserError");
+  if (errorBox) errorBox.textContent = "";
+  state.saveMapBrowserError = null;
+  if (directory) directory.setCustomValidity("");
+  const name = document.getElementById("saveMapName");
+  if (name) name.setCustomValidity("");
+  if (browser) browser.hidden = true;
+  const generation = ++state.saveMapDialogSeq;
+  state.saveMapBrowseSeq += 1;
+  updateSaveMapOutput();
+  dialog.showModal();
+  if (directory && !directory.value.trim()) {
+    await loadSaveMapDirectory("", false);
+    if (generation !== state.saveMapDialogSeq || !dialog.open) return;
+    if (!directory.value.trim() && state.saveMapDefaultDirectory) {
+      directory.value = state.saveMapDefaultDirectory;
+      updateSaveMapOutput();
+    }
+  }
+  if (generation !== state.saveMapDialogSeq || !dialog.open) return;
+  if (directory) directory.focus();
+}
+
 async function submitSaveMap(event) {
   event.preventDefault();
   const dialog = document.getElementById("saveMapDialog");
-  const destinationInput = document.getElementById("saveMapDestination");
-  const destination = destinationInput.value.trim();
+  const directoryInput = document.getElementById("saveMapDirectory");
+  const nameInput = document.getElementById("saveMapName");
+  const directory = directoryInput.value.trim();
+  const name = nameInput.value.trim();
+  directoryInput.setCustomValidity("");
+  nameInput.setCustomValidity("");
+  let invalidInput = null;
+  let message = "";
+  if (!directory.startsWith("/") || directory.split("/").includes("..") || directory.includes("\0")) {
+    message = "Enter an absolute parent directory without '..' or NUL bytes.";
+    invalidInput = directoryInput;
+  } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) {
+    message = "The folder name must start with a letter or number and use only letters, numbers, dot, underscore or dash.";
+    invalidInput = nameInput;
+  }
+  if (invalidInput) {
+    invalidInput.setCustomValidity(message);
+    invalidInput.reportValidity();
+    return;
+  }
+  const destination = saveMapDestination(directory, name);
   if (!destination.startsWith("/") || destination === "/") {
-    destinationInput.setCustomValidity("Enter a path under the robot user's home directory, such as /map or /map/site.");
-    destinationInput.reportValidity();
+    directoryInput.setCustomValidity("The output folder must resolve to an absolute path.");
+    directoryInput.reportValidity();
     return;
   }
-  if (destination.split("/").includes("..")) {
-    destinationInput.setCustomValidity("Destination cannot contain '..' path segments.");
-    destinationInput.reportValidity();
-    return;
-  }
-  destinationInput.setCustomValidity("");
-  if (!window.confirm(`Save the map to ${destination} under the robot user's home directory?\n\nExisting map files in this directory will be overwritten. Unrelated files are preserved.`)) return;
+  if (!window.confirm(`Save the map to ${destination}?\n\nExisting map files in this folder will be overwritten.`)) return;
 
   dialog.close();
   saveMapSubmissionError = null;
   document.getElementById("openSaveMap").disabled = true;
-  document.getElementById("saveMapStatus").textContent = `Starting map save to ${destination} under the robot user's home directory ...`;
+  document.getElementById("saveMapStatus").textContent = `Starting map save to ${destination} ...`;
   try {
     await postJson("/api/mapping/save_map", {
       destination,
@@ -2375,14 +3566,120 @@ function updateTerminalLog(target, summary) {
   updateManagedProcessButton(target);
   const lines = Array.isArray(summary.lines) ? summary.lines : [];
   const seq = typeof summary.seq === "number" ? summary.seq : undefined;
-  const isInitial = lastLogSeq[target] === 0;
+  const previousSeq = lastLogSeq[target];
+  // A restarted web process starts its per-target sequence at zero again.  A
+  // delta computed with the old, higher cursor can therefore return a LOWER
+  // non-zero seq and no rows at all; treating that as an ordinary cursor
+  // advance would leave the old session's DOM on screen.
+  const rolledBack = seq !== undefined && previousSeq > 0 && seq < previousSeq;
+  const isInitial = previousSeq === 0 || rolledBack;
+  const duplicateSeq = seq !== undefined && !rolledBack && seq === previousSeq;
+
+  // Incremental append keeps an active selection in earlier text alive, but a
+  // terminal that only ever appends grows without bound.  Retain a fixed
+  // line/byte window per target (shared by both page copies) and clip a single
+  // enormous line before it is stored so one write cannot defeat the byte cap.
+  const MAX_LINES = 400;
+  const MAX_BYTES = 64 * 1024;
+  const MAX_LINE_CHARS = 4096;
+  const encoder = typeof TextEncoder === "function" ? new TextEncoder() : null;
+  const byteLength = (text) => {
+    if (!text) return 0;
+    return encoder ? encoder.encode(text).length : text.length;
+  };
+  const clipLine = (value) => {
+    const text =
+      typeof value === "string" ? value : String(value == null ? "" : value);
+    return text.length > MAX_LINE_CHARS
+      ? text.slice(0, MAX_LINE_CHARS) + "\u2026"
+      : text;
+  };
+  const normalizeLines = (values) => {
+    const result = [];
+    values.forEach((value) => {
+      const text =
+        typeof value === "string" ? value : String(value == null ? "" : value);
+      // Backend entries are already single lines; clip before split so a
+      // multi-megabyte value cannot allocate a megabyte-sized array.
+      const bounded =
+        text.length > MAX_LINE_CHARS
+          ? text.slice(0, MAX_LINE_CHARS) + "\u2026"
+          : text;
+      bounded.split(/\r\n|\r|\n/).forEach((part) => result.push(clipLine(part)));
+    });
+    return result;
+  };
+  const buffers =
+    updateTerminalLog._buffers || (updateTerminalLog._buffers = Object.create(null));
+  const buffer =
+    buffers[target] ||
+    (buffers[target] = { lines: [], bytes: 0, pending: false });
+  const appendToBuffer = (incoming) => {
+    const previousLines = buffer.lines.length;
+    incoming.forEach((line) => {
+      buffer.bytes += byteLength(line) + (buffer.lines.length ? 1 : 0);
+      buffer.lines.push(line);
+    });
+    let removedLines = 0;
+    while (buffer.lines.length > MAX_LINES || buffer.bytes > MAX_BYTES) {
+      const removed = buffer.lines.shift();
+      buffer.bytes -= byteLength(removed);
+      if (buffer.lines.length) buffer.bytes -= 1;
+      removedLines += 1;
+    }
+    return { removedLines, previousLines };
+  };
+  const replaceBuffer = (incoming) => {
+    buffer.lines = incoming.slice();
+    buffer.bytes = buffer.lines.reduce(
+      (total, line, index) => total + byteLength(line) + (index ? 1 : 0),
+      0,
+    );
+    while (buffer.lines.length > MAX_LINES || buffer.bytes > MAX_BYTES) {
+      const removed = buffer.lines.shift();
+      buffer.bytes -= byteLength(removed);
+      if (buffer.lines.length) buffer.bytes -= 1;
+    }
+  };
+  const atBottom = (outputElement) =>
+    outputElement.scrollTop + outputElement.clientHeight >=
+    outputElement.scrollHeight - 8;
+  const renderBuffer = (removedLines = 0, previousLines = 0) => {
+    const text = buffer.lines.length ? buffer.lines.join("\n") : "No output.";
+    outputElements.forEach((outputElement) => {
+      const wasAtBottom = atBottom(outputElement);
+      const previousScrollTop = outputElement.scrollTop;
+      const previousScrollHeight = outputElement.scrollHeight;
+      outputElement.textContent = text;
+      if (wasAtBottom) {
+        outputElement.scrollTop = outputElement.scrollHeight;
+      } else if (removedLines > 0 && previousLines > 0) {
+        // Trimming removed old rows from the top.  Shift a scrolled-up viewport
+        // by their average height so it keeps showing roughly the same rows
+        // instead of an arbitrary physical scrollTop.
+        const removedHeight =
+          (previousScrollHeight / previousLines) * removedLines;
+        outputElement.scrollTop = Math.max(
+          0,
+          previousScrollTop - removedHeight,
+        );
+      }
+    });
+  };
+  const appendText = (text) => {
+    outputElements.forEach((outputElement) => {
+      const wasAtBottom = atBottom(outputElement);
+      outputElement.appendChild(document.createTextNode(text));
+      if (wasAtBottom) outputElement.scrollTop = outputElement.scrollHeight;
+    });
+  };
 
   // A full textContent rewrite would wipe an active text selection in a log;
   // only that case needs to defer. Incremental append adds a text node at the
   // end and does not perturb offsets in existing text, so a selection there
-  // survives even while new lines keep arriving — no need to freeze. The same
-  // target can be mounted on both the Navigation and Mapping pages, so every
-  // matching output element is updated.
+  // survives even while new lines keep arriving. The same target can be
+  // mounted on both the Navigation and Mapping pages, so every matching output
+  // element is updated.
   const selection = window.getSelection();
   const selectingHere =
     selection &&
@@ -2391,28 +3688,68 @@ function updateTerminalLog(target, summary) {
     outputElements.some((element) => element.contains(selection.anchorNode));
 
   if (seq === undefined || isInitial) {
-    // First render, reconnect, or legacy server without seq: replace contents.
-    if (!selectingHere) {
-      outputElements.forEach((outputElement) => {
-        const atBottom =
-          outputElement.scrollTop + outputElement.clientHeight >= outputElement.scrollHeight - 8;
-        outputElement.textContent = lines.length ? lines.join("\n") : "No output.";
-        if (atBottom) outputElement.scrollTop = outputElement.scrollHeight;
-      });
-      if (seq !== undefined) lastLogSeq[target] = seq;
+    // First render, reconnect, rollback, or legacy server without seq: replace
+    // contents. A rollback also invalidates an earlier selection: the old
+    // session must not stay mounted indefinitely just because it is selected.
+    replaceBuffer(normalizeLines(lines));
+    buffer.pending = false;
+    if (!selectingHere || rolledBack) {
+      renderBuffer();
+    } else {
+      // Keep the selection in the bounded old DOM; render the new snapshot as
+      // soon as the selection clears. The retained buffer stays capped.
+      buffer.pending = true;
+    }
+    if (rolledBack) {
+      // The response was computed with the obsolete cursor; do not adopt its
+      // lower seq. The next poll asks from 0 and receives the new server's
+      // retained window, whose earlier rows the old cursor omitted.
+      lastLogSeq[target] = 0;
+    } else if (seq !== undefined) {
+      lastLogSeq[target] = seq;
+    }
+  } else if (duplicateSeq) {
+    // A repeated seq is not new data; never append the same window twice.
+    if (buffer.pending && !selectingHere) {
+      renderBuffer();
+      buffer.pending = false;
     }
   } else if (lines.length) {
     // Incremental: append only the new lines, even while the user is selecting
     // — appending a text node preserves any selection in earlier text.
-    outputElements.forEach((outputElement) => {
-      const atBottom =
-        outputElement.scrollTop + outputElement.clientHeight >= outputElement.scrollHeight - 8;
-      outputElement.appendChild(document.createTextNode("\n" + lines.join("\n")));
-      if (atBottom) outputElement.scrollTop = outputElement.scrollHeight;
-    });
+    const incoming = normalizeLines(lines);
+    if (!buffer.lines.length) {
+      // "No output." is a placeholder, not retained text. Replace it instead
+      // of appending, so it cannot become a fake prefix for the first row.
+      replaceBuffer(incoming);
+      if (!selectingHere) {
+        renderBuffer();
+        buffer.pending = false;
+      } else {
+        buffer.pending = true;
+      }
+    } else {
+      const { removedLines, previousLines } = appendToBuffer(incoming);
+      if (buffer.pending) {
+        if (!selectingHere) {
+          renderBuffer(removedLines, previousLines);
+          buffer.pending = false;
+        }
+      } else if (removedLines) {
+        // The cap wins over selection: never let a selection keep the terminal
+        // unbounded. Only a trimming update requires a full render.
+        renderBuffer(removedLines, previousLines);
+      } else {
+        appendText("\n" + incoming.join("\n"));
+      }
+    }
     lastLogSeq[target] = seq;
   } else if (seq !== undefined) {
     lastLogSeq[target] = seq;
+    if (buffer.pending && !selectingHere) {
+      renderBuffer();
+      buffer.pending = false;
+    }
   }
   if (!summary.enabled) {
     setState("disabled", "pill waiting");
@@ -3039,8 +4376,29 @@ const mappingJoystickVisibility = {
   frameId: null,
   timerId: null,
   visible: false,
+  requested: false,
   pendingReveal: false,
 };
+
+function updateMappingJoystickToggle() {
+  const button = document.getElementById("mappingJoystickToggle");
+  if (!button) return;
+  const enabled = mappingJoystickVisibility.requested;
+  button.textContent = enabled ? "隐藏轮盘" : "显示轮盘";
+  button.setAttribute("aria-pressed", String(enabled));
+  button.classList.toggle("start-log", !enabled);
+  button.classList.toggle("stop-log", enabled);
+}
+
+function toggleMappingJoystick() {
+  if (state.view !== "mapping") return;
+  const visible = !mappingJoystickVisibility.requested;
+  const result = setMappingJoystickVisible(visible, {
+    deferReveal: pageTransition.active && pageTransition.expectsGrid,
+  });
+  if (!visible) exitJoystickLayout();
+  return result;
+}
 
 function cancelMappingJoystickVisibility() {
   if (mappingJoystickVisibility.frameId !== null) {
@@ -3091,6 +4449,8 @@ function flushPendingMappingJoystickReveal() {
 }
 
 async function setMappingJoystickVisible(visible, options = {}) {
+  mappingJoystickVisibility.requested = visible;
+  updateMappingJoystickToggle();
   const joystick = document.getElementById("mappingJoystick");
   const stage = document.querySelector(".stage");
   if (stage) stage.classList.toggle("mapping-active", visible);
@@ -3812,12 +5172,9 @@ function setTab(tab) {
 
   document.querySelector(".app").classList.toggle("system-mode", tab === "system");
 
-  // Safety state commits synchronously: hiding the joystick also fires the
-  // teleop stop, and leaving layout mode must never wait for the transition.
-  // Showing waits until the sidebar geometry is known and the layout
-  // transition is armed, so a System -> Mapping reveal can defer measuring the
-  // joystick until the grid has settled.
-  if (tab !== "mapping") {
+  // Leaving or entering Mapping resets the explicit opt-in. Hiding also stops
+  // teleop synchronously before the layout transition starts.
+  if (tab !== "mapping" || previousTab !== "mapping") {
     setMappingJoystickVisible(false);
     exitJoystickLayout();
   }
@@ -3855,7 +5212,7 @@ function setTab(tab) {
   const deferJoystickReveal =
     sidebarChanged || (pageTransition.active && pageTransition.expectsGrid);
 
-  if (tab === "mapping") {
+  if (tab === "mapping" && mappingJoystickVisibility.requested) {
     setMappingJoystickVisible(true, { deferReveal: deferJoystickReveal });
   }
 
@@ -3891,6 +5248,9 @@ function setTab(tab) {
     if (typeof pollTf === "function") pollTf();
     if (typeof refreshSavedLogSessions === "function") refreshSavedLogSessions();
   }
+  // One metadata stream for the visible view; switching tabs or hiding the
+  // page closes the previous stream before a replacement is opened.
+  syncCloudStream();
 
   // Hidden System view must not poll or accept graph interaction.
   if (typeof ensureTfGraphView === "function") {
@@ -4074,12 +5434,23 @@ function attachEvents() {
     input.addEventListener("change", () => {
       LAYERS[input.dataset.layer].enabled = input.checked;
       if (LAYERS[input.dataset.layer].object) LAYERS[input.dataset.layer].object.visible = input.checked;
+      syncCloudStream();
       void refreshController.tick();
     });
   });
   document.getElementById("pathLayer").addEventListener("change", (event) => {
     state.showPaths = event.target.checked;
     updatePaths();
+    // Resuming a hidden path applies only the latest pending revision.
+    void refreshController.tick();
+  });
+  document.getElementById("trajectoryLayer").addEventListener("change", (event) => {
+    state.showTrajectory = event.target.checked;
+    updatePaths();
+    // Match layer toggles: stop requesting the topic while hidden and apply
+    // only the latest pending revision when it is shown again.
+    syncCloudStream();
+    void refreshController.tick();
   });
   document.getElementById("vehicleLayer").addEventListener("change", (event) => {
     state.showVehicle = event.target.checked;
@@ -4091,12 +5462,14 @@ function attachEvents() {
       if (MAPPING_LAYERS[input.dataset.mappingLayer].object) {
         MAPPING_LAYERS[input.dataset.mappingLayer].object.visible = input.checked;
       }
+      syncCloudStream();
       void refreshController.tick();
     });
   });
   document.getElementById("mappingPathLayer").addEventListener("change", (event) => {
     state.showMappingPath = event.target.checked;
     updateMappingPath();
+    void refreshController.tick();
   });
   document.getElementById("mappingVehicleLayer").addEventListener("change", (event) => {
     state.showMappingVehicle = event.target.checked;
@@ -4125,14 +5498,27 @@ function attachEvents() {
   attachSegmentedControls();
   observeMapStageResize();
   attachLayoutTransitionListener();
-  document.getElementById("openSaveMap").addEventListener("click", () => {
-    saveMapSubmissionError = null;
-    const dialog = document.getElementById("saveMapDialog");
-    dialog.showModal();
-    document.getElementById("saveMapDestination").focus();
+  document.getElementById("openSaveMap").addEventListener("click", openSaveMapDialog);
+  const saveMapDialog = document.getElementById("saveMapDialog");
+  saveMapDialog.addEventListener("close", () => {
+    // Abandon any directory or initialization request still in flight.
+    invalidateSaveMapDialog();
   });
-  document.getElementById("cancelSaveMap").addEventListener("click", () => document.getElementById("saveMapDialog").close());
-  document.getElementById("saveMapDestination").addEventListener("input", (event) => event.target.setCustomValidity(""));
+  document.getElementById("cancelSaveMap").addEventListener("click", () => saveMapDialog.close());
+  document.getElementById("browseSaveMapDirectory").addEventListener("click", () => {
+    const directory = document.getElementById("saveMapDirectory");
+    loadSaveMapDirectory(directory.value.trim());
+  });
+  document.getElementById("saveMapBrowserUp").addEventListener("click", () => {
+    loadSaveMapDirectory(state.saveMapBrowserParent || "");
+  });
+  document.getElementById("saveMapBrowserUse").addEventListener("click", useSaveMapDirectory);
+  for (const id of ["saveMapDirectory", "saveMapName"]) {
+    document.getElementById(id).addEventListener("input", (event) => {
+      event.target.setCustomValidity("");
+      updateSaveMapOutput();
+    });
+  }
   document.getElementById("saveMapForm").addEventListener("submit", submitSaveMap);
 
   document.getElementById("openRecordBag").addEventListener("click", openRecordBagDialog);
@@ -4178,6 +5564,8 @@ function attachEvents() {
   document.addEventListener("visibilitychange", handleVisibilityChange);
 
   const joystickSettings = document.getElementById("joystickSettings");
+  const joystickToggle = document.getElementById("mappingJoystickToggle");
+  if (joystickToggle) joystickToggle.addEventListener("click", toggleMappingJoystick);
   if (joystickSettings) joystickSettings.addEventListener("click", enterJoystickLayout);
   const joystickDone = document.getElementById("joystickDone");
   if (joystickDone) joystickDone.addEventListener("click", exitJoystickLayout);
@@ -4267,6 +5655,7 @@ function attachEvents() {
 
 function start() {
   attachEvents();
+  document.addEventListener("visibilitychange", syncCloudStream);
   resizeAll();
   setTab("3d");
   pollState();
@@ -4275,13 +5664,11 @@ function start() {
   heartbeatViewer();
   void refreshController.tick();
   pollMappingState();
-  pollPose();
   refreshMaps();
   refreshJoystickPreferences();
   setSidebarCollapsed(false);
   setInterval(pollState, 1000);
   setInterval(pollMappingState, 1000);
-  setInterval(pollPose, 100);
   setInterval(pollLogs, 1000);
   setInterval(pollDiagnostics, 1000);
   setInterval(heartbeatViewer, 3000);
