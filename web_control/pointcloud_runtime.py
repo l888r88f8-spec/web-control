@@ -252,10 +252,14 @@ def _parse_with_numpy(
             arrays["z"][rows, cols],
         )
     )
-    # Materialize in chunks: a single tolist() over a million points holds the
-    # interpreter lock for seconds and starves IMU and HTTP callbacks.
-    points: list[list[float]] = []
     count = int(sampled.shape[0])
+    if count <= _LIST_CHUNK_POINTS * 4:
+        # Small/live clouds finish in a few milliseconds; yielding here only
+        # adds latency to the high-rate layers.
+        return sampled.tolist(), finite_count
+    # Large one-shot maps: materialize in chunks so a single tolist() over a
+    # million points cannot hold the interpreter lock for seconds.
+    points: list[list[float]] = []
     for start in range(0, count, _LIST_CHUNK_POINTS):
         points.extend(sampled[start : start + _LIST_CHUNK_POINTS].tolist())
         if start + _LIST_CHUNK_POINTS < count:
