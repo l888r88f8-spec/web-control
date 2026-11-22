@@ -571,11 +571,21 @@ class PointCloudIngestWorker:
                     if frame.epoch != epoch:
                         continue
 
+                    decode_started = time.monotonic()
                     try:
                         decoded = self._decode(frame.msg)
                     except Exception as exc:
                         self._error(key, exc)
                         continue
+                    decode_elapsed = time.monotonic() - decode_started
+                    if decode_elapsed >= 0.25 and self._logger is not None:
+                        try:
+                            self._logger.warning(
+                                f"cloud decode {key[0]}/{key[1]} took "
+                                f"{decode_elapsed:.2f}s"
+                            )
+                        except Exception:
+                            pass
                     # A decoder for raw subscription bytes returns the frame id
                     # with the points because there is no message object; the
                     # default decoder keeps reading it from the header.

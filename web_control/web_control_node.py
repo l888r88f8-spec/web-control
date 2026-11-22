@@ -3816,12 +3816,20 @@ class WebControlNode(Node):
             payload["frame_id"],
             payload["count"],
         )
-        return cache.encode(
+        encode_started = time.monotonic()
+        body = cache.encode(
             ("nav", payload["layer"], mode),
             signature,
             lambda: utf8_json_bytes(payload),
             expected_epoch=expected_epoch,
         )
+        encode_elapsed = time.monotonic() - encode_started
+        if encode_elapsed >= 0.25:
+            self.get_logger().warning(
+                f"cloud response {layer_name}/{mode} serialization took "
+                f"{encode_elapsed:.2f}s"
+            )
+        return body
 
     def mapping_layer_payload(self, layer_name: str) -> dict[str, Any]:
         return _mapping_layer_payload_snapshot(self, layer_name)[0]
@@ -4003,8 +4011,18 @@ class WebControlNode(Node):
 
     # -- Topic and motion diagnostics -------------------------------------
     def diagnostics_imu_callback(self, msg: Any) -> None:
+        now = time.monotonic()
+        previous = getattr(self, "_imu_callback_stamp", None)
+        self._imu_callback_stamp = now
+        if previous is not None and now - previous >= 0.5:
+            last_log = getattr(self, "_imu_gap_log_stamp", 0.0)
+            if now - last_log >= 1.0:
+                self._imu_gap_log_stamp = now
+                self.get_logger().warning(
+                    f"IMU callback gap {now - previous:.2f}s"
+                )
         try:
-            self.diagnostics_service.record_imu(msg, time.monotonic())
+            self.diagnostics_service.record_imu(msg, now)
         except Exception as exc:  # pragma: no cover - defensive ROS guard
             self.get_logger().warning(f"IMU diagnostics callback failed: {exc}")
 

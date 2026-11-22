@@ -2166,6 +2166,9 @@ function createRefreshController({
       ? `/api/map3d?layer=${encodeURIComponent(task.name)}`
       : `/api/mapping/map3d?layer=${encodeURIComponent(task.name)}`;
     return (async () => {
+      const startedAt = typeof performance !== "undefined" && performance.now
+        ? performance.now()
+        : Date.now();
       try {
         const data = await getJson(url);
         const epochState = observeEpoch(data && data.epoch);
@@ -2231,6 +2234,14 @@ function createRefreshController({
         if (task.generation === generation) task.retryAt = now() + 1000;
       } finally {
         task.inFlight = false;
+        const elapsedMs = (typeof performance !== "undefined" && performance.now
+          ? performance.now()
+          : Date.now()) - startedAt;
+        if (elapsedMs >= 150) {
+          console.warn(
+            `cloud layer ${task.group}/${task.name} took ${elapsedMs.toFixed(0)} ms`,
+          );
+        }
         // Catch up after any lifecycle reset too; a newer revision is pending
         // even though this response belonged to the retired generation.
         if (task.latestVersion > task.appliedVersion) {

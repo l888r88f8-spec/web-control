@@ -208,6 +208,7 @@ class TerrainIngestWorker:
                 time.sleep(0)
                 return not self._superseded()
 
+            convert_started = time.monotonic()
             try:
                 terrain = self._convert(msg, proceed)
             except Exception as exc:  # pragma: no cover - defensive
@@ -217,6 +218,14 @@ class TerrainIngestWorker:
                     except Exception:
                         pass
                 continue
+            convert_elapsed = time.monotonic() - convert_started
+            if convert_elapsed >= 0.5 and self._logger is not None:
+                try:
+                    self._logger.warning(
+                        f"terrain conversion took {convert_elapsed:.2f}s"
+                    )
+                except Exception:
+                    pass
             if terrain is None:
                 continue
             try:
