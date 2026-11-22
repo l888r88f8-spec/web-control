@@ -572,10 +572,24 @@ class PointCloudIngestWorker:
                         continue
 
                     try:
-                        points, finite_count = self._decode(frame.msg)
+                        decoded = self._decode(frame.msg)
                     except Exception as exc:
                         self._error(key, exc)
                         continue
+                    # A decoder for raw subscription bytes returns the frame id
+                    # with the points because there is no message object; the
+                    # default decoder keeps reading it from the header.
+                    if len(decoded) == 3:
+                        points, finite_count, frame_id = decoded
+                    else:
+                        points, finite_count = decoded
+                        frame_id = str(
+                            getattr(
+                                getattr(frame.msg, "header", None),
+                                "frame_id",
+                                "",
+                            )
+                        )
                     # Static and dynamic frames share the same lifecycle rule:
                     # a clear/stop that happened while decoding wins over the
                     # result.
@@ -584,9 +598,6 @@ class PointCloudIngestWorker:
                             continue
                         if frame.key_epoch != self._key_epochs.get(key, 0):
                             continue
-                    frame_id = str(
-                        getattr(getattr(frame.msg, "header", None), "frame_id", "")
-                    )
                     group, layer = key
                     try:
                         self._apply_result(

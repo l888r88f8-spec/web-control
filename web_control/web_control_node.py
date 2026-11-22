@@ -38,6 +38,7 @@ try:
         QoSProfile,
         QoSReliabilityPolicy,
     )
+    from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
 except ModuleNotFoundError:
@@ -54,6 +55,7 @@ except ModuleNotFoundError:
     Imu = None
     PointCloud2 = None
     point_cloud2 = None
+    deserialize_message = None
     QoSDurabilityPolicy = None
     QoSHistoryPolicy = None
     QoSProfile = None
@@ -1771,6 +1773,7 @@ class WebControlNode(Node):
             self._apply_pointcloud_result,
             max_points=0,
             legacy_reader=self._legacy_pointcloud_reader,
+            parser=self._parse_raw_pointcloud,
             logger=self.get_logger(),
             demand_ttl_sec=self.cloud_demand_ttl,
         )
@@ -2187,9 +2190,17 @@ class WebControlNode(Node):
         topic = str(topic_value or "").strip()
         if not topic:
             return False
+        # Point clouds stay serialized on the executor; the worker
+        # deserializes and decodes them, so a large map frame cannot block IMU
+        # or diagnostics callbacks.
+        raw_kwargs = {"raw": True} if plan.message_type == "PointCloud2" else {}
         try:
             subscription = self.create_subscription(
-                message_type, topic, callback, self.cloud_layer_qos(plan.qos)
+                message_type,
+                topic,
+                callback,
+                self.cloud_layer_qos(plan.qos),
+                **raw_kwargs,
             )
         except Exception as exc:
             self._cloud_subscription_failures[key] = now
@@ -2967,6 +2978,25 @@ class WebControlNode(Node):
         return point_cloud2.read_points(
             msg, field_names=("x", "y", "z"), skip_nans=True
         )
+
+    def _parse_raw_pointcloud(
+        self, payload: Any
+    ) -> tuple[list[list[float]], int, str]:
+        """Deserialize one raw PointCloud2 payload on the worker thread.
+
+        Cloud subscriptions are created with ``raw=True`` so the ROS executor
+        only hands over the serialized bytes; message construction, field
+        binding and the point decode all happen here, away from IMU, odometry
+        and diagnostics callbacks.
+        """
+        if deserialize_message is None or PointCloud2 is None:
+            raise RuntimeError("PointCloud2 serialization is unavailable")
+        msg = deserialize_message(payload, PointCloud2)
+        points, finite_count = parse_pointcloud2(
+            msg, 0, legacy_reader=self._legacy_pointcloud_reader
+        )
+        frame_id = str(getattr(getattr(msg, "header", None), "frame_id", "") or "")
+        return points, finite_count, frame_id
 
     def _apply_pointcloud_result(
         self,
