@@ -54,7 +54,7 @@ def terrain_markers_to_triangles(
     markers: Iterable[Any],
     *,
     yield_control: Optional[Callable[[], bool]] = None,
-    yield_interval: int = 4096,
+    yield_interval: int = 256,
 ) -> Optional[dict[str, Any]]:
     """Return all triangle vertices and colours from one terrain MarkerArray.
 
@@ -132,7 +132,7 @@ class TerrainIngestWorker:
         self,
         apply: Callable[[dict[str, Any], int, float], Any],
         *,
-        yield_interval: int = 4096,
+        yield_interval: int = 256,
         logger: Any = None,
         stop_timeout_sec: float = 1.0,
     ) -> None:

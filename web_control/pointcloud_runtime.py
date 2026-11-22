@@ -252,7 +252,15 @@ def _parse_with_numpy(
             arrays["z"][rows, cols],
         )
     )
-    return sampled.tolist(), finite_count
+    # Materialize in chunks: a single tolist() over a million points holds the
+    # interpreter lock for seconds and starves IMU and HTTP callbacks.
+    points: list[list[float]] = []
+    count = int(sampled.shape[0])
+    for start in range(0, count, _LIST_CHUNK_POINTS):
+        points.extend(sampled[start : start + _LIST_CHUNK_POINTS].tolist())
+        if start + _LIST_CHUNK_POINTS < count:
+            time.sleep(0)
+    return points, finite_count
 
 
 def parse_pointcloud2(
@@ -298,6 +306,8 @@ STATIC_RATE = 1.0
 # A request is considered active for a short window so an SSE viewer can renew
 # demand about once per second without keeping every layer permanently active.
 DEFAULT_DEMAND_TTL_SEC = 2.0
+# Python list materialization yield size for large clouds.
+_LIST_CHUNK_POINTS = 20000
 
 
 @dataclass
@@ -952,3 +962,48 @@ class CloudResponseCache:
 def utf8_json_bytes(payload: Any) -> bytes:
     """Encode one cloud response with the same compact JSON format as HTTP."""
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def cloud_payload_json_bytes(
+    payload: Any, *, chunk_size: int = 20000
+) -> bytes:
+    """Encode a cloud response, serializing point/colour arrays in chunks.
+
+    ``json.dumps`` over a million nested points holds the interpreter lock for
+    seconds, which stalls IMU and HTTP callbacks.  The metadata is small; the
+    ``points``/``colors`` arrays are encoded chunk by chunk with a GIL yield
+    between them, producing the identical JSON document.
+    """
+    if not isinstance(payload, dict):
+        return utf8_json_bytes(payload)
+    points = payload.get("points")
+    colors = payload.get("colors")
+    if not isinstance(points, list) or len(points) <= chunk_size:
+        return utf8_json_bytes(payload)
+
+    meta = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("points", "colors")
+    }
+    parts = [json.dumps(meta, separators=(",", ":"))[:-1], ',"points":']
+
+    def encode_array(values: list[Any]) -> str:
+        chunks: list[str] = []
+        for start in range(0, len(values), chunk_size):
+            # Drop the chunk's own brackets so joining keeps one flat array.
+            chunks.append(
+                json.dumps(
+                    values[start : start + chunk_size], separators=(",", ":")
+                )[1:-1]
+            )
+            if start + chunk_size < len(values):
+                time.sleep(0)
+        return "[" + ",".join(chunks) + "]"
+
+    parts.append(encode_array(points))
+    if isinstance(colors, list):
+        parts.append(',"colors":')
+        parts.append(encode_array(colors))
+    parts.append("}")
+    return "".join(parts).encode("utf-8")

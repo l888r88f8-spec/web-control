@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import math
 import mimetypes
@@ -145,6 +146,7 @@ from web_control.log_store import (
 from web_control.pointcloud_runtime import (
     DEFAULT_DEMAND_TTL_SEC,
     CloudResponseCache,
+    cloud_payload_json_bytes,
     CloudRevisionHub,
     PointCloudIngestWorker,
     parse_pointcloud2,
@@ -1438,6 +1440,8 @@ class WebControlNode(Node):
         if rclpy is None:
             raise RuntimeError("ROS 2 Python environment is not available")
         super().__init__("web_control")
+        self._gc_pause_start: float | None = None
+        gc.callbacks.append(self._gc_observer)
 
         self.declare_parameter("host", "0.0.0.0")
         self.declare_parameter("port", 8080)
@@ -3803,7 +3807,7 @@ class WebControlNode(Node):
         cache = getattr(self, "cloud_responses", None)
         if cache is None:
             payload, _version = _layer_payload_snapshot(self, layer_name, mode)
-            return utf8_json_bytes(payload)
+            return cloud_payload_json_bytes(payload)
         # Capture before reading values so a clear between the snapshot and
         # encode cannot let this request resurrect the invalidated body.
         expected_epoch = cache.epoch()
@@ -3820,7 +3824,7 @@ class WebControlNode(Node):
         body = cache.encode(
             ("nav", payload["layer"], mode),
             signature,
-            lambda: utf8_json_bytes(payload),
+            lambda: cloud_payload_json_bytes(payload),
             expected_epoch=expected_epoch,
         )
         encode_elapsed = time.monotonic() - encode_started
@@ -3838,7 +3842,7 @@ class WebControlNode(Node):
         cache = getattr(self, "cloud_responses", None)
         if cache is None:
             payload, _version = _mapping_layer_payload_snapshot(self, layer_name)
-            return utf8_json_bytes(payload)
+            return cloud_payload_json_bytes(payload)
         expected_epoch = cache.epoch()
         payload, version = _mapping_layer_payload_snapshot(self, layer_name)
         signature = (
@@ -3852,7 +3856,7 @@ class WebControlNode(Node):
         return cache.encode(
             ("mapping", payload["layer"], "3d"),
             signature,
-            lambda: utf8_json_bytes(payload),
+            lambda: cloud_payload_json_bytes(payload),
             expected_epoch=expected_epoch,
         )
 
@@ -4010,6 +4014,25 @@ class WebControlNode(Node):
         return payload
 
     # -- Topic and motion diagnostics -------------------------------------
+    def _gc_observer(self, phase: str, info: dict[str, Any]) -> None:
+        """Log interpreter collections long enough to freeze ROS callbacks."""
+        if phase == "start":
+            self._gc_pause_start = time.monotonic()
+            return
+        started = self._gc_pause_start
+        self._gc_pause_start = None
+        if started is None:
+            return
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.1:
+            try:
+                self.get_logger().warning(
+                    f"gc generation {info.get('generation')} pause "
+                    f"{elapsed:.2f}s"
+                )
+            except Exception:
+                pass
+
     def diagnostics_imu_callback(self, msg: Any) -> None:
         now = time.monotonic()
         previous = getattr(self, "_imu_callback_stamp", None)
