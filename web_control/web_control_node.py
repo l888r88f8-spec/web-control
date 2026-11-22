@@ -2976,9 +2976,11 @@ class WebControlNode(Node):
                     },
                     stamp=arrival_stamp,
                     frame_id=frame_id,
-                    count=len(points),
+                    count=len(points) // 3,
                 )
                 changed = True
+        if len(points) >= 60000:
+            gc.freeze()
         if changed:
             publish_cloud_metadata_if_available(self)
 
@@ -3059,6 +3061,11 @@ class WebControlNode(Node):
                 if group == "nav" and layer_name == "mapground":
                     self.mapground_seen = True
                 changed = True
+        if finite_count >= 20000:
+            # Move the long-lived point lists out of the cyclic collector's
+            # young generations; otherwise every gen-2 pass rescans millions
+            # of nested lists and freezes the interpreter for hundreds of ms.
+            gc.freeze()
         if changed:
             publish = getattr(self, "publish_cloud_metadata", None)
             if publish is not None:

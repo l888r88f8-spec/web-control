@@ -107,9 +107,9 @@ def terrain_markers_to_triangles(
                 continue
             for offset in range(3):
                 x, y, z = triangle[offset]  # type: ignore[misc]
-                points.append([x, y, z])
+                points.extend((x, y, z))
                 red, green, blue = _marker_color(marker, start + offset)
-                colors.append([red, green, blue])
+                colors.extend((red, green, blue))
             triangles += 1
             if yield_control is not None and triangles % interval == 0:
                 if not yield_control():

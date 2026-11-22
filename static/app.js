@@ -739,26 +739,48 @@ function makePointCloud(points, color, options = {}) {
 
 function makeTerrainMesh(points, colors, color) {
   const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array(points.length * 3);
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    const p = rosToThree(point[0], point[1], point[2]);
-    positions[index * 3] = p.x;
-    positions[index * 3 + 1] = p.y;
-    positions[index * 3 + 2] = p.z;
+  // The backend sends one flat float array per attribute, which parses and
+  // uploads without allocating one JS array per vertex.  Nested triples are
+  // still accepted for older cached bodies.
+  const flatPoints =
+    Array.isArray(points) && points.length > 0 && typeof points[0] === "number";
+  const vertexCount = flatPoints ? points.length / 3 : points.length;
+  const positions = new Float32Array(vertexCount * 3);
+  if (flatPoints) {
+    for (let index = 0; index < points.length; index += 3) {
+      positions[index] = points[index];
+      positions[index + 1] = points[index + 2];
+      positions[index + 2] = -points[index + 1];
+    }
+  } else {
+    for (let index = 0; index < vertexCount; index += 1) {
+      const point = points[index];
+      const p = rosToThree(point[0], point[1], point[2]);
+      positions[index * 3] = p.x;
+      positions[index * 3 + 1] = p.y;
+      positions[index * 3 + 2] = p.z;
+    }
   }
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  // The backend emits one RGB triple per vertex.  A partially missing colour
-  // buffer falls back to the flat layer colour instead of misaligning arrays.
+  // One RGB triple per vertex; a mismatched or missing colour buffer falls
+  // back to the flat layer colour instead of misaligning arrays.
+  const flatColors =
+    Array.isArray(colors) && colors.length > 0 && typeof colors[0] === "number";
+  const colorLength = flatColors ? colors.length / 3 : colors ? colors.length : 0;
   const useVertexColors =
-    Array.isArray(colors) && points.length > 0 && colors.length === points.length;
+    Array.isArray(colors) && vertexCount > 0 && colorLength === vertexCount;
   if (useVertexColors) {
-    const vertexColors = new Float32Array(points.length * 3);
-    for (let index = 0; index < points.length; index += 1) {
-      const value = colors[index];
-      vertexColors[index * 3] = value[0];
-      vertexColors[index * 3 + 1] = value[1];
-      vertexColors[index * 3 + 2] = value[2];
+    let vertexColors;
+    if (flatColors) {
+      vertexColors = Float32Array.from(colors);
+    } else {
+      vertexColors = new Float32Array(vertexCount * 3);
+      for (let index = 0; index < vertexCount; index += 1) {
+        const value = colors[index];
+        vertexColors[index * 3] = value[0];
+        vertexColors[index * 3 + 1] = value[1];
+        vertexColors[index * 3 + 2] = value[2];
+      }
     }
     geometry.setAttribute("color", new THREE.BufferAttribute(vertexColors, 3));
   }
