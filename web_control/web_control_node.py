@@ -185,7 +185,7 @@ from web_control.recording import (
     validate_topic_selection,
 )
 from web_control.teleop import TeleopController
-from web_control.terrain import terrain_markers_to_triangles
+from web_control.terrain import TerrainIngestWorker, terrain_markers_to_triangles
 from web_control.tf_tree import TfTreeCache
 
 LAYER_NAMES = {
@@ -1775,6 +1775,12 @@ class WebControlNode(Node):
             demand_ttl_sec=self.cloud_demand_ttl,
         )
         self.cloud_worker.start()
+        # Terrain snapshots are large; convert them off the ROS executor so a
+        # grid-map load cannot stall IMU, odometry or the diagnostics timers.
+        self.terrain_worker = TerrainIngestWorker(
+            self._apply_grid_terrain, logger=self.get_logger()
+        )
+        self.terrain_worker.start()
         self.odom = SourceCache("odom", self.stale_timeout)
         self.mapping_odom = SourceCache("mapping_odom", self.stale_timeout)
         self.mapping_path = SourceCache("mapping_path", self.stale_timeout)
@@ -2889,25 +2895,35 @@ class WebControlNode(Node):
         enqueue("nav", "obstacles", msg, clear_on_empty=True)
 
     def grid_terrain_callback(self, msg: Any) -> None:
-        """Apply one latched grid terrain snapshot as triangle vertices.
+        """Hand one latched grid terrain snapshot to the background worker.
 
-        The grid planner emits a full replacement on every map update, so an
-        empty conversion clears the layer rather than leaving the old cells on
-        screen.  Every complete finite triangle is retained; conversion runs on
-        the ROS callback only for this low-rate, latched topic.
-
-        The lifecycle generation is captured before the conversion and checked
-        again before the cache is written.  A navigation stop or map change can
-        therefore not be undone by a message whose callback was already running
-        when the generation advanced.
+        The MarkerArray can hold hundreds of thousands of vertices; converting
+        it here would block the single-threaded executor (IMU, odometry and
+        diagnostics timers) for seconds while a grid map loads.  The worker
+        keeps only the newest snapshot and applies it with the lifecycle
+        generation captured now.
         """
         key = ("nav", "grid_terrain")
         with self.lock:
             generations = getattr(self, "_cloud_generations", None) or {}
             generation = int(generations.get(key, 0))
-        terrain = terrain_markers_to_triangles(
-            getattr(msg, "markers", ()) or ()
+        worker = getattr(self, "terrain_worker", None)
+        if worker is None:
+            self._apply_grid_terrain(
+                terrain_markers_to_triangles(getattr(msg, "markers", ()) or ()),
+                generation,
+                self.now_sec(),
+            )
+            return
+        worker.submit(
+            msg, generation=generation, arrival_stamp=self.now_sec()
         )
+
+    def _apply_grid_terrain(
+        self, terrain: dict[str, Any], generation: int, arrival_stamp: float
+    ) -> None:
+        """Apply one converted terrain snapshot if its lifecycle still matches."""
+        key = ("nav", "grid_terrain")
         points = terrain["points"]
         frame_id = str(terrain["frame_id"] or self.map_frame)
         changed = False
@@ -2929,7 +2945,7 @@ class WebControlNode(Node):
                         "colors": terrain["colors"],
                         "format": "triangles",
                     },
-                    stamp=self.now_sec(),
+                    stamp=arrival_stamp,
                     frame_id=frame_id,
                     count=len(points),
                 )
@@ -4855,6 +4871,9 @@ class WebControlNode(Node):
         cloud_worker = getattr(self, "cloud_worker", None)
         if cloud_worker is not None:
             cloud_worker.stop()
+        terrain_worker = getattr(self, "terrain_worker", None)
+        if terrain_worker is not None:
+            terrain_worker.stop()
         self.cleanup_teleop()
         recording = getattr(self, "recorder", None)
         if recording is not None:
