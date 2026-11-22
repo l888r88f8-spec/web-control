@@ -31,6 +31,7 @@ NumPy cannot decode.
 from __future__ import annotations
 
 import json
+import struct
 import math
 import threading
 import time
@@ -162,9 +163,9 @@ def _numpy_fields(msg: Any) -> tuple[list[tuple[str, int, int, int]], int]:
     return arrays, point_step
 
 
-def _parse_with_numpy(
+def _parse_with_numpy_array(
     msg: Any, max_points: int
-) -> tuple[list[list[float]], int]:
+) -> tuple[Any, int]:
     if np is None:  # pragma: no cover - guarded by parse_pointcloud2
         raise UnsupportedPointCloudFormat("NumPy is unavailable")
 
@@ -175,7 +176,7 @@ def _parse_with_numpy(
     width = int(getattr(msg, "width", 0) or 0)
     height = int(getattr(msg, "height", 0) or 0)
     if width == 0 or height == 0:
-        return [], 0
+        return np.empty((0, 3), dtype=np.float32), 0
     if width < 0 or height < 0:
         raise ValueError("PointCloud2 width/height must not be negative")
 
@@ -224,7 +225,7 @@ def _parse_with_numpy(
     finite &= np.isfinite(arrays["z"])
     finite_count = int(np.count_nonzero(finite))
     if finite_count == 0:
-        return [], 0
+        return np.empty((0, 3), dtype=np.float32), 0
 
     # Map the sampled position among finite points back to its flat point
     # index, then gather only the selected coordinates.  No full Python tuple
@@ -252,6 +253,14 @@ def _parse_with_numpy(
             arrays["z"][rows, cols],
         )
     )
+    return sampled, finite_count
+
+
+def _parse_with_numpy(
+    msg: Any, max_points: int
+) -> tuple[list[list[float]], int]:
+    """Decode into per-point Python lists for callers that want rows."""
+    sampled, finite_count = _parse_with_numpy_array(msg, max_points)
     count = int(sampled.shape[0])
     if count <= _LIST_CHUNK_POINTS * 4:
         # Small/live clouds finish in a few milliseconds; yielding here only
@@ -286,6 +295,53 @@ def parse_pointcloud2(
         if legacy_reader is None:
             raise
     return _parse_legacy(msg, max_points, legacy_reader)
+
+
+def parse_pointcloud2_array(
+    msg: Any,
+    max_points: int,
+    legacy_reader: Optional[Callable[[Any], Iterable[Sequence[float]]]] = None,
+) -> tuple[Any, int]:
+    """Decode a PointCloud2 into a flat ``float32`` ``(N, 3)`` array.
+
+    The web viewer transfers points as binary float32, so no per-point Python
+    list is created for the production path.
+    """
+    try:
+        return _parse_with_numpy_array(msg, max_points)
+    except UnsupportedPointCloudFormat:
+        if legacy_reader is None:
+            raise
+    points = list(_parse_legacy(msg, max_points, legacy_reader))
+    if not points:
+        return np.empty((0, 3), dtype=np.float32), 0
+    sampled = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    return sampled, int(sampled.shape[0])
+
+
+def cloud_binary_body(
+    header: dict[str, Any], positions: Any, colors: Any = None
+) -> bytes:
+    """Frame one cloud response as a JSON header plus float32 arrays.
+
+    Layout: ``WCB1`` magic, little-endian uint32 header length, the UTF-8 JSON
+    header, then ``positions`` (``count * 3`` float32) and, when present,
+    ``colors`` (``count * 3`` float32).
+    """
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    parts = [b"WCB1", struct.pack("<I", len(header_bytes)), header_bytes]
+    parts.append(
+        np.ascontiguousarray(positions, dtype="<f4").tobytes()
+        if np is not None
+        else bytes(positions)
+    )
+    if colors is not None:
+        parts.append(
+            np.ascontiguousarray(colors, dtype="<f4").tobytes()
+            if np is not None
+            else bytes(colors)
+        )
+    return b"".join(parts)
 
 
 # Only the static latched navigation maps retain an output ceiling.  Dynamic

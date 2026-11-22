@@ -240,6 +240,45 @@ async function getJson(url) {
   return response.json();
 }
 
+
+// Cloud layers arrive as a framed float32 binary body: "WCB1", a little-
+// endian uint32 header length, JSON metadata, then positions (and colours for
+// triangle layers).  Building typed arrays from the buffer avoids parsing one
+// JS object per point, which is what froze the page on large maps.  A JSON
+// body from an older server is still accepted.
+async function getCloudLayer(url) {
+  const response = await fetchWithTimeout(url, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength < 8) throw new Error("cloud response is truncated");
+  const view = new DataView(buffer);
+  if (view.getUint32(0, false) !== 0x57434231) {
+    return JSON.parse(new TextDecoder().decode(buffer));
+  }
+  const headerLength = view.getUint32(4, true);
+  if (8 + headerLength > buffer.byteLength) {
+    throw new Error("cloud header is truncated");
+  }
+  const header = JSON.parse(
+    new TextDecoder().decode(new Uint8Array(buffer, 8, headerLength)),
+  );
+  const count = Number(header.count) || 0;
+  const offset = 8 + headerLength;
+  const positions = new Float32Array(
+    buffer.slice(offset, offset + count * 12),
+  );
+  let colors;
+  if (header.format === "triangles") {
+    const colorOffset = offset + count * 12;
+    if (buffer.byteLength >= colorOffset + count * 12) {
+      colors = new Float32Array(
+        buffer.slice(colorOffset, colorOffset + count * 12),
+      );
+    }
+  }
+  return { ...header, points: positions, colors };
+}
+
 async function getText(url) {
   const response = await fetchWithTimeout(url, { cache: "no-store" });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -690,35 +729,37 @@ function writeHeightColor(target, offset, height, minHeight, maxHeight) {
 
 function makePointCloud(points, color, options = {}) {
   const geometry = new THREE.BufferGeometry();
-  const positions = new Float32Array(points.length * 3);
+  // The binary endpoint delivers one flat float32 array per attribute; nested
+  // triples are still accepted for JSON responses and tests.
+  const flat =
+    ArrayBuffer.isView(points) ||
+    (Array.isArray(points) && points.length > 0 && typeof points[0] === "number");
+  const count = flat ? points.length / 3 : points.length;
+  const positions = new Float32Array(count * 3);
   const heightColored = !options.flatColor;
   let minHeight = Infinity;
   let maxHeight = -Infinity;
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    const rawHeight = point[2];
+  const heightAt = (index) => (flat ? points[index * 3 + 2] : points[index][2]);
+  const xAt = (index) => (flat ? points[index * 3] : points[index][0]);
+  const yAt = (index) => (flat ? points[index * 3 + 1] : points[index][1]);
+  for (let index = 0; index < count; index += 1) {
+    const rawHeight = heightAt(index);
     const height = Number.isFinite(rawHeight) ? rawHeight : 0;
     if (Number.isFinite(rawHeight)) {
       if (rawHeight < minHeight) minHeight = rawHeight;
       if (rawHeight > maxHeight) maxHeight = rawHeight;
     }
-    const p = rosToThree(point[0], point[1], height);
+    const p = rosToThree(xAt(index), yAt(index), height);
     positions[index * 3] = p.x;
     positions[index * 3 + 1] = p.y;
     positions[index * 3 + 2] = p.z;
   }
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  const useVertexColors = heightColored && points.length > 0;
+  const useVertexColors = heightColored && count > 0;
   if (useVertexColors) {
-    const colors = new Float32Array(points.length * 3);
-    for (let index = 0; index < points.length; index += 1) {
-      writeHeightColor(
-        colors,
-        index * 3,
-        points[index][2],
-        minHeight,
-        maxHeight,
-      );
+    const colors = new Float32Array(count * 3);
+    for (let index = 0; index < count; index += 1) {
+      writeHeightColor(colors, index * 3, heightAt(index), minHeight, maxHeight);
     }
     geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
   }
@@ -743,7 +784,9 @@ function makeTerrainMesh(points, colors, color) {
   // uploads without allocating one JS array per vertex.  Nested triples are
   // still accepted for older cached bodies.
   const flatPoints =
-    Array.isArray(points) && points.length > 0 && typeof points[0] === "number";
+    (Array.isArray(points) || ArrayBuffer.isView(points)) &&
+    points.length > 0 &&
+    typeof points[0] === "number";
   const vertexCount = flatPoints ? points.length / 3 : points.length;
   const positions = new Float32Array(vertexCount * 3);
   if (flatPoints) {
@@ -765,7 +808,9 @@ function makeTerrainMesh(points, colors, color) {
   // One RGB triple per vertex; a mismatched or missing colour buffer falls
   // back to the flat layer colour instead of misaligning arrays.
   const flatColors =
-    Array.isArray(colors) && colors.length > 0 && typeof colors[0] === "number";
+    (Array.isArray(colors) || ArrayBuffer.isView(colors)) &&
+    colors.length > 0 &&
+    typeof colors[0] === "number";
   const colorLength = flatColors ? colors.length / 3 : colors ? colors.length : 0;
   const useVertexColors =
     Array.isArray(colors) && vertexCount > 0 && colorLength === vertexCount;
@@ -1961,6 +2006,7 @@ const STATIC_NAVIGATION_LAYERS = new Set(["global_map", "mapcloud", "mapground"]
 function createRefreshController({
   now = () => Date.now(),
   getJson,
+  getCloudLayer = getJson,
   getView,
   navigationLayers,
   mappingLayers,
@@ -2134,7 +2180,11 @@ function createRefreshController({
 
   function resetCloudTaskLifecycle(task) {
     const layer = cloudLayer(task);
-    const hadGeometry = Boolean(layer && Array.isArray(layer.points3d) && layer.points3d.length);
+    const hadGeometry = Boolean(
+      layer &&
+      (Array.isArray(layer.points3d) || ArrayBuffer.isView(layer.points3d)) &&
+      layer.points3d.length
+    );
     if (layer) {
       layer.points3d = [];
       layer.lastFetch3d = 0;
@@ -2185,14 +2235,14 @@ function createRefreshController({
     const requestedVersion = task.latestVersion;
     task.requestedVersion = requestedVersion;
     const url = task.group === "nav"
-      ? `/api/map3d?layer=${encodeURIComponent(task.name)}`
-      : `/api/mapping/map3d?layer=${encodeURIComponent(task.name)}`;
+      ? `/api/map3d.bin?layer=${encodeURIComponent(task.name)}`
+      : `/api/mapping/map3d.bin?layer=${encodeURIComponent(task.name)}`;
     return (async () => {
       const startedAt = typeof performance !== "undefined" && performance.now
         ? performance.now()
         : Date.now();
       try {
-        const data = await getJson(url);
+        const data = await getCloudLayer(url);
         const epochState = observeEpoch(data && data.epoch);
         if (epochState === "stale") return;
         if (epochState === "new") {
@@ -2226,11 +2276,11 @@ function createRefreshController({
         if (task.latestCleared && requestedVersion < task.latestVersion) {
           return;
         }
-        const points = Array.isArray(data.points) ? data.points : [];
+        const points = data.points && (Array.isArray(data.points) || ArrayBuffer.isView(data.points)) ? data.points : [];
         current.points3d = points;
         // Triangle layers carry per-vertex colours; ordinary point clouds
         // leave both fields unset and keep the existing renderer.
-        current.colors = Array.isArray(data.colors) ? data.colors : [];
+        current.colors = data.colors && (Array.isArray(data.colors) || ArrayBuffer.isView(data.colors)) ? data.colors : [];
         current.format = data.format === "triangles" ? "triangles" : "points";
         current.lastFetch3d = now();
         if (task.group === "nav" && STATIC_NAVIGATION_LAYERS.has(task.name)) {
@@ -2854,6 +2904,7 @@ function createCloudStreamController({
 const refreshController = createRefreshController({
   now: () => Date.now(),
   getJson,
+  getCloudLayer,
   getView: () => state.view,
   navigationLayers: LAYERS,
   mappingLayers: MAPPING_LAYERS,

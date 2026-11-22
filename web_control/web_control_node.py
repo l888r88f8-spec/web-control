@@ -146,10 +146,12 @@ from web_control.log_store import (
 from web_control.pointcloud_runtime import (
     DEFAULT_DEMAND_TTL_SEC,
     CloudResponseCache,
+    cloud_binary_body,
     cloud_payload_json_bytes,
     CloudRevisionHub,
     PointCloudIngestWorker,
     parse_pointcloud2,
+    parse_pointcloud2_array,
     utf8_json_bytes,
 )
 from web_control.cloud_subscriptions import (
@@ -1295,6 +1297,12 @@ def _layer_payload_snapshot(
         # ordinary point clouds omit both keys and keep the existing payload.
         format_name = data.get("format")
         colors = data.get("colors")
+        # Production caches hold float32 arrays for binary transfer; the
+        # legacy JSON views still need plain Python lists.
+        if hasattr(points_3d, "tolist"):
+            points_3d = points_3d.tolist()
+        if hasattr(colors, "tolist"):
+            colors = colors.tolist()
     hub = getattr(owner, "cloud_hub", None)
     epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
     if mode == "3d":
@@ -1340,6 +1348,8 @@ def _mapping_layer_payload_snapshot(
         generations = getattr(owner, "_cloud_generations", None) or {}
         generation = int(generations.get(key, 0))
         points = data.get("points3d", [])
+        if hasattr(points, "tolist"):
+            points = points.tolist()
     hub = getattr(owner, "cloud_hub", None)
     epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
     return (
@@ -3010,7 +3020,7 @@ class WebControlNode(Node):
         if deserialize_message is None or PointCloud2 is None:
             raise RuntimeError("PointCloud2 serialization is unavailable")
         msg = deserialize_message(payload, PointCloud2)
-        points, finite_count = parse_pointcloud2(
+        points, finite_count = parse_pointcloud2_array(
             msg, 0, legacy_reader=self._legacy_pointcloud_reader
         )
         frame_id = str(getattr(getattr(msg, "header", None), "frame_id", "") or "")
@@ -3835,6 +3845,39 @@ class WebControlNode(Node):
             )
         return body
 
+    def layer_binary_response(self, layer_name: str) -> bytes:
+        """Return one navigation cloud as a framed float32 binary body."""
+        layer = normalize_layer_name(layer_name)
+        now = self.now_sec()
+        key = ("nav", layer)
+        with self.lock:
+            cache = self.layers[layer]
+            data = cache.data or {}
+            status = cache.status(now)
+            frame_id = cache.frame_id
+            count = cache.count
+            version = cache.version
+            generations = getattr(self, "_cloud_generations", None) or {}
+            generation = int(generations.get(key, 0))
+            positions = data.get("points3d")
+            colors = data.get("colors")
+            format_name = data.get("format") or "points"
+        hub = getattr(self, "cloud_hub", None)
+        epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
+        if positions is None:
+            positions = []
+        header = {
+            "layer": layer,
+            "status": status,
+            "frame_id": frame_id,
+            "count": count,
+            "version": version,
+            "generation": generation,
+            "epoch": epoch,
+            "format": format_name,
+        }
+        return cloud_binary_body(header, positions, colors)
+
     def mapping_layer_payload(self, layer_name: str) -> dict[str, Any]:
         return _mapping_layer_payload_snapshot(self, layer_name)[0]
 
@@ -4207,6 +4250,39 @@ class WebControlNode(Node):
         response["topic_logging_enabled"] = enabled
         response["logging"] = self.diagnostics_log.status()
         return response
+
+    def mapping_layer_binary_response(self, layer_name: str) -> bytes:
+        """Return one mapping cloud as a framed float32 binary body."""
+        layer = normalize_mapping_layer_name(layer_name)
+        now = self.now_sec()
+        key = ("mapping", layer)
+        with self.lock:
+            cache = self.mapping_layers[layer]
+            data = cache.data or {}
+            status = cache.status(now)
+            frame_id = cache.frame_id
+            count = cache.count
+            version = cache.version
+            generations = getattr(self, "_cloud_generations", None) or {}
+            generation = int(generations.get(key, 0))
+            positions = data.get("points3d")
+            colors = data.get("colors")
+            format_name = data.get("format") or "points"
+        hub = getattr(self, "cloud_hub", None)
+        epoch = str(getattr(hub, "epoch", "")) if hub is not None else ""
+        if positions is None:
+            positions = []
+        header = {
+            "layer": layer,
+            "status": status,
+            "frame_id": frame_id,
+            "count": count,
+            "version": version,
+            "generation": generation,
+            "epoch": epoch,
+            "format": format_name,
+        }
+        return cloud_binary_body(header, positions, colors)
 
     def diagnostics_payload(self) -> dict[str, Any]:
         now_mono = time.monotonic()
@@ -4589,6 +4665,16 @@ class WebControlNode(Node):
                             self.send_encoded_json(responder(layer, "2d"))
                         else:
                             self.send_json(node.layer_payload(layer, "2d"))
+                    elif parsed.path == "/api/map3d.bin":
+                        layer = query.get("layer", ["local_map"])[0]
+                        normalize_layer_name(layer)
+                        note_demand = getattr(node, "note_cloud_demand", None)
+                        if note_demand is not None:
+                            note_demand("nav", layer)
+                        responder = getattr(node, "layer_binary_response", None)
+                        if responder is None:
+                            raise ValueError("binary cloud layer API is unavailable")
+                        self.send_binary(responder(layer))
                     elif parsed.path == "/api/map3d":
                         layer = query.get("layer", ["local_map"])[0]
                         normalize_layer_name(layer)
@@ -4641,6 +4727,18 @@ class WebControlNode(Node):
                         )
                     elif parsed.path == "/api/mapping/state":
                         self.send_json(node.mapping_state_payload())
+                    elif parsed.path == "/api/mapping/map3d.bin":
+                        layer = query.get("layer", ["global_map"])[0]
+                        normalize_mapping_layer_name(layer)
+                        note_demand = getattr(node, "note_cloud_demand", None)
+                        if note_demand is not None:
+                            note_demand("mapping", layer)
+                        responder = getattr(
+                            node, "mapping_layer_binary_response", None
+                        )
+                        if responder is None:
+                            raise ValueError("binary mapping layer API is unavailable")
+                        self.send_binary(responder(layer))
                     elif parsed.path == "/api/mapping/map3d":
                         layer = query.get("layer", ["global_map"])[0]
                         normalize_mapping_layer_name(layer)
@@ -4858,6 +4956,14 @@ class WebControlNode(Node):
                     OSError,
                 ):
                     return
+
+            def send_binary(self, body: bytes, status: int = 200) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
 
             def send_encoded_json(self, body: bytes, status: int = 200) -> None:
                 self.send_response(status)
