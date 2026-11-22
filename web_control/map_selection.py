@@ -14,7 +14,7 @@ import logging
 import math
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from web_control.atomic_io import atomic_write_text
 from web_control.map_catalog import validate_map_name
@@ -214,6 +214,38 @@ def validate_joystick_preferences(payload: Any) -> dict[str, dict[str, float]]:
     return validated
 
 
+def validate_layer_preferences(
+    payload: Any, allowed: Iterable[str]
+) -> dict[str, bool]:
+    """Return the checkbox states to store, rejecting unknown or non-bool keys."""
+    if not isinstance(payload, dict):
+        raise ValueError("layer preferences must be an object")
+    allowed_set = set(allowed)
+    unknown = sorted(set(payload) - allowed_set)
+    if unknown:
+        raise ValueError(f"unknown layer: {unknown[0]}")
+    validated: dict[str, bool] = {}
+    for name, enabled in payload.items():
+        if type(enabled) is not bool:
+            raise ValueError(f"layer {name} must be a boolean")
+        validated[name] = enabled
+    if not validated:
+        raise ValueError("layer preferences must not be empty")
+    return validated
+
+
+def saved_layer_preferences(payload: Any, allowed: Iterable[str]) -> dict[str, bool]:
+    """Return one boolean per known layer, defaulting unchecked names to on."""
+    states = {name: True for name in allowed}
+    if not isinstance(payload, dict):
+        return states
+    for name in states:
+        value = payload.get(name)
+        if type(value) is bool:
+            states[name] = value
+    return states
+
+
 def _saved_number(value: Any, minimum: float, maximum: float, default: float) -> float:
     """Return a finite in-range saved value, else ``default``."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -403,6 +435,32 @@ class SelectionStore:
             if not isinstance(ui, dict):
                 ui = {}
             ui["joystick"] = validated
+            payload["ui"] = ui
+            _atomic_write_text(self.path, json.dumps(payload) + "\n")
+        return validated
+
+    def load_layer_preferences(self, allowed: Iterable[str]) -> dict[str, bool]:
+        """Return one boolean per known navigation layer, defaulting to on."""
+        payload = self._read_payload()
+        ui = payload.get("ui")
+        layers = ui.get("layers") if isinstance(ui, dict) else None
+        return saved_layer_preferences(layers, allowed)
+
+    def save_layer_preferences(
+        self, preferences: Any, allowed: Iterable[str]
+    ) -> dict[str, bool]:
+        """Validate and atomically merge layer checkbox states."""
+        validated = validate_layer_preferences(preferences, allowed)
+        with _STORE_LOCK:
+            payload = self._read_payload()
+            ui = payload.get("ui")
+            if not isinstance(ui, dict):
+                ui = {}
+            saved = ui.get("layers")
+            if not isinstance(saved, dict):
+                saved = {}
+            saved.update(validated)
+            ui["layers"] = saved
             payload["ui"] = ui
             _atomic_write_text(self.path, json.dumps(payload) + "\n")
         return validated

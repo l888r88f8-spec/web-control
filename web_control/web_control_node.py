@@ -2514,18 +2514,32 @@ class WebControlNode(Node):
         }
 
     def ui_preferences_payload(self) -> dict[str, Any]:
-        """Return the validated joystick layout shared by every browser."""
+        """Return the joystick layout and layer checkboxes shared by browsers."""
         return {
             "ok": True,
             "joystick": self.map_selection.load_joystick_preferences(),
+            "layers": self.map_selection.load_layer_preferences(LAYER_NAMES),
             "stamp": self.now_sec(),
         }
 
     def save_ui_preferences(self, payload: Any) -> dict[str, Any]:
-        """Validate and atomically merge a complete joystick setting."""
-        validated = self.map_selection.save_joystick_preferences(payload)
+        """Validate and atomically merge joystick and layer preferences."""
+        if not isinstance(payload, dict):
+            raise ValueError("ui preferences must be an object")
+        saved = False
         response = success_response("ui preferences saved", self.now_sec())
-        response["joystick"] = validated
+        if "throttle" in payload or "steering" in payload:
+            response["joystick"] = self.map_selection.save_joystick_preferences(
+                payload
+            )
+            saved = True
+        if "layers" in payload:
+            response["layers"] = self.map_selection.save_layer_preferences(
+                payload["layers"], LAYER_NAMES
+            )
+            saved = True
+        if not saved:
+            raise ValueError("no ui preference in payload")
         return response
 
     def select_navigation_planner(self, payload: Any) -> dict[str, Any]:

@@ -5193,6 +5193,44 @@ function applySavedStickPreferences(saved, fallbackToDefaults) {
   }
 }
 
+// Layer checkboxes are shared robot-side preferences, so a fresh browser or a
+// restarted page opens with the operator's saved scene instead of all-on.
+let layerPreferencesDirty = false;
+
+function applySavedLayerPreferences(saved) {
+  if (layerPreferencesDirty || !saved || typeof saved !== "object") return;
+  document.querySelectorAll("input[data-layer]").forEach((input) => {
+    const name = input.dataset.layer;
+    if (typeof saved[name] !== "boolean") return;
+    input.checked = saved[name];
+    LAYERS[name].enabled = saved[name];
+    if (LAYERS[name].object) LAYERS[name].object.visible = saved[name];
+  });
+  syncCloudStream();
+  void refreshController.tick();
+}
+
+async function refreshLayerPreferences() {
+  try {
+    const data = await getJson("/api/ui/preferences");
+    applySavedLayerPreferences(data && data.layers);
+  } catch (_error) {
+    // Keep the markup defaults when the saved preferences are unavailable.
+  }
+}
+
+async function persistLayerPreferences() {
+  const layers = {};
+  document.querySelectorAll("input[data-layer]").forEach((input) => {
+    layers[input.dataset.layer] = input.checked;
+  });
+  try {
+    await postJson("/api/ui/preferences", { layers });
+  } catch (_error) {
+    // A failed save keeps the local choice for this page session.
+  }
+}
+
 async function persistJoystickPreferences() {
   joystickLayout.revision += 1;
   const revision = joystickLayout.revision;
@@ -5826,10 +5864,12 @@ function attachEvents() {
   document.querySelectorAll(".mode").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
   document.querySelectorAll("input[data-layer]").forEach((input) => {
     input.addEventListener("change", () => {
+      layerPreferencesDirty = true;
       LAYERS[input.dataset.layer].enabled = input.checked;
       if (LAYERS[input.dataset.layer].object) LAYERS[input.dataset.layer].object.visible = input.checked;
       syncCloudStream();
       void refreshController.tick();
+      void persistLayerPreferences();
     });
   });
   document.getElementById("pathLayer").addEventListener("change", (event) => {
@@ -6065,6 +6105,7 @@ function start() {
   pollMappingState();
   refreshMaps();
   refreshJoystickPreferences();
+  refreshLayerPreferences();
   setSidebarCollapsed(false);
   setInterval(pollState, 1000);
   setInterval(pollMappingState, 1000);
