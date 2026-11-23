@@ -7,25 +7,29 @@
   <maintainer email="robot@example.com">robot</maintainer>
   <license>BSD</license>
 
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>action_msgs</exec_depend>
-  <exec_depend>diagnostic_msgs</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>lio_sam_hesai</exec_depend>
-  <exec_depend>nav_msgs</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>rcl_interfaces</exec_depend>
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>rosbag2</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>sensor_msgs_py</exec_depend>
-  <exec_depend>visualization_msgs</exec_depend>
-  <exec_depend>tf2_msgs</exec_depend>
+  <depend>action_msgs</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>boost</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>keyboard_handler</depend>
+  <depend>lio_sam_hesai</depend>
+  <depend>nav_msgs</depend>
+  <depend>nlohmann-json-dev</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>rclcpp</depend>
+  <depend>rosbag2_cpp</depend>
+  <depend>rosbag2_transport</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>yaml-cpp</depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rosbag2_storage_default_plugins</exec_depend>
 
   <export>
-    <build_type>ament_python</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>
