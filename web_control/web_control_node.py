@@ -2973,7 +2973,7 @@ class WebControlNode(Node):
             cache = self.layers.get("grid_terrain")
             if cache is None:
                 return
-            if not points:
+            if points is None or len(points) == 0:
                 if cache.data is not None:
                     cache.clear()
                     changed = True
@@ -3053,7 +3053,7 @@ class WebControlNode(Node):
             cache = caches.get(layer_name)
             if cache is None:
                 return False
-            if not points:
+            if points is None or len(points) == 0:
                 if clear_on_empty:
                     cache.clear()
                     changed = True
